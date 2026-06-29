@@ -18,6 +18,10 @@ from lab_copilot_gateway.approval import (
 )
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.config import get_public_config
+from lab_copilot_gateway.elabftw import (
+    ElabftwAdapterError,
+    get_elabftw_read_adapter,
+)
 from lab_copilot_gateway.identity import (
     DbIdentityMapper,
     IdentityMapper,
@@ -109,6 +113,24 @@ class ApprovalConsumeBody(BaseModel):
     target_record: str | None = None
 
 
+class ElabftwReadBody(BaseModel):
+    """Request body for POST /elabftw/read_current_experiment (C08).
+
+    Caller supplies the signed context token (from the eLabFTW launcher, C11)
+    and the identity fields the gateway uses to resolve the mapped user via
+    the identity mapper.  The adapter does the rest: token verify → identity
+    resolution → policy decision → downstream HTTP → audit record.
+    """
+
+    context_token: str
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+
+
 def _identity_to_dict(identity: MappedIdentity) -> dict[str, Any]:
     return {
         "mapped": True,
@@ -146,12 +168,13 @@ def create_app() -> FastAPI:
     service_name = "lab-copilot-gateway"
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
 
-    # Eagerly initialize audit store, policy engine, identity mapper, and
-    # approval store so /health reflects state.
+    # Eagerly initialize audit store, policy engine, identity mapper,
+    # approval store, and eLabFTW read adapter so /health reflects state.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
     identity_mapper = get_identity_mapper()
     approval_store = get_approval_store()
+    elabftw_adapter = get_elabftw_read_adapter()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -163,7 +186,9 @@ def create_app() -> FastAPI:
             "policy_engine": "ready",
             "policy_max_tier": int(policy_engine.max_tier),
             "kill_switches": list(policy_engine.kill_switches),
-            "elabftw": "not_configured",
+            "elabftw": (
+                "configured" if elabftw_adapter.client is not None else "not_configured"
+            ),
             "opencloning": "not_configured",
             "wallac": "not_configured",
             "bentolab": "not_configured",
@@ -297,6 +322,37 @@ def create_app() -> FastAPI:
         if record is None:
             return None
         return record.to_dict()
+
+    @api.post("/elabftw/read_current_experiment")
+    def elabftw_read_current_experiment(body: ElabftwReadBody) -> dict[str, object]:
+        """Read the experiment referenced by the caller's context token.
+
+        Orchestrates token verification → identity resolution → policy decision
+        → downstream eLabFTW HTTP call → audit record.  Returns the read
+        result on success or an ``error`` payload on any adapter failure
+        (invalid token, unmapped caller, policy denied, client error).
+        """
+        adapter = get_elabftw_read_adapter()
+        # Resolve the mapped identity before invoking the adapter so the
+        # adapter receives a `MappedIdentity | None` to fail closed on.
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        try:
+            result = adapter.read_current_experiment(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+        except ElabftwAdapterError as exc:
+            return {"ok": False, **exc.to_dict()}
+        return {"ok": True, "experiment": result.to_dict()}
 
     return api
 

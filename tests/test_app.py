@@ -9,19 +9,29 @@ from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
 from lab_copilot_gateway.approval import ApprovalStore
 from lab_copilot_gateway.audit import AuditStore
+from lab_copilot_gateway.elabftw import (
+    ContextTokenClaims,
+    ElabftwReadAdapter,
+    StubElabftwClient,
+    mint_context_token,
+)
 from lab_copilot_gateway.identity import DbIdentityMapper
 from lab_copilot_gateway.policy import PolicyEngine
 
 
 @pytest.fixture(autouse=True)
-def _reset_audit_store() -> None:
+def _reset_audit_store(monkeypatch) -> None:
     """Use in-memory audit store per test to avoid cross-test bleed."""
     import lab_copilot_gateway.app as appmod
     import lab_copilot_gateway.approval as approvalmod
     import lab_copilot_gateway.audit as auditmod
+    import lab_copilot_gateway.elabftw as elabmod
     import lab_copilot_gateway.identity as identitymod
     import lab_copilot_gateway.policy as policymod
     import lab_copilot_gateway.tools as toolsmod
+
+    # Pin the context-token secret for HTTP-level tests that mint tokens.
+    monkeypatch.setenv("LAB_COPILOT_TOKEN_SECRET", "http-test-secret")
 
     original_audit = appmod.get_audit_store()
     store = AuditStore(db_path=":memory:")
@@ -32,6 +42,23 @@ def _reset_audit_store() -> None:
     auditmod._default_store = store
     identitymod._default_mapper = DbIdentityMapper(db_path=":memory:")
     approvalmod._default_store = approval_store
+    # Wire the eLabFTW adapter with a stub client so the HTTP path is testable
+    # without a live eLabFTW instance.
+    stub_client = StubElabftwClient(
+        seeds={
+            42: {
+                "id": 42,
+                "title": "HTTP test experiment",
+                "body": "<p>body</p>",
+                "metadata": {"extra_fields": {}},
+            }
+        }
+    )
+    elabmod._default_adapter = ElabftwReadAdapter(
+        policy_engine=policymod._default_engine,
+        audit_store=store,
+        client=stub_client,
+    )
     original_tools = toolsmod._default_registry
     toolsmod._default_registry = None  # fall back to the curated catalog
     yield
@@ -41,6 +68,7 @@ def _reset_audit_store() -> None:
     policymod._default_engine = original_policy
     identitymod._default_mapper = None
     approvalmod._default_store = None
+    elabmod._default_adapter = None
     toolsmod._default_registry = original_tools
 
 
@@ -60,7 +88,8 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["policy_engine"] == "ready"
     assert body["dependencies"]["policy_max_tier"] == 6
     assert body["dependencies"]["kill_switches"] == []
-    assert body["dependencies"]["elabftw"] == "not_configured"
+    # eLabFTW adapter is wired with a stub client by the test fixture.
+    assert body["dependencies"]["elabftw"] == "configured"
     # Identity mapper defaults to in-memory db backend (fail-closed).
     assert body["dependencies"]["identity_backend"] == "db"
     assert body["dependencies"]["identity_db"] == "memory"
@@ -424,3 +453,84 @@ def test_approval_get_returns_null_for_unknown() -> None:
     r = client.get("/approval/does-not-exist")
     assert r.status_code == 200
     assert r.json() is None
+
+
+# --- /elabftw/read_current_experiment HTTP roundtrips (C08) ---------------
+
+
+def _http_claims(experiment_id: int = 42) -> ContextTokenClaims:
+    import datetime as _dt
+
+    issued = _dt.datetime.now(_dt.timezone.utc)
+    return ContextTokenClaims(
+        experiment_id=experiment_id,
+        mapped_elabftw_user_id="elab-http-1",
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        issued_at=issued.isoformat(),
+        expires_at=(issued + _dt.timedelta(seconds=600)).isoformat(),
+    )
+
+
+def _http_token(claims: ContextTokenClaims | None = None) -> str:
+    return mint_context_token(claims or _http_claims())
+
+
+def test_elabftw_read_current_experiment_succeeds() -> None:
+    """Happy path: mapped user with valid token → adapter returns the
+    experiment, audit record persisted."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    body = {
+        "context_token": _http_token(),
+        "keycloak_subject": "kc-http-1",
+        "conversation_id": "conv-http-1",
+        "request_id": "req-http-1",
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+    }
+    r = client.post("/elabftw/read_current_experiment", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    exp = out["experiment"]
+    assert exp["experiment_id"] == 42
+    assert exp["title"] == "HTTP test experiment"
+
+
+def test_elabftw_read_current_experiment_unmapped_user_fails() -> None:
+    """No identity mapping in DB → mapped_identity=None → ok:false."""
+    client = make_client()
+    body = {
+        "context_token": _http_token(),
+        "keycloak_subject": "absent",
+    }
+    r = client.post("/elabftw/read_current_experiment", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "unmapped_caller"
+
+
+def test_elabftw_read_current_experiment_invalid_token_fails() -> None:
+    """Invalid (garbage) token → ok:false with reason invalid_context_token."""
+    client = make_client()
+    body = {
+        "context_token": "garbage.payload",
+        "keycloak_subject": "absent",
+    }
+    r = client.post("/elabftw/read_current_experiment", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_context_token"
