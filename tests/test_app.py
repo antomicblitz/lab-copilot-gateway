@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime as _dt
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -12,6 +14,7 @@ from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
     ElabftwReadAdapter,
+    ElabftwWriteAdapter,
     StubElabftwClient,
     mint_context_token,
 )
@@ -51,12 +54,23 @@ def _reset_audit_store(monkeypatch) -> None:
                 "title": "HTTP test experiment",
                 "body": "<p>body</p>",
                 "metadata": {"extra_fields": {}},
+                "state": 1,
+                "locked": 0,
+                "uploads": [],
             }
         }
     )
     elabmod._default_adapter = ElabftwReadAdapter(
         policy_engine=policymod._default_engine,
         audit_store=store,
+        client=stub_client,
+    )
+    # Wire the C09 write adapter with the same stub client and approval store
+    # so the write HTTP path is testable without a live eLabFTW instance.
+    elabmod._default_write_adapter = ElabftwWriteAdapter(
+        policy_engine=policymod._default_engine,
+        audit_store=store,
+        approval_store=approval_store,
         client=stub_client,
     )
     original_tools = toolsmod._default_registry
@@ -69,6 +83,7 @@ def _reset_audit_store(monkeypatch) -> None:
     identitymod._default_mapper = None
     approvalmod._default_store = None
     elabmod._default_adapter = None
+    elabmod._default_write_adapter = None
     toolsmod._default_registry = original_tools
 
 
@@ -534,3 +549,195 @@ def test_elabftw_read_current_experiment_invalid_token_fails() -> None:
     out = r.json()
     assert out["ok"] is False
     assert out["reason"] == "invalid_context_token"
+
+
+# --- /elabftw/draft_experiment_update and /elabftw/amend_my_experiment_after_approval
+#     HTTP roundtrips (C09)
+
+
+def _http_write_claims(experiment_id: int = 42) -> ContextTokenClaims:
+    issued = _dt.datetime.now(_dt.timezone.utc)
+    return ContextTokenClaims(
+        experiment_id=experiment_id,
+        mapped_elabftw_user_id="elab-http-1",
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        issued_at=issued.isoformat(),
+        expires_at=(issued + _dt.timedelta(seconds=600)).isoformat(),
+    )
+
+
+def _http_amend_body(
+    *,
+    context_token: str,
+    approval_id: str,
+    args: dict,
+    amendment_html: str = "<p>AI note</p>",
+) -> dict[str, object]:
+    return {
+        "context_token": context_token,
+        "approval_id": approval_id,
+        "approval_args": args,
+        "keycloak_subject": "kc-http-1",
+        "conversation_id": "conv-write",
+        "request_id": "req-write",
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+        "amendment_html": amendment_html,
+    }
+
+
+def test_elabftw_amend_my_experiment_after_approval_succeeds() -> None:
+    """Happy path: mapped user with valid token + approval → amend succeeds.
+
+    Verifies:
+        * POST /approval/request issues an approval_id bound to args.
+        * POST /elabftw/amend_my_experiment_after_approval consumes the
+          approval and writes the amendment downstream.
+        * Response includes ok:true with operation, experiment_id,
+          downstream_id, and audit_action_id.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    amend_args = {"experiment_id": 42, "amendment_html": "<p>AI note</p>"}
+    # 1. Request an approval token.
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.amend_my_experiment_after_approval",
+            "args": amend_args,
+            "target_record": "elabftw:experiment:42",
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    assert approval_resp.status_code == 200
+    approval_id = approval_resp.json()["approval_id"]
+
+    # 2. Amend with the approval.
+    body = _http_amend_body(
+        context_token=mint_context_token(_http_write_claims()),
+        approval_id=approval_id,
+        args=amend_args,
+    )
+    r = client.post("/elabftw/amend_my_experiment_after_approval", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    write = out["write"]
+    assert write["operation"] == "append_amendment"
+    assert write["experiment_id"] == 42
+    assert write["audit_action_id"]
+
+
+def test_elabftw_amend_denies_without_approval_token() -> None:
+    """Approval token is required for tier-4 writes — passing a nonexistent
+    approval_id → ok:false with an approval_denied reason."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    body = _http_amend_body(
+        context_token=mint_context_token(_http_write_claims()),
+        approval_id="nonexistent-approval",
+        args={"experiment_id": 42, "amendment_html": "<p>x</p>"},
+    )
+    r = client.post("/elabftw/amend_my_experiment_after_approval", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert "approval_denied" in out["reason"] or "approval_consume" in out["reason"]
+
+
+def test_elabftw_amend_rejects_invalid_context_token() -> None:
+    """Invalid context token → ok:false with reason invalid_context_token,
+    before any approval token is consumed."""
+    client = make_client()
+    body = _http_amend_body(
+        context_token="garbage.payload",
+        approval_id="any",
+        args={"experiment_id": 42, "amendment_html": "<p>x</p>"},
+    )
+    r = client.post("/elabftw/amend_my_experiment_after_approval", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_context_token"
+
+
+def test_elabftw_draft_experiment_update_succeeds() -> None:
+    """Happy path: draft_experiment_update creates a new experiment."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    draft_args = {"title": "AI-proposed draft"}
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.draft_experiment_update",
+            "args": draft_args,
+            "target_record": None,
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    approval_id = approval_resp.json()["approval_id"]
+
+    body = {
+        "context_token": mint_context_token(_http_write_claims()),
+        "approval_id": approval_id,
+        "approval_args": draft_args,
+        "keycloak_subject": "kc-http-1",
+    }
+    r = client.post("/elabftw/draft_experiment_update", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    write = out["write"]
+    assert write["operation"] == "create_draft"
+    assert write["audit_action_id"]
+
+
+def test_elabftw_health_reports_elabftw_write_status() -> None:
+    """The /health endpoint should still report `elabftw: configured` when
+    the stub client is wired (the C09 adapter shares the same client)."""
+    r = make_client().get("/health")
+    assert r.status_code == 200
+    assert r.json()["dependencies"]["elabftw"] == "configured"

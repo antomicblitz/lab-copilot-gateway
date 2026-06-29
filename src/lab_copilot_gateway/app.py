@@ -21,6 +21,7 @@ from lab_copilot_gateway.config import get_public_config
 from lab_copilot_gateway.elabftw import (
     ElabftwAdapterError,
     get_elabftw_read_adapter,
+    get_elabftw_write_adapter,
 )
 from lab_copilot_gateway.identity import (
     DbIdentityMapper,
@@ -131,6 +132,60 @@ class ElabftwReadBody(BaseModel):
     model_id: str | None = None
 
 
+class ElabftwDraftBody(BaseModel):
+    """Request body for POST /elabftw/draft_experiment_update (C09).
+
+    Caller supplies the signed context token, an approval_id issued via
+    POST /approval/request bound to the exact args the LLM is about to
+    draft, the identity fields used to resolve the mapped user, and the
+    proposed draft args (title/body) the approval was issued for.  The
+    adapter verifies the approval token, consumes it, and writes the
+    draft downstream.
+
+    Security: there is NO separate ``target_title`` field.  The title is
+    sourced from ``approval_args['title']`` so the approval-token hash
+    binds it; callers cannot override the title without breaking the hash.
+    """
+
+    context_token: str
+    approval_id: str
+    approval_args: dict[str, Any] = Field(default_factory=dict)
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+
+
+class ElabftwAmendBody(BaseModel):
+    """Request body for POST /elabftw/amend_my_experiment_after_approval (C09).
+
+    Caller supplies the signed context token, an approval_id issued via
+    POST /approval/request bound to the exact amendment args, the
+    identity fields used to resolve the mapped user, the amendment HTML,
+    and (optionally) an attachment to upload alongside the amendment.  The
+    adapter verifies the approval, consumes it, checks the target experiment's
+    state (append-only enforcement), appends the amendment, optionally
+    uploads the attachment, then writes provenance (audit_action_id) back
+    into the experiment metadata.
+    """
+
+    context_token: str
+    approval_id: str
+    approval_args: dict[str, Any] = Field(default_factory=dict)
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+    amendment_html: str = ""
+    attachment_filename: str | None = None
+    attachment_b64: str | None = None  # base64-encoded bytes
+    attachment_comment: str = ""
+
+
 def _identity_to_dict(identity: MappedIdentity) -> dict[str, Any]:
     return {
         "mapped": True,
@@ -169,12 +224,16 @@ def create_app() -> FastAPI:
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
 
     # Eagerly initialize audit store, policy engine, identity mapper,
-    # approval store, and eLabFTW read adapter so /health reflects state.
+    # approval store, eLabFTW read adapter (C08), and eLabFTW write adapter
+    # (C09) so /health reflects state.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
     identity_mapper = get_identity_mapper()
     approval_store = get_approval_store()
     elabftw_adapter = get_elabftw_read_adapter()
+    # Trigger construction of the write adapter singleton (no binding needed
+    # here, but the call ensures /health shows the configured state).
+    get_elabftw_write_adapter()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -353,6 +412,92 @@ def create_app() -> FastAPI:
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "experiment": result.to_dict()}
+
+    @api.post("/elabftw/draft_experiment_update")
+    def elabftw_draft_experiment_update(body: ElabftwDraftBody) -> dict[str, object]:
+        """Create a new draft experiment through the C09 write adapter.
+
+        Orchestrates token verification → identity resolution → policy
+        decision (tier 4 bounded write) → approval token consume →
+        downstream ``create_experiment`` → provenance writeback → audit
+        record.  Returns the new experiment id on success or an ``error``
+        payload on any failure (invalid token, unmapped caller, policy
+        denied, approval_denied, append_only_violation, client_error).
+        """
+        adapter = get_elabftw_write_adapter()
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        try:
+            result = adapter.draft_experiment_update(
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+        except ElabftwAdapterError as exc:
+            return {"ok": False, **exc.to_dict()}
+        return {"ok": True, "write": result.to_dict()}
+
+    @api.post("/elabftw/amend_my_experiment_after_approval")
+    def elabftw_amend_my_experiment_after_approval(
+        body: ElabftwAmendBody,
+    ) -> dict[str, object]:
+        """Append an approved amendment section to the user's experiment.
+
+        Orchestrates token verification → identity resolution → policy
+        decision (tier 4 bounded write) → append-only state check →
+        approval token consume → append amendment + optional attachment →
+        provenance writeback → audit record.  Returns the amendment
+        outcome on success or an ``error`` payload on any failure.
+        """
+        import base64
+
+        # Decode attachment (if provided) from base64 to bytes.  Malformed
+        # base64 returns a clean error rather than a 500.
+        attachment_data: bytes | None = None
+        if body.attachment_b64 is not None and body.attachment_filename:
+            try:
+                attachment_data = base64.b64decode(body.attachment_b64)
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "client_error",
+                    "message": f"attachment_b64 is not valid base64: {exc}",
+                }
+
+        adapter = get_elabftw_write_adapter()
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        try:
+            result = adapter.amend_my_experiment_after_approval(
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+                amendment_html=body.amendment_html,
+                attachment_filename=body.attachment_filename,
+                attachment_data=attachment_data,
+                attachment_comment=body.attachment_comment,
+            )
+        except ElabftwAdapterError as exc:
+            return {"ok": False, **exc.to_dict()}
+        return {"ok": True, "write": result.to_dict()}
 
     return api
 
