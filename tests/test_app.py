@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
 from lab_copilot_gateway.audit import AuditStore
+from lab_copilot_gateway.identity import DbIdentityMapper
 from lab_copilot_gateway.policy import PolicyEngine
 
 
@@ -16,6 +17,7 @@ def _reset_audit_store() -> None:
     """Use in-memory audit store per test to avoid cross-test bleed."""
     import lab_copilot_gateway.app as appmod
     import lab_copilot_gateway.audit as auditmod
+    import lab_copilot_gateway.identity as identitymod
     import lab_copilot_gateway.policy as policymod
 
     original_audit = appmod.get_audit_store()
@@ -24,10 +26,12 @@ def _reset_audit_store() -> None:
     policymod._default_engine = PolicyEngine()  # clean default, no kill switches
     # Inject into the module-level singleton before create_app runs.
     auditmod._default_store = store
+    identitymod._default_mapper = DbIdentityMapper(db_path=":memory:")
     yield
     store.close()
     auditmod._default_store = original_audit
     policymod._default_engine = original_policy
+    identitymod._default_mapper = None
 
 
 def make_client() -> TestClient:
@@ -47,6 +51,9 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["policy_max_tier"] == 6
     assert body["dependencies"]["kill_switches"] == []
     assert body["dependencies"]["elabftw"] == "not_configured"
+    # Identity mapper defaults to in-memory db backend (fail-closed).
+    assert body["dependencies"]["identity_backend"] == "db"
+    assert body["dependencies"]["identity_db"] == "memory"
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -166,3 +173,61 @@ def test_policy_evaluate_denies_unmapped_user() -> None:
     out = r.json()
     assert out["decision"] == "deny"
     assert out["reason"] == "unmapped_caller"
+
+
+# --- /identity/resolve HTTP roundtrips -----------------------------------
+
+
+def test_identity_resolve_unmapped_returns_mapped_false() -> None:
+    """Default in-memory DB has no mappings → fail-closed mapped=false."""
+    client = make_client()
+    r = client.post("/identity/resolve", json={"keycloak_subject": "absent"})
+    assert r.status_code == 200
+    assert r.json() == {"mapped": False}
+
+
+def test_identity_resolve_mapped_user_returns_team_ids() -> None:
+    """Seed the in-memory mapper; resolver returns the full identity."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-app-1",
+        librechat_user_id="lc-app-1",
+        elabftw_user_id="elab-app-1",
+        elabftw_team_ids=["team-a", "team-b"],
+    )
+
+    client = make_client()
+    r = client.post("/identity/resolve", json={"keycloak_subject": "kc-app-1"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mapped"] is True
+    assert body["elabftw_user_id"] == "elab-app-1"
+    assert body["elabftw_team_id"] == "team-a"
+    assert body["elabftw_team_ids"] == ["team-a", "team-b"]
+    assert body["keycloak_subject"] == "kc-app-1"
+    assert body["librechat_user_id"] == "lc-app-1"
+
+
+def test_identity_resolve_by_librechat_user_id_works() -> None:
+    """Either identifier resolves the identity."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-app-2",
+        librechat_user_id="lc-app-2",
+        elabftw_user_id="elab-app-2",
+        elabftw_team_ids=["only-team"],
+    )
+
+    client = make_client()
+    r = client.post("/identity/resolve", json={"librechat_user_id": "lc-app-2"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["mapped"] is True
+    assert body["elabftw_user_id"] == "elab-app-2"
+    assert body["elabftw_team_ids"] == ["only-team"]

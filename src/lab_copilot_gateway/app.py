@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import os
+from typing import Any
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.config import get_public_config
+from lab_copilot_gateway.identity import (
+    DbIdentityMapper,
+    IdentityMapper,
+    MappedIdentity,
+    get_identity_mapper,
+)
 from lab_copilot_gateway.policy import PolicyRequest, Tier, get_policy_engine
 from lab_copilot_gateway.tools import list_tools
 
@@ -48,36 +57,73 @@ class PolicyRequestBody(BaseModel):
     approval_id: str | None = None
 
 
+class IdentityResolveBody(BaseModel):
+    """Request body for POST /identity/resolve.
+
+    Either identifier alone is sufficient — a row matching either one resolves
+    the identity.  Both ``None`` resolves nothing.
+    """
+
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+
+
+def _identity_to_dict(identity: MappedIdentity) -> dict[str, Any]:
+    return {
+        "mapped": True,
+        "keycloak_subject": identity.keycloak_subject,
+        "librechat_user_id": identity.librechat_user_id,
+        "elabftw_user_id": identity.elabftw_user_id,
+        "elabftw_team_id": identity.elabftw_team_id,
+        "elabftw_team_ids": list(identity.elabftw_team_ids),
+    }
+
+
+def _identity_backend_status(mapper: IdentityMapper) -> dict[str, str]:
+    """Health-facing summary of the identity mapper backend."""
+    if isinstance(mapper, DbIdentityMapper):
+        return {
+            "identity_backend": "db",
+            "identity_db": "configured" if mapper.db_path != ":memory:" else "memory",
+        }
+    return {
+        "identity_backend": "static",
+        "identity_path": os.getenv("LAB_COPILOT_IDENTITY_MAP_PATH", ""),
+    }
+
+
 def create_app() -> FastAPI:
     """Create the ASGI application."""
     service_name = "lab-copilot-gateway"
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
 
-    # Eagerly initialize audit store and policy engine so /health reflects state.
+    # Eagerly initialize audit store, policy engine, and identity mapper so
+    # /health reflects state.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
+    identity_mapper = get_identity_mapper()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
 
     @api.get("/health")
     def health() -> dict[str, object]:
+        deps: dict[str, object] = {
+            "audit_db": "configured" if audit_store.db_path != ":memory:" else "memory",
+            "policy_engine": "ready",
+            "policy_max_tier": int(policy_engine.max_tier),
+            "kill_switches": list(policy_engine.kill_switches),
+            "elabftw": "not_configured",
+            "opencloning": "not_configured",
+            "wallac": "not_configured",
+            "bentolab": "not_configured",
+        }
+        deps.update(_identity_backend_status(identity_mapper))
         return {
             "service": service_name,
             "version": __version__,
             "status": "ok",
-            "dependencies": {
-                "audit_db": "configured"
-                if audit_store.db_path != ":memory:"
-                else "memory",
-                "policy_engine": "ready",
-                "policy_max_tier": int(policy_engine.max_tier),
-                "kill_switches": list(policy_engine.kill_switches),
-                "elabftw": "not_configured",
-                "opencloning": "not_configured",
-                "wallac": "not_configured",
-                "bentolab": "not_configured",
-            },
+            "dependencies": deps,
         }
 
     @api.get("/config/public")
@@ -118,6 +164,19 @@ def create_app() -> FastAPI:
             "requires_approval": decision.requires_approval,
             "matched_kill_switches": decision.matched_kill_switches,
         }
+
+    @api.post("/identity/resolve")
+    def resolve_identity(body: IdentityResolveBody) -> dict[str, object]:
+        identity = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        if identity is None:
+            # Missing mapping fails closed — caller (LibreChat) must treat
+            # this as "no lab access" and the policy engine separately denies
+            # any subsequent /policy/evaluate call (user_id would be None).
+            return {"mapped": False}
+        return _identity_to_dict(identity)
 
     return api
 
