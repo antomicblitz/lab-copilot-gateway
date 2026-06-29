@@ -981,3 +981,334 @@ def test_elabftw_mint_token_binds_to_resolved_user_not_request() -> None:
         assert out["mapped_elabftw_user_id"] == "elab-mint-2"
     else:
         assert out["reason"] == "unmapped_caller"
+
+
+# --- POST /invoke (C13 — LibreChat tool surface) --------------------------
+#
+# /invoke is the single dispatch entry point used by the LibreChat
+# custom-endpoint service.  It enforces the C06 tool registry and
+# routes to the right adapter by tool name.  These tests cover:
+#
+#   * Acceptance #4: tool not in registry → tool_not_registered.
+#   * Happy-path dispatch to elabftw.read_current_experiment.
+#   * Happy-path dispatch to elabftw.amend_my_experiment_after_approval
+#     (with an approval token issued via /approval/request).
+#   * A registered tool whose adapter isn't implemented yet →
+#     adapter_not_implemented (so LibreChat sees a structured error,
+#     not a transport 404).
+#   * Invalid token / unmapped caller propagation: /invoke must not
+#     silently swallow adapter errors — the same reason codes the
+#     per-tool endpoints emit must come back through /invoke.
+#   * Registry unchanged after /invoke (dispatch is read-only on
+#     the registry; no tool added or removed).
+
+
+def test_invoke_rejects_tool_not_in_registry() -> None:
+    """Acceptance #4: gateway rejects direct privileged calls not in
+    tool registry.
+
+    A request with a tool_name that isn't in the C06 catalog must
+    return ok:false with reason tool_not_registered.  This is the
+    core LibreChat-facing guardrail: an attacker who crafts an
+    arbitrary tool_name (e.g. 'elabftw.delete_everything' or a raw
+    privileged endpoint name) gets nothing back.
+    """
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.delete_everything",
+            "context_token": "doesn't-matter",
+            "keycloak_subject": "kc-invoke-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["tool_name"] == "elabftw.delete_everything"
+    assert out["reason"] == "tool_not_registered"
+    assert "not in the gateway registry" in out["message"]
+
+
+def test_invoke_rejects_empty_tool_name() -> None:
+    """Empty tool_name must fail closed (tool_not_registered), not
+    dispatch to anything."""
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "",
+            "context_token": "doesn't-matter",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "tool_not_registered"
+
+
+def test_invoke_rejects_raw_endpoint_name_as_tool() -> None:
+    """An attacker trying to pass a raw privileged endpoint path as
+    tool_name (e.g. '/elabftw/experiments/42' or 'DELETE /elabftw/123')
+    must hit the registry guard, not route to anything."""
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "DELETE /elabftw/experiments/42",
+            "context_token": "doesn't-matter",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "tool_not_registered"
+
+
+def test_invoke_dispatches_elabftw_read() -> None:
+    """Happy path: tool 'elabftw.read_current_experiment' in registry,
+    mapped user, valid token → adapter returns the experiment via the
+    /invoke dispatcher (same result as POST /elabftw/read_current_experiment).
+
+    Uses kc-http-1/lc-http-1/elab-http-1 because _http_claims() (called by
+    _http_token()) binds the token to that identity — the cross-user
+    binding check requires the request identity to match the token claims.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.read_current_experiment",
+            "context_token": _http_token(),
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-invoke-read",
+            "request_id": "req-invoke-read",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["tool_name"] == "elabftw.read_current_experiment"
+    result = out["result"]
+    assert result["experiment_id"] == 42
+    assert result["title"] == "HTTP test experiment"
+
+
+def test_invoke_dispatches_elabftw_amend_with_approval() -> None:
+    """Happy path: tool 'elabftw.amend_my_experiment_after_approval'
+    with an approval token issued via /approval/request → /invoke
+    dispatches to the write adapter and returns the amendment result.
+
+    Uses kc-http-1/lc-http-1/elab-http-1 to match _http_write_claims()."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    amend_args = {"experiment_id": 42, "amendment_html": "<p>AI note via invoke</p>"}
+    # Issue the approval bound to amend_args.
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.amend_my_experiment_after_approval",
+            "args": amend_args,
+            "target_record": "elabftw:experiment:42",
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    assert approval_resp.status_code == 200
+    approval_id = approval_resp.json()["approval_id"]
+
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.amend_my_experiment_after_approval",
+            "context_token": mint_context_token(_http_write_claims()),
+            "approval_id": approval_id,
+            "args": amend_args,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-invoke-amend",
+            "request_id": "req-invoke-amend",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["tool_name"] == "elabftw.amend_my_experiment_after_approval"
+    write = out["result"]
+    assert write["operation"] == "append_amendment"
+    assert write["experiment_id"] == 42
+    assert write["audit_action_id"]
+
+
+def test_invoke_propagates_invalid_context_token() -> None:
+    """Invalid context_token → ok:false with reason invalid_context_token
+    (propagated from the underlying adapter, not swallowed)."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-invoke-invalid",
+        librechat_user_id="lc-invoke-invalid",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.read_current_experiment",
+            "context_token": "garbage.payload",
+            "keycloak_subject": "kc-invoke-invalid",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["tool_name"] == "elabftw.read_current_experiment"
+    assert out["reason"] == "invalid_context_token"
+
+
+def test_invoke_propagates_unmapped_caller() -> None:
+    """Unmapped caller identity → ok:false with reason unmapped_caller
+    (same as the per-tool endpoint)."""
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.read_current_experiment",
+            "context_token": _http_token(),
+            "keycloak_subject": "absent",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["tool_name"] == "elabftw.read_current_experiment"
+    assert out["reason"] == "unmapped_caller"
+
+
+def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
+    """Tools whose adapter is not yet implemented (opencloning.*,
+    wallac.*, bentolab.* — C16+) must return ok:false with reason
+    adapter_not_implemented, not 404 or a stack trace.  LibreChat can
+    surface this to the user as 'this tool is not wired up yet'."""
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "opencloning.parse_sequence_file",
+            "context_token": "doesn't-matter",
+            "args": {"file_format": "fasta"},
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["tool_name"] == "opencloning.parse_sequence_file"
+    assert out["reason"] == "adapter_not_implemented"
+
+
+def test_invoke_does_not_modify_registry() -> None:
+    """Dispatch is read-only on the registry: invoking a tool neither
+    adds nor removes registry entries.  /health still reports
+    tool_count: 13 and /tools still returns the same catalog."""
+    client = make_client()
+    before = client.get("/tools").json()["tools"]
+    # Hit a couple of paths that exercise different code branches.
+    client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.delete_everything",
+            "context_token": "x",
+        },
+    )
+    client.post(
+        "/invoke",
+        json={
+            "tool_name": "wallac.get_status",
+            "context_token": "x",
+        },
+    )
+    after = client.get("/tools").json()["tools"]
+    assert before == after
+    health = client.get("/health").json()
+    assert health["dependencies"]["tool_count"] == 13  # noqa: PLR2004
+
+
+def test_invoke_amend_missing_approval_id_denies() -> None:
+    """amend requires approval; passing a nonexistent approval_id still
+    hits the adapter's approval gate (same as the per-tool endpoint),
+    returning approval_denied rather than /invoke short-circuiting.
+
+    Uses kc-http-1/lc-http-1 to match _http_write_claims()."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.amend_my_experiment_after_approval",
+            "context_token": mint_context_token(_http_write_claims()),
+            "approval_id": "nonexistent-approval",
+            "args": {"experiment_id": 42, "amendment_html": "<p>x</p>"},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["tool_name"] == "elabftw.amend_my_experiment_after_approval"
+    # Adapter emits approval_denied / approval_consume_* (mirrors the
+    # per-tool endpoint's behaviour — /invoke doesn't short-circuit).
+    assert "approval" in out["reason"] or "consum" in out["reason"]
+
+
+def test_invoke_health_reflects_tool_count() -> None:
+    """/health still exposes the tool_count surface so operators and
+    the custom-endpoint service can discover whether /invoke is wired
+    to a non-empty registry."""
+    body = make_client().get("/health").json()
+    assert body["dependencies"]["tool_count"] == 13  # noqa: PLR2004

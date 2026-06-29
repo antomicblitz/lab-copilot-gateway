@@ -212,6 +212,46 @@ class ElabftwAmendBody(BaseModel):
     attachment_comment: str = ""
 
 
+class InvokeBody(BaseModel):
+    """Request body for POST /invoke (C13 — LibreChat tool surface).
+
+    Single dispatch entry point used by the LibreChat custom-endpoint
+    service (see copilot/librechat-custom-endpoint/) to invoke a cur-
+    ated gateway tool by name.  The body carries:
+
+        * ``tool_name``    — must match an entry in the C06 registry;
+          anything else is rejected with ``tool_not_registered``
+          (C13 acceptance check #4: gateway rejects direct privileged
+          calls not in tool registry).
+        * ``context_token`` — signed token from the eLabFTW launcher
+          (C11 mint endpoint); adapter verifies + binds identity.
+        * ``args``          — tool-specific args (title, amendment_html,
+          experiment_id carryover, etc.).
+        * ``approval_id``   — required for tier-4 (mutating) tools; the
+          adapter consumes it after hashing ``args``.
+        * identity / provenance fields — mirror the per-tool endpoints
+          so audit records carry the same metadata.
+
+    The endpoint is a thin dispatcher: it looks up the tool in the
+    registry, refuses anything that is not registered, then routes to
+    the appropriate adapter by ``tool.adapter`` + ``tool.name``.  Tools
+    whose adapter is not yet implemented (opencloning.*, wallac.*,
+    bentolab.* — C16+) return ``adapter_not_implemented`` rather than
+    404 so the LibreChat side gets a structured error it can surface.
+    """
+
+    tool_name: str
+    context_token: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    approval_id: str | None = None
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+
+
 def _identity_to_dict(identity: MappedIdentity) -> dict[str, Any]:
     return {
         "mapped": True,
@@ -578,6 +618,169 @@ def create_app() -> FastAPI:
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "write": result.to_dict()}
+
+    # --- C13: LibreChat tool-surface dispatcher -------------------------
+    #
+    # POST /invoke is the single entry point used by the LibreChat
+    # custom-endpoint service (copilot/librechat-custom-endpoint/).  It
+    # enforces the C06 tool registry — anything not in the registry is
+    # rejected with tool_not_registered (C13 acceptance #4).  Routing
+    # then fans out by adapter:
+    #
+    #   elabftw.read_current_experiment
+    #     → ElabftwReadAdapter.read_current_experiment
+    #   elabftw.draft_experiment_update
+    #     → ElabftwWriteAdapter.draft_experiment_update
+    #   elabftw.amend_my_experiment_after_approval
+    #     → ElabftwWriteAdapter.amend_my_experiment_after_approval
+    #   opencloning.*, wallac.*, bentolab.*
+    #     → adapter_not_implemented (those adapters land in C16+)
+    #
+    # Returns a uniform {ok, tool_name, result? | reason, message?}
+    # shape so the custom-endpoint translator can map it into OpenAI's
+    # chat-completions tool-call response without per-tool branching.
+
+    @api.post("/invoke")
+    def invoke(body: InvokeBody) -> dict[str, object]:
+        """Invoke a registered tool by name (C13 LibreChat surface).
+
+        Acceptance #4 (gateway rejects direct privileged calls not in
+        tool registry): an unregistered ``tool_name`` returns
+        ``ok:false`` with reason ``tool_not_registered`` and HTTP 200
+        (the custom-endpoint service treats non-200 as transport
+        failure; structured errors stay in-band).
+        """
+        registry = get_tool_registry()
+        tool = registry.find(body.tool_name)
+        if tool is None:
+            return {
+                "ok": False,
+                "tool_name": body.tool_name,
+                "reason": "tool_not_registered",
+                "message": (
+                    f"tool {body.tool_name!r} is not in the gateway registry; "
+                    "LibreChat may only invoke curated C06 tools"
+                ),
+            }
+
+        # Dispatch by adapter.  Each branch reuses the same adapter
+        # call the per-tool endpoint makes so the C08/C09 invariants
+        # (token verify, identity binding, policy, approval consume,
+        # audit) are preserved exactly.
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+
+        if tool.adapter == "elabftw":
+            # Reuse the per-tool endpoint logic by calling the
+            # underlying adapter directly.  This keeps /invoke and the
+            # per-tool endpoints in lockstep — no separate code path
+            # for the same tool.
+            try:
+                if tool.name == "elabftw.read_current_experiment":
+                    adapter = get_elabftw_read_adapter()
+                    result = adapter.read_current_experiment(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.draft_experiment_update":
+                    adapter = get_elabftw_write_adapter()
+                    result = adapter.draft_experiment_update(
+                        context_token=body.context_token,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.amend_my_experiment_after_approval":
+                    import base64
+
+                    attachment_data: bytes | None = None
+                    attachment_filename = body.args.get("attachment_filename")
+                    attachment_b64 = body.args.get("attachment_b64")
+                    if attachment_b64 and attachment_filename:
+                        try:
+                            attachment_data = base64.b64decode(attachment_b64)
+                        except Exception as exc:
+                            return {
+                                "ok": False,
+                                "tool_name": tool.name,
+                                "reason": "client_error",
+                                "message": f"attachment_b64 is not valid base64: {exc}",
+                            }
+                    adapter = get_elabftw_write_adapter()
+                    result = adapter.amend_my_experiment_after_approval(
+                        context_token=body.context_token,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                        amendment_html=body.args.get("amendment_html", ""),
+                        attachment_filename=attachment_filename,
+                        attachment_data=attachment_data,
+                        attachment_comment=body.args.get("attachment_comment", ""),
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                else:
+                    # elabftw adapter but no known tool mapping —
+                    # shouldn't happen (registry only contains the
+                    # three above), but fail closed just in case.
+                    return {
+                        "ok": False,
+                        "tool_name": tool.name,
+                        "reason": "tool_not_dispatched",
+                        "message": (
+                            f"tool {tool.name!r} is in the elabftw adapter but "
+                            "has no /invoke dispatch path"
+                        ),
+                    }
+            except ElabftwAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+        # Adapters that don't exist yet (C16+).  Return a structured
+        # error so the LibreChat side can surface a clear "this tool
+        # is not wired up yet" message instead of a transport 404.
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "adapter_not_implemented",
+            "message": (
+                f"tool {tool.name!r} is in the registry but its "
+                f"{tool.adapter!r} adapter is not implemented yet "
+                "(lands in C16+)"
+            ),
+        }
 
     return api
 
