@@ -8,22 +8,26 @@ from fastapi.testclient import TestClient
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
 from lab_copilot_gateway.audit import AuditStore
+from lab_copilot_gateway.policy import PolicyEngine
 
 
 @pytest.fixture(autouse=True)
 def _reset_audit_store() -> None:
     """Use in-memory audit store per test to avoid cross-test bleed."""
     import lab_copilot_gateway.app as appmod
-
-    original = appmod.get_audit_store()
-    store = AuditStore(db_path=":memory:")
-    # Inject into the module-level singleton before create_app runs.
     import lab_copilot_gateway.audit as auditmod
+    import lab_copilot_gateway.policy as policymod
 
+    original_audit = appmod.get_audit_store()
+    store = AuditStore(db_path=":memory:")
+    original_policy = policymod._default_engine
+    policymod._default_engine = PolicyEngine()  # clean default, no kill switches
+    # Inject into the module-level singleton before create_app runs.
     auditmod._default_store = store
     yield
     store.close()
-    auditmod._default_store = original
+    auditmod._default_store = original_audit
+    policymod._default_engine = original_policy
 
 
 def make_client() -> TestClient:
@@ -39,6 +43,9 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["version"] == __version__
     assert body["status"] == "ok"
     assert body["dependencies"]["audit_db"] == "memory"
+    assert body["dependencies"]["policy_engine"] == "ready"
+    assert body["dependencies"]["policy_max_tier"] == 6
+    assert body["dependencies"]["kill_switches"] == []
     assert body["dependencies"]["elabftw"] == "not_configured"
 
 
@@ -101,3 +108,61 @@ def test_audit_failure_record_with_error_via_http() -> None:
     row = client.get("/audit/http-fail-1").json()
     assert row["policy_decision"] == "deny"
     assert "POLICY_DENIED" in row["error_json"]
+
+
+def test_policy_evaluate_allows_mapped_read() -> None:
+    client = make_client()
+    body = {
+        "tool_name": "elabftw.read_experiment",
+        "tier": 1,
+        "user_id": "elab-user-1",
+    }
+    r = client.post("/policy/evaluate", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["decision"] == "allow"
+    assert out["tier"] == 1
+
+
+def test_policy_evaluate_denies_write_without_approval() -> None:
+    client = make_client()
+    body = {
+        "tool_name": "elabftw.amend_experiment_after_approval",
+        "tier": 4,
+        "user_id": "elab-user-1",
+    }
+    r = client.post("/policy/evaluate", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["decision"] == "deny"
+    assert out["reason"] == "approval_required"
+    assert out["requires_approval"] is True
+
+
+def test_policy_evaluate_denies_hardware_even_with_approval() -> None:
+    client = make_client()
+    body = {
+        "tool_name": "wallac.run_measurement",
+        "tier": 5,
+        "user_id": "elab-user-1",
+        "has_approval": True,
+    }
+    r = client.post("/policy/evaluate", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["decision"] == "deny"
+    assert out["reason"] == "hardware_blocked"
+
+
+def test_policy_evaluate_denies_unmapped_user() -> None:
+    client = make_client()
+    body = {
+        "tool_name": "help.faq",
+        "tier": 0,
+        "user_id": None,
+    }
+    r = client.post("/policy/evaluate", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["decision"] == "deny"
+    assert out["reason"] == "unmapped_caller"
