@@ -52,6 +52,15 @@ from lab_copilot_gateway.policy import Decision, PolicyEngine, PolicyRequest, Ti
 
 # --- configuration --------------------------------------------------------
 
+# TTL caps for the C11 launcher's mint endpoint.  The launcher requests a
+# short-lived token scoped to one experiment; the gateway clamps the
+# requested TTL to [1, _MAX_MINT_TTL_SECONDS] and defaults to
+# _NORMAL_TTL_SECONDS when no TTL is supplied.  These are module-level so
+# tests can monkeypatch if needed; production tuning should be via env
+# vars only (added when a need is demonstrated).
+_NORMAL_TTL_SECONDS = 300  # 5 minutes — ample for a copilot read+amend.
+_MAX_MINT_TTL_SECONDS = 600  # 10 minutes hard cap; launchers may not exceed.
+
 
 def _env_secret() -> bytes:
     """Return the gateway's context-token HMAC secret.
@@ -188,6 +197,57 @@ def mint_context_token(
     payload_b64 = _b64url(payload_bytes)
     sig = hmac.new(sec, payload_b64.encode("ascii"), hashlib.sha256).hexdigest()
     return f"{payload_b64}.{sig}"
+
+
+def mint_token_for_identity(
+    *,
+    experiment_id: int,
+    mapped_elabftw_user_id: str,
+    keycloak_subject: str | None,
+    librechat_user_id: str | None,
+    ttl_seconds: int | None = None,
+    secret: bytes | None = None,
+) -> tuple[str, str]:
+    """Mint a context token bound to one experiment + one mapped user.
+
+    Returns ``(token, expires_at_iso)``.  TTL is clamped to
+    ``[1, _MAX_MINT_TTL_SECONDS]`` and defaults to
+    ``_NORMAL_TTL_SECONDS`` when ``None`` or non-positive.  ``expires_at``
+    is returned alongside the token so the HTTP layer does not have to
+    re-derive it from the signed payload.
+
+    This is the entrypoint the C11 launcher's ``POST /elabftw/mint_context_token``
+    endpoint calls; it deliberately takes resolved identity fields
+    (``mapped_elabftw_user_id``, ``keycloak_subject``, ``librechat_user_id``)
+    rather than an untrusted ``IdentityMapper.map()`` result — the
+    caller must first authenticate via the identity mapper (Keycloak
+    session in C14; dev header in C11) and pass the resolved fields in.
+
+    The token is single-use for *policy* (the gateway re-authenticates
+    the token signature on every read/write), but TTL-bounded: an
+    attacker who exfiltrates a token from the browser has at most
+    ``_MAX_MINT_TTL_SECONDS`` to replay it.
+    """
+    if ttl_seconds is None or ttl_seconds <= 0:
+        ttl_seconds = _NORMAL_TTL_SECONDS
+    if ttl_seconds > _MAX_MINT_TTL_SECONDS:
+        ttl_seconds = _MAX_MINT_TTL_SECONDS
+
+    now = _dt.datetime.now(_dt.timezone.utc)
+    expires = now + _dt.timedelta(seconds=ttl_seconds)
+    issued_at = now.isoformat(timespec="seconds")
+    expires_at = expires.isoformat(timespec="seconds")
+
+    claims = ContextTokenClaims(
+        experiment_id=experiment_id,
+        mapped_elabftw_user_id=mapped_elabftw_user_id,
+        keycloak_subject=keycloak_subject,
+        librechat_user_id=librechat_user_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    token = mint_context_token(claims, secret=secret)
+    return token, expires_at
 
 
 def verify_context_token(

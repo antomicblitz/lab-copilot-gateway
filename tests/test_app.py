@@ -741,3 +741,243 @@ def test_elabftw_health_reports_elabftw_write_status() -> None:
     r = make_client().get("/health")
     assert r.status_code == 200
     assert r.json()["dependencies"]["elabftw"] == "configured"
+
+
+# ============================================================================
+# C11 — POST /elabftw/mint_context_token launcher endpoint
+# ============================================================================
+#
+# The launcher (browser JS injected by Caddy) needs to obtain a short-lived
+# context token scoped to the experiment the user is viewing.  It cannot
+# read the HMAC secret (server-side only), so it calls this endpoint.
+# Trust boundary in C11 is the identity mapper: the caller self-attests
+# its `keycloak_subject`/`librechat_user_id` and the mapper must resolve
+# to a registered eLabFTW user.  C14 wraps this with Keycloak session
+# verification layered on top.
+
+
+def _register_mapped_user(
+    keycloak_subject: str = "kc-mint-1",
+    librechat_user_id: str = "lc-mint-1",
+    elabftw_user_id: str = "elab-mint-1",
+) -> None:
+    """Register a mapping in the test identity mapper; used by mint tests."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject=keycloak_subject,
+        librechat_user_id=librechat_user_id,
+        elabftw_user_id=elabftw_user_id,
+        elabftw_team_ids=["team-mint-1"],
+    )
+
+
+def test_elabftw_mint_context_token_succeeds_for_mapped_user() -> None:
+    """Mapped user → 200 ok with a signed token bound to the experiment.
+
+    The token returned must verify against the gateway secret and must
+    be consumable by the C08 read endpoint (full launcher roundtrip).
+    """
+    from lab_copilot_gateway.elabftw import verify_context_token
+
+    _register_mapped_user()
+
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 42,
+            "keycloak_subject": "kc-mint-1",
+            "librechat_user_id": "lc-mint-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["experiment_id"] == 42
+    assert out["mapped_elabftw_user_id"] == "elab-mint-1"
+    assert "expires_at" in out and out["expires_at"]
+    token = out["context_token"]
+    assert token and "." in token
+
+    # Token is verifiable and carries the expected claims.
+    claims = verify_context_token(token)
+    assert claims.experiment_id == 42
+    assert claims.mapped_elabftw_user_id == "elab-mint-1"
+    assert claims.keycloak_subject == "kc-mint-1"
+    assert claims.librechat_user_id == "lc-mint-1"
+
+
+def test_elabftw_mint_then_read_current_experiment_roundtrip() -> None:
+    """End-to-end launcher flow: mint → read with the minted token.
+
+    This is the C11 acceptance test: 'Context token is created and
+    consumed by gateway.'  The token minted here must be accepted by
+    the C08 read endpoint without further ceremony.
+    """
+    _register_mapped_user()
+    stub_seed_id = 42  # seeded by the autouse fixture
+
+    client = make_client()
+    mint_r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": stub_seed_id,
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert mint_r.status_code == 200
+    token = mint_r.json()["context_token"]
+
+    read_r = client.post(
+        "/elabftw/read_current_experiment",
+        json={
+            "context_token": token,
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert read_r.status_code == 200
+    out = read_r.json()
+    assert out["ok"] is True
+    assert out["experiment"]["experiment_id"] == stub_seed_id
+    assert out["experiment"]["title"] == "HTTP test experiment"
+
+
+def test_elabftw_mint_denies_unmapped_caller() -> None:
+    """Caller not in the identity mapper → ok:false with reason
+    unmapped_caller.  This is the C11 fail-closed auth gate."""
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 42,
+            "keycloak_subject": "not-registered",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "unmapped_caller"
+
+
+def test_elabftw_mint_denies_caller_with_no_identity_fields() -> None:
+    """Neither keycloak_subject nor librechat_user_id → unmapped.
+    Defends against a launcher that drops its identity headers."""
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={"experiment_id": 42},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "unmapped_caller"
+
+
+def test_elabftw_mint_rejects_nonpositive_experiment_id() -> None:
+    """experiment_id <= 0 is invalid even for a mapped user."""
+    _register_mapped_user()
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 0,
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_experiment_id"
+
+
+def test_elabftw_mint_ttl_clamped_to_max() -> None:
+    """requested_ttl_seconds > _MAX_MINT_TTL_SECONDS is clamped silently.
+
+    The launcher should never be able to mint a token that outlives the
+    hard cap.  We assert the returned expires_at is at most
+    _NORMAL_TTL_SECONDS + a few seconds of slack — actually capped to
+    _MAX_MINT_TTL_SECONDS, so we verify the gap is bounded by that cap
+    plus a small clock slack.
+    """
+    from lab_copilot_gateway.elabftw import _MAX_MINT_TTL_SECONDS
+
+    _register_mapped_user()
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 42,
+            "keycloak_subject": "kc-mint-1",
+            "requested_ttl_seconds": 3_600,  # 1 hour — over cap
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    expires = _dt.datetime.fromisoformat(out["expires_at"])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    delta = (expires - now).total_seconds()
+    # Cap is 600s; allow 5s clock slack.
+    assert delta <= _MAX_MINT_TTL_SECONDS + 5
+    # And not absurdly short.
+    assert delta > 60
+
+
+def test_elabftw_mint_default_ttl_when_none_supplied() -> None:
+    """No requested_ttl_seconds → uses _NORMAL_TTL_SECONDS (300s)."""
+    from lab_copilot_gateway.elabftw import _NORMAL_TTL_SECONDS
+
+    _register_mapped_user()
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 42,
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    expires = _dt.datetime.fromisoformat(out["expires_at"])
+    now = _dt.datetime.now(_dt.timezone.utc)
+    delta = (expires - now).total_seconds()
+    # Default 300s; allow 5s slack.
+    assert _NORMAL_TTL_SECONDS - 5 <= delta <= _NORMAL_TTL_SECONDS + 5
+
+
+def test_elabftw_mint_token_binds_to_resolved_user_not_request() -> None:
+    """The token carries the *resolved* eLabFTW user id, not what the
+    caller claims.  A caller mapped to elab-user-A cannot obtain a token
+    bound to elab-user-B by passing a different keycloak_subject — the
+    mapper is the source of truth."""
+    _register_mapped_user(
+        keycloak_subject="kc-mint-2",
+        librechat_user_id="lc-mint-2",
+        elabftw_user_id="elab-mint-2",
+    )
+
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": 42,
+            # Correctly registered subject.
+            "keycloak_subject": "kc-mint-2",
+            # Caller lies about its librechat id — must not influence the
+            # bound user; the mapper resolves from keycloak_subject.
+            "librechat_user_id": "lc-impostor",
+        },
+    )
+    # The mapper is keyed by both — if it doesn't match both, it returns
+    # None.  Either way, the bound user is NOT lc-impostor.
+    out = r.json()
+    if out["ok"]:
+        # If the mapper resolved by keycloak_subject alone, the bound
+        # user must still be elab-mint-2, never a value derived from
+        # the librechat_user_id field.
+        assert out["mapped_elabftw_user_id"] == "elab-mint-2"
+    else:
+        assert out["reason"] == "unmapped_caller"

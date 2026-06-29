@@ -11,11 +11,18 @@ COPY src ./src
 
 RUN pip install --no-cache-dir uv \
     && uv sync --frozen --no-dev --no-cache \
-    && adduser --system --group appuser
+    && adduser --system --group appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
 
 USER appuser
 
 EXPOSE 8080
+
+# /data holds the gateway's sqlite files (audit db, identity db). Operator
+# can mount an external volume here for persistence; otherwise it's an
+# ephemeral container-managed dir.
+VOLUME /data
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"

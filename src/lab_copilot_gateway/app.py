@@ -20,6 +20,7 @@ from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.config import get_public_config
 from lab_copilot_gateway.elabftw import (
     ElabftwAdapterError,
+    mint_token_for_identity,
     get_elabftw_read_adapter,
     get_elabftw_write_adapter,
 )
@@ -130,6 +131,31 @@ class ElabftwReadBody(BaseModel):
     request_id: str | None = None
     provider: str | None = None
     model_id: str | None = None
+
+
+class ElabftwMintBody(BaseModel):
+    """Request body for POST /elabftw/mint_context_token (C11 launcher).
+
+    Caller identifies itself via ``keycloak_subject`` and/or
+    ``librechat_user_id`` and requests a short-lived token scoped to one
+    experiment.  The gateway resolves the caller to a mapped eLabFTW
+    identity via the identity mapper (fails closed if unmapped), then mints
+    a token bound to ``experiment_id`` + the resolved identity.
+
+    Authentication: in C11 (Phase 1 dev / Tailscale) the caller
+    self-attests its ``keycloak_subject``/``librechat_user_id`` and the
+    identity mapper is the trust boundary (only pre-registered mappings
+    resolve).  C14 wraps the endpoint with Keycloak session cookie
+    verification; until then, the mapper is the auth gate.
+
+    ``requested_ttl_seconds`` is clamped server-side; callers cannot
+    exceed ``_MAX_MINT_TTL_SECONDS``.
+    """
+
+    experiment_id: int
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    requested_ttl_seconds: int | None = None
 
 
 class ElabftwDraftBody(BaseModel):
@@ -412,6 +438,60 @@ def create_app() -> FastAPI:
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "experiment": result.to_dict()}
+
+    @api.post("/elabftw/mint_context_token")
+    def elabftw_mint_context_token(body: ElabftwMintBody) -> dict[str, object]:
+        """Mint a short-lived context token for the C11 launcher.
+
+        Resolves the caller to a mapped eLabFTW identity via the identity
+        mapper (fail-closed if unmapped), then mints a token bound to
+        ``experiment_id`` + the resolved identity.  Returns the token and
+        its ``expires_at`` ISO timestamp.  TTL is clamped server-side.
+
+        The token authorizes downstream reads/writes (C08/C09) on this
+        experiment only, scoped to the resolved user.  The launcher opens
+        LibreChat with the token in the URL.
+
+        In C11, trust is the identity mapper (callers self-attest their
+        ``keycloak_subject``/``librechat_user_id``; only pre-registered
+        mappings resolve).  C14 will wrap this endpoint with Keycloak
+        session cookie verification layered on top.
+        """
+        # Fail-closed auth gate: identity mapper must resolve the caller.
+        # Either keycloak_subject or librechat_user_id may be the lookup key
+        # depending on the mapper backend; both-None is always unmapped.
+        mapped = identity_mapper.map(
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        if mapped is None:
+            return {
+                "ok": False,
+                "reason": "unmapped_caller",
+                "message": ("caller did not resolve to a mapped eLabFTW identity"),
+            }
+
+        if body.experiment_id <= 0:
+            return {
+                "ok": False,
+                "reason": "invalid_experiment_id",
+                "message": "experiment_id must be a positive integer",
+            }
+
+        token, expires_at = mint_token_for_identity(
+            experiment_id=body.experiment_id,
+            mapped_elabftw_user_id=mapped.elabftw_user_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            ttl_seconds=body.requested_ttl_seconds,
+        )
+        return {
+            "ok": True,
+            "context_token": token,
+            "expires_at": expires_at,
+            "experiment_id": body.experiment_id,
+            "mapped_elabftw_user_id": mapped.elabftw_user_id,
+        }
 
     @api.post("/elabftw/draft_experiment_update")
     def elabftw_draft_experiment_update(body: ElabftwDraftBody) -> dict[str, object]:
