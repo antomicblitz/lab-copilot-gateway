@@ -19,6 +19,7 @@ def _reset_audit_store() -> None:
     import lab_copilot_gateway.audit as auditmod
     import lab_copilot_gateway.identity as identitymod
     import lab_copilot_gateway.policy as policymod
+    import lab_copilot_gateway.tools as toolsmod
 
     original_audit = appmod.get_audit_store()
     store = AuditStore(db_path=":memory:")
@@ -27,11 +28,14 @@ def _reset_audit_store() -> None:
     # Inject into the module-level singleton before create_app runs.
     auditmod._default_store = store
     identitymod._default_mapper = DbIdentityMapper(db_path=":memory:")
+    original_tools = toolsmod._default_registry
+    toolsmod._default_registry = None  # fall back to the curated catalog
     yield
     store.close()
     auditmod._default_store = original_audit
     policymod._default_engine = original_policy
     identitymod._default_mapper = None
+    toolsmod._default_registry = original_tools
 
 
 def make_client() -> TestClient:
@@ -54,6 +58,8 @@ def test_health_returns_version_and_dependency_status() -> None:
     # Identity mapper defaults to in-memory db backend (fail-closed).
     assert body["dependencies"]["identity_backend"] == "db"
     assert body["dependencies"]["identity_db"] == "memory"
+    # C06 curated tool catalog.
+    assert body["dependencies"]["tool_count"] == 13  # noqa: PLR2004 — catalog size
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -70,11 +76,62 @@ def test_public_config_is_deterministic_and_non_secret() -> None:
     }
 
 
-def test_tools_registry_starts_empty() -> None:
+def test_tools_registry_returns_curated_catalog() -> None:
+    """GET /tools returns the curated V1 catalog (C06).
+
+    Each entry must contain the required fields and must NOT expose raw
+    low-level endpoint URLs (acceptance check: registry does not surface
+    callable endpoint strings).
+    """
     response = make_client().get("/tools")
 
     assert response.status_code == 200
-    assert response.json() == {"tools": []}
+    tools = response.json()["tools"]
+    assert len(tools) == 13  # noqa: PLR2004 — V1 catalog size is a contract
+
+    required_fields = {
+        "name",
+        "tier",
+        "tier_name",
+        "adapter",
+        "requires_approval",
+        "mutability",
+        "description",
+    }
+    forbidden_fields = {
+        "url",
+        "endpoint",
+        "endpoint_url",
+        "raw_endpoint",
+        "raw_url",
+        "http_method",
+        "http_path",
+    }
+    names = set()
+    for entry in tools:
+        assert required_fields.issubset(entry.keys())
+        # Reason: registry must never surface raw downstream endpoint URLs as
+        # callable strings to the LLM.
+        assert not (forbidden_fields & set(entry.keys()))
+        names.add(entry["name"])
+
+    # All 13 tools from the C06 plan must be present.
+    expected_names = {
+        "elabftw.read_current_experiment",
+        "elabftw.draft_experiment_update",
+        "elabftw.amend_my_experiment_after_approval",
+        "opencloning.parse_sequence_file",
+        "opencloning.manual_sequence",
+        "opencloning.oligo_hybridization",
+        "opencloning.simulate_assembly",
+        "wallac.get_status",
+        "wallac.propose_generated_protocol",
+        "wallac.validate_generated_protocol",
+        "wallac.prepare_submission_package",
+        "bentolab.get_status",
+        "bentolab.validate_pcr_profile",
+    }
+    assert names == expected_names
 
 
 def test_audit_roundtrip_via_http() -> None:

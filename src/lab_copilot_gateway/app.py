@@ -18,7 +18,7 @@ from lab_copilot_gateway.identity import (
     get_identity_mapper,
 )
 from lab_copilot_gateway.policy import PolicyRequest, Tier, get_policy_engine
-from lab_copilot_gateway.tools import list_tools
+from lab_copilot_gateway.tools import get_tool_registry, list_tools
 
 
 class AuditBody(BaseModel):
@@ -119,6 +119,7 @@ def create_app() -> FastAPI:
             "bentolab": "not_configured",
         }
         deps.update(_identity_backend_status(identity_mapper))
+        deps["tool_count"] = len(get_tool_registry().list())
         return {
             "service": service_name,
             "version": __version__,
