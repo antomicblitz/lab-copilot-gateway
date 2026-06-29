@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
+from lab_copilot_gateway.approval import ApprovalStore
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.identity import DbIdentityMapper
 from lab_copilot_gateway.policy import PolicyEngine
@@ -16,6 +17,7 @@ from lab_copilot_gateway.policy import PolicyEngine
 def _reset_audit_store() -> None:
     """Use in-memory audit store per test to avoid cross-test bleed."""
     import lab_copilot_gateway.app as appmod
+    import lab_copilot_gateway.approval as approvalmod
     import lab_copilot_gateway.audit as auditmod
     import lab_copilot_gateway.identity as identitymod
     import lab_copilot_gateway.policy as policymod
@@ -23,18 +25,22 @@ def _reset_audit_store() -> None:
 
     original_audit = appmod.get_audit_store()
     store = AuditStore(db_path=":memory:")
+    approval_store = ApprovalStore(db_path=":memory:")
     original_policy = policymod._default_engine
     policymod._default_engine = PolicyEngine()  # clean default, no kill switches
     # Inject into the module-level singleton before create_app runs.
     auditmod._default_store = store
     identitymod._default_mapper = DbIdentityMapper(db_path=":memory:")
+    approvalmod._default_store = approval_store
     original_tools = toolsmod._default_registry
     toolsmod._default_registry = None  # fall back to the curated catalog
     yield
     store.close()
+    approval_store.close()
     auditmod._default_store = original_audit
     policymod._default_engine = original_policy
     identitymod._default_mapper = None
+    approvalmod._default_store = None
     toolsmod._default_registry = original_tools
 
 
@@ -58,6 +64,9 @@ def test_health_returns_version_and_dependency_status() -> None:
     # Identity mapper defaults to in-memory db backend (fail-closed).
     assert body["dependencies"]["identity_backend"] == "db"
     assert body["dependencies"]["identity_db"] == "memory"
+    # C07 approval token store defaults to in-memory db backend.
+    assert body["dependencies"]["approval_backend"] == "db"
+    assert body["dependencies"]["approval_db"] == "memory"
     # C06 curated tool catalog.
     assert body["dependencies"]["tool_count"] == 13  # noqa: PLR2004 — catalog size
 
@@ -288,3 +297,130 @@ def test_identity_resolve_by_librechat_user_id_works() -> None:
     assert body["mapped"] is True
     assert body["elabftw_user_id"] == "elab-app-2"
     assert body["elabftw_team_ids"] == ["only-team"]
+
+
+# --- /approval/* HTTP roundtrips -----------------------------------------
+
+
+_APPROVAL_REQUEST_BODY = {
+    "tool_name": "elabftw.amend_my_experiment_after_approval",
+    "args": {"experiment_id": 42, "amendment": "add AI note"},
+    "target_record": "elabftw:experiment:42",
+    "tier": 4,
+    "keycloak_subject": "kc-1",
+    "librechat_user_id": "lc-1",
+    "mapped_elabftw_user_id": "elab-1",
+    "provider": "openai",
+    "model_id": "gpt-4o-mini",
+    "ttl_seconds": 300,
+}
+
+
+def test_approval_request_returns_id_and_expiry() -> None:
+    client = make_client()
+    r = client.post("/approval/request", json=_APPROVAL_REQUEST_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approval_id"]
+    assert body["expires_at"]
+    assert body["tool_name"] == "elabftw.amend_my_experiment_after_approval"
+    assert body["args_hash"]
+
+
+def test_approval_consume_roundtrip_succeeds() -> None:
+    """Happy path: request → consume with same args → consumed: true."""
+    client = make_client()
+    req = client.post("/approval/request", json=_APPROVAL_REQUEST_BODY)
+    approval_id = req.json()["approval_id"]
+
+    consume_body = {
+        "approval_id": approval_id,
+        "tool_name": "elabftw.amend_my_experiment_after_approval",
+        "args": {"experiment_id": 42, "amendment": "add AI note"},
+        "target_record": "elabftw:experiment:42",
+    }
+    r = client.post("/approval/consume", json=consume_body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["consumed"] is True
+    assert out["approval_id"] == approval_id
+    assert out["consumed_at"]
+    assert out["tool_name"] == "elabftw.amend_my_experiment_after_approval"
+
+
+def test_approval_consume_rejects_mismatched_args() -> None:
+    """Acceptance check: modified args → consumed: false, reason: mismatch."""
+    client = make_client()
+    req = client.post("/approval/request", json=_APPROVAL_REQUEST_BODY)
+    approval_id = req.json()["approval_id"]
+
+    consume_body = {
+        "approval_id": approval_id,
+        "tool_name": "elabftw.amend_my_experiment_after_approval",
+        "args": {"experiment_id": 999, "amendment": "tampered"},  # differs
+        "target_record": "elabftw:experiment:42",
+    }
+    r = client.post("/approval/consume", json=consume_body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["consumed"] is False
+    assert out["reason"] == "mismatch"
+
+
+def test_approval_consume_rejects_replay() -> None:
+    """Acceptance check: replayed (already-consumed) token → consumed: false."""
+    client = make_client()
+    approval_id = client.post("/approval/request", json=_APPROVAL_REQUEST_BODY).json()[
+        "approval_id"
+    ]
+
+    consume_body = {
+        "approval_id": approval_id,
+        "tool_name": "elabftw.amend_my_experiment_after_approval",
+        "args": {"experiment_id": 42, "amendment": "add AI note"},
+        "target_record": "elabftw:experiment:42",
+    }
+    first = client.post("/approval/consume", json=consume_body).json()
+    assert first["consumed"] is True
+
+    second = client.post("/approval/consume", json=consume_body).json()
+    assert second["consumed"] is False
+    assert second["reason"] == "already_consumed"
+
+
+def test_approval_consume_rejects_unknown_id() -> None:
+    client = make_client()
+    consume_body = {
+        "approval_id": "never-issued",
+        "tool_name": "elabftw.amend_my_experiment_after_approval",
+        "args": {"a": 1},
+    }
+    r = client.post("/approval/consume", json=consume_body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["consumed"] is False
+    assert out["reason"] == "not_found"
+
+
+def test_approval_get_returns_record() -> None:
+    client = make_client()
+    approval_id = client.post("/approval/request", json=_APPROVAL_REQUEST_BODY).json()[
+        "approval_id"
+    ]
+
+    r = client.get(f"/approval/{approval_id}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["approval_id"] == approval_id
+    assert body["tool_name"] == "elabftw.amend_my_experiment_after_approval"
+    assert body["consumed_at"] is None
+
+
+def test_approval_get_returns_null_for_unknown() -> None:
+    """Unknown approval_id returns 200 with null body (FastAPI encodes Optional
+    return as JSON null).  An explicit 404 would require a response_model; the
+    null body is intentional and consistent with GET /audit/{action_id}."""
+    client = make_client()
+    r = client.get("/approval/does-not-exist")
+    assert r.status_code == 200
+    assert r.json() is None

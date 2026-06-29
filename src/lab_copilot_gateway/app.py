@@ -9,6 +9,13 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
 from lab_copilot_gateway import __version__
+from lab_copilot_gateway.approval import (
+    ApprovalError,
+    ApprovalRequest,
+    ApprovalStore,
+    compute_args_hash,
+    get_approval_store,
+)
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.config import get_public_config
 from lab_copilot_gateway.identity import (
@@ -68,6 +75,40 @@ class IdentityResolveBody(BaseModel):
     librechat_user_id: str | None = None
 
 
+class ApprovalRequestBody(BaseModel):
+    """Request body for POST /approval/request.
+
+    Captures the exact tool name, args (the gateway computes the hash), target
+    record, tier, requesting identity, provider/model, and TTL.  The gateway
+    stores the hash of canonical-JSON args; the caller never sees the hash.
+    """
+
+    tool_name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    target_record: str | None = None
+    tier: int
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    mapped_elabftw_user_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+    ttl_seconds: int | None = None
+
+
+class ApprovalConsumeBody(BaseModel):
+    """Request body for POST /approval/consume.
+
+    The gateway recomputes the args hash from the args the caller is actually
+    using, then verifies the token is bound to the same hash.  An attacker
+    cannot replay an approval with modified args — the hash will not match.
+    """
+
+    approval_id: str
+    tool_name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    target_record: str | None = None
+
+
 def _identity_to_dict(identity: MappedIdentity) -> dict[str, Any]:
     return {
         "mapped": True,
@@ -92,16 +133,25 @@ def _identity_backend_status(mapper: IdentityMapper) -> dict[str, str]:
     }
 
 
+def _approval_backend_status(store: ApprovalStore) -> dict[str, str]:
+    """Health-facing summary of the approval token store."""
+    return {
+        "approval_backend": "db",
+        "approval_db": "configured" if store.db_path != ":memory:" else "memory",
+    }
+
+
 def create_app() -> FastAPI:
     """Create the ASGI application."""
     service_name = "lab-copilot-gateway"
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
 
-    # Eagerly initialize audit store, policy engine, and identity mapper so
-    # /health reflects state.
+    # Eagerly initialize audit store, policy engine, identity mapper, and
+    # approval store so /health reflects state.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
     identity_mapper = get_identity_mapper()
+    approval_store = get_approval_store()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -119,6 +169,7 @@ def create_app() -> FastAPI:
             "bentolab": "not_configured",
         }
         deps.update(_identity_backend_status(identity_mapper))
+        deps.update(_approval_backend_status(approval_store))
         deps["tool_count"] = len(get_tool_registry().list())
         return {
             "service": service_name,
@@ -178,6 +229,74 @@ def create_app() -> FastAPI:
             # any subsequent /policy/evaluate call (user_id would be None).
             return {"mapped": False}
         return _identity_to_dict(identity)
+
+    @api.post("/approval/request")
+    def request_approval(body: ApprovalRequestBody) -> dict[str, object]:
+        """Issue a single-use approval token bound to (tool, args hash, target).
+
+        The caller (typically the gateway's tool-execution path or the
+        LibreChat approval card) supplies the EXACT args the tool will run
+        with; the gateway hashes them and stores the hash.  ``approval_id``
+        is opaque to the client and may be displayed but not modified.
+        """
+        from lab_copilot_gateway.approval import DEFAULT_APPROVAL_TTL_SECONDS
+
+        req = ApprovalRequest(
+            tool_name=body.tool_name,
+            args_hash=compute_args_hash(body.args),
+            target_record=body.target_record,
+            tier=body.tier,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            mapped_elabftw_user_id=body.mapped_elabftw_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+            ttl_seconds=body.ttl_seconds or DEFAULT_APPROVAL_TTL_SECONDS,
+        )
+        approval_id, expires_at = approval_store.request(req)
+        return {
+            "approval_id": approval_id,
+            "expires_at": expires_at,
+            "tool_name": req.tool_name,
+            "args_hash": req.args_hash,
+        }
+
+    @api.post("/approval/consume")
+    def consume_approval(body: ApprovalConsumeBody) -> dict[str, object]:
+        """Verify + consume a single-use approval token.
+
+        Returns ``{"consumed": true, ...}`` on success or
+        ``{"consumed": false, "reason": ..., "message": ...}`` on any failure
+        (not_found / already_consumed / expired / mismatch).  The reason code
+        is stable for callers; the message is human-readable.
+        """
+        args_hash = compute_args_hash(body.args)
+        try:
+            result = approval_store.consume(
+                body.approval_id,
+                tool_name=body.tool_name,
+                args_hash=args_hash,
+                target_record=body.target_record,
+            )
+        except ApprovalError as exc:
+            return {"consumed": False, **exc.to_dict()}
+        return {
+            "consumed": True,
+            "approval_id": result.approval_id,
+            "tool_name": result.tool_name,
+            "args_hash": result.args_hash,
+            "target_record": result.target_record,
+            "tier": result.tier,
+            "consumed_at": result.consumed_at,
+        }
+
+    @api.get("/approval/{approval_id}")
+    def get_approval(approval_id: str) -> dict[str, object] | None:
+        """Fetch one approval row by id (admin / test reads)."""
+        record = approval_store.get(approval_id)
+        if record is None:
+            return None
+        return record.to_dict()
 
     return api
 
