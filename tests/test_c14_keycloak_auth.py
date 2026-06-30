@@ -666,3 +666,102 @@ class TestHealthEndpoint:
         assert status["jwks_configured"] is True
         assert status["jwks_first_boot_done"] is True
         assert status["jwks_keys_cached"] >= 1
+
+
+class TestAuditObservability:
+    """Chunk 10 — audit records for authenticated actions only.
+
+    Unauthenticated 401s must NOT create lab audit rows because no
+    trustworthy principal exists.  Authenticated denials (valid JWT,
+    unmapped sub, policy deny) DO create audit rows through the existing
+    adapter audit path.
+    """
+
+    def test_unauthenticated_401_creates_no_audit_row(self, jwt_config) -> None:
+        """Missing JWT → 401, no audit row written."""
+        from lab_copilot_gateway.audit import AuditStore
+        from lab_copilot_gateway.auth import register_auth_exception_handler
+        from fastapi import Depends, FastAPI
+        from fastapi.testclient import TestClient
+
+        audit_store = AuditStore(db_path=":memory:")
+
+        app = FastAPI()
+        register_auth_exception_handler(app)
+
+        @app.post("/test-audit-protected")
+        def protected(
+            principal: AuthenticatedPrincipal = Depends(verified_principal),
+        ) -> dict[str, object]:
+            # If we reach here, auth passed; write an audit record
+            audit_store.append(
+                type(
+                    "R",
+                    (),
+                    {
+                        "action_id": "should-not-happen",
+                        "conversation_id": None,
+                        "request_id": None,
+                        "keycloak_subject": principal.keycloak_subject,
+                        "librechat_user_id": None,
+                        "mapped_elabftw_user_id": None,
+                        "mapped_elabftw_team_id": None,
+                        "provider": None,
+                        "model_id": None,
+                        "tool_name": None,
+                        "tool_args_hash": None,
+                        "context_refs": [],
+                        "policy_decision": None,
+                        "approval_id": None,
+                        "api_call_summary": {},
+                        "result_summary": {},
+                        "error": None,
+                        "artifact_manifest": [],
+                        "created_at": None,
+                    },
+                )()
+            )
+            return {"ok": True}
+
+        client = TestClient(app)
+        response = client.post("/test-audit-protected", json={})
+        assert response.status_code == 401
+        assert audit_store.count() == 0  # no audit row for unauthenticated
+
+    def test_authenticated_request_can_reach_audit_path(self, dev_config) -> None:
+        """Valid dev-auth → 200, route handler can write audit records."""
+        from lab_copilot_gateway.audit import AuditStore, AuditRecord
+        from lab_copilot_gateway.auth import register_auth_exception_handler
+        from fastapi import Depends, FastAPI
+        from fastapi.testclient import TestClient
+
+        audit_store = AuditStore(db_path=":memory:")
+
+        app = FastAPI()
+        register_auth_exception_handler(app)
+
+        @app.post("/test-audit-protected")
+        def protected(
+            principal: AuthenticatedPrincipal = Depends(verified_principal),
+        ) -> dict[str, object]:
+            record = AuditRecord(
+                action_id="test-authed-1",
+                keycloak_subject=principal.keycloak_subject,
+            )
+            audit_store.append(record)
+            return {"ok": True}
+
+        client = TestClient(app)
+        response = client.post(
+            "/test-audit-protected",
+            json={},
+            headers={
+                "X-Lab-Copilot-Dev-Auth": TEST_DEV_SECRET,
+                "X-Lab-Copilot-Dev-Sub": "kc-audited-user",
+            },
+        )
+        assert response.status_code == 200
+        assert audit_store.count() == 1
+        row = audit_store.get("test-authed-1")
+        assert row is not None
+        assert row["keycloak_subject"] == "kc-audited-user"
