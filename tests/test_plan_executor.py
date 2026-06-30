@@ -565,3 +565,117 @@ def test_execute_plan_step_results_have_correct_indices() -> None:
     assert indices == list(range(len(result.step_results)))
     for i, r in enumerate(result.step_results):
         assert r.step_index == i
+
+
+# --- C40: result model enrichment -------------------------------------------
+
+
+def test_step_result_audit_action_id_extracted_from_write() -> None:
+    """C40: successful write steps have audit_action_id extracted from
+    the WriteResult, not None."""
+    body = "<p>test body</p>"
+    plan = _simple_edit_plan(body=body)
+    executor, _stub, _audit, approval_store = _build_executor(
+        seeds={
+            123: {
+                "id": 123,
+                "title": "test",
+                "body": body,
+                "metadata": None,
+                "state": 1,
+                "locked": 0,
+            }
+        },
+    )
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=123),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    # Step 0 is read (no audit_action_id), step 1 is write (has audit_action_id).
+    assert result.step_results[0].audit_action_id is None
+    assert result.step_results[1].audit_action_id is not None
+    assert len(result.step_results[1].audit_action_id) > 0
+
+
+def test_step_result_retryable_false_for_body_drift() -> None:
+    """C40: body_drift_since_approval is a permanent failure (not retryable)."""
+    body = "<p>actual body</p>"
+    plan = _simple_edit_plan(body=body)
+    executor, _stub, _audit, approval_store = _build_executor(
+        seeds={
+            123: {
+                "id": 123,
+                "title": "test",
+                "body": "<p>different body</p>",  # causes body drift
+                "metadata": None,
+                "state": 1,
+                "locked": 0,
+            }
+        },
+    )
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=123),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "partial_failure"
+    write_step = result.step_results[1]  # step 1 is the write
+    assert write_step.status == "failed"
+    assert write_step.retryable is False  # body drift is permanent
+
+
+def test_step_result_retryable_true_for_client_error() -> None:
+    """C40: client_error is a transient failure (retryable)."""
+    body = "<p>test body</p>"
+    plan = _simple_edit_plan(body=body)
+    # Use an empty stub client — get_experiment will raise KeyError,
+    # which the write adapter wraps as client_error.
+    executor, _stub, _audit, approval_store = _build_executor(
+        seeds={},  # no seeds → read_experiment_by_id will fail
+    )
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=123),
+        mapped_identity=_identity(),
+    )
+
+    # The read step fails with client_error (KeyError from stub).
+    read_step = result.step_results[0]
+    assert read_step.status == "failed"
+    assert read_step.retryable is True  # client_error is transient
+
+
+def test_step_result_to_dict_includes_retryable() -> None:
+    """C40: to_dict() includes the retryable field."""
+    from lab_copilot_gateway.plan_executor import StepResult
+
+    sr = StepResult(
+        step_index=0, tool_name="test", status="failed", error="x", retryable=True
+    )
+    d = sr.to_dict()
+    assert d["retryable"] is True
+
+
+def test_retryable_reasons_constant() -> None:
+    """C40: RETRYABLE_REASONS contains the expected transient reasons."""
+    from lab_copilot_gateway.plan_executor import RETRYABLE_REASONS
+
+    assert "client_error" in RETRYABLE_REASONS
+    assert "state_check_failed" in RETRYABLE_REASONS
+    assert "audit_persistence_failed" in RETRYABLE_REASONS
+    # Permanent failures are NOT in the set.
+    assert "body_drift_since_approval" not in RETRYABLE_REASONS
+    assert "append_only_violation" not in RETRYABLE_REASONS
