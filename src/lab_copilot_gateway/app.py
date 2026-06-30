@@ -35,6 +35,10 @@ from lab_copilot_gateway.opencloning import (
     OpenCloningAdapterError,
     get_opencloning_adapter,
 )
+from lab_copilot_gateway.wallac import (
+    WallacAdapterError,
+    get_wallac_adapter,
+)
 from lab_copilot_gateway.identity import (
     DbIdentityMapper,
     IdentityMapper,
@@ -313,6 +317,7 @@ def create_app() -> FastAPI:
     # here, but the call ensures /health shows the configured state).
     get_elabftw_write_adapter()
     opencloning_adapter = get_opencloning_adapter()
+    wallac_adapter = get_wallac_adapter()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -332,7 +337,9 @@ def create_app() -> FastAPI:
                 if opencloning_adapter.client is not None
                 else "not_configured"
             ),
-            "wallac": "not_configured",
+            "wallac": (
+                "configured" if wallac_adapter.client is not None else "not_configured"
+            ),
             "bentolab": "not_configured",
         }
         deps.update(_identity_backend_status(identity_mapper))
@@ -946,7 +953,44 @@ def create_app() -> FastAPI:
                 # subclasses. Map them to the same {ok:false, reason, message} shape.
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
-        # Adapters that don't exist yet (C18+).  Return a structured
+        if tool.adapter == "wallac":
+            try:
+                adapter = get_wallac_adapter()
+                if tool.name == "wallac.get_status":
+                    result = adapter.get_status(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "tool_name": tool.name,
+                        "reason": "tool_not_dispatched",
+                        "message": (
+                            f"tool {tool.name!r} is in the wallac adapter "
+                            "but has no /invoke dispatch path"
+                        ),
+                    }
+            except WallacAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+            except ElabftwAdapterError as exc:
+                # Wallac adapter reuses eLabFTW's InvalidContextToken and
+                # UnmappedCaller, so those errors surface as ElabftwAdapterError
+                # subclasses. Map them to the same {ok:false, reason, message} shape.
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+        # Adapters that don't exist yet (C19+).  Return a structured
         # error so the LibreChat side can surface a clear "this tool
         # is not wired up yet" message instead of a transport 404.
         return {
@@ -956,7 +1000,7 @@ def create_app() -> FastAPI:
             "message": (
                 f"tool {tool.name!r} is in the registry but its "
                 f"{tool.adapter!r} adapter is not implemented yet "
-                "(lands in C18+)"
+                "(lands in C19+)"
             ),
         }
 

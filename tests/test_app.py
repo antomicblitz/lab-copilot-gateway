@@ -1270,15 +1270,15 @@ def test_invoke_propagates_unmapped_caller() -> None:
 
 
 def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
-    """Tools whose adapter is not yet implemented (wallac.*,
-    bentolab.* — C18+) must return ok:false with reason
-    adapter_not_implemented, not 404 or a stack trace.  LibreChat can
-    surface this to the user as 'this tool is not wired up yet'."""
+    """Tools whose adapter is not yet implemented (bentolab.* — C19+)
+    must return ok:false with reason adapter_not_implemented, not 404
+    or a stack trace.  LibreChat can surface this to the user as 'this
+    tool is not wired up yet'."""
     client = make_client()
     r = client.post(
         "/invoke",
         json={
-            "tool_name": "wallac.get_status",
+            "tool_name": "bentolab.get_status",
             "context_token": "doesn't-matter",
             "args": {},
         },
@@ -1286,7 +1286,7 @@ def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
     assert r.status_code == 200
     out = r.json()
     assert out["ok"] is False
-    assert out["tool_name"] == "wallac.get_status"
+    assert out["tool_name"] == "bentolab.get_status"
     assert out["reason"] == "adapter_not_implemented"
 
 
