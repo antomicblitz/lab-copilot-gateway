@@ -813,3 +813,408 @@ def test_adapter_error_to_dict() -> None:
     err = ElabftwAdapterError(reason="custom", message="some message")
     out = err.to_dict()
     assert out == {"reason": "custom", "message": "some message"}
+
+
+# --- C36: multi-record retrieval --------------------------------------------
+
+
+# -- StubElabftwClient.search_experiments --
+
+
+def test_stub_search_finds_by_title() -> None:
+    """Stub search matches by title (case-insensitive substring)."""
+    c = StubElabftwClient(
+        seeds={
+            1: {"id": 1, "title": "Gel electrophoresis", "body": ""},
+            2: {"id": 2, "title": "PCR optimization", "body": ""},
+        }
+    )
+    results = c.search_experiments("pcr")
+    assert len(results) == 1
+    assert results[0]["id"] == 2
+
+
+def test_stub_search_finds_by_body() -> None:
+    """Stub search matches by body keyword (case-insensitive)."""
+    c = StubElabftwClient(
+        seeds={
+            1: {"id": 1, "title": "Run A", "body": "<p>western blot</p>"},
+            2: {"id": 2, "title": "Run B", "body": "<p>agarose gel</p>"},
+        }
+    )
+    results = c.search_experiments("western")
+    assert len(results) == 1
+    assert results[0]["id"] == 1
+
+
+def test_stub_search_no_matches_returns_empty() -> None:
+    """Stub search with no matching term returns empty list."""
+    c = StubElabftwClient(seeds={1: {"id": 1, "title": "A", "body": "B"}})
+    assert c.search_experiments("zzz_no_match") == []
+
+
+def test_stub_search_respects_limit_and_offset() -> None:
+    """Stub search applies offset and limit correctly."""
+    c = StubElabftwClient(
+        seeds={
+            1: {"id": 1, "title": "PCR test A", "body": ""},
+            2: {"id": 2, "title": "PCR test B", "body": ""},
+            3: {"id": 3, "title": "PCR test C", "body": ""},
+        }
+    )
+    results = c.search_experiments("pcr", limit=2, offset=1)
+    assert len(results) == 2
+    assert {r["id"] for r in results} == {2, 3}
+
+
+# -- ElabftwReadAdapter.search_my_experiments --
+
+
+def test_search_success_returns_summaries_and_audits(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """Happy path: mapped identity, multiple seeds, search returns
+    SearchResult with summaries and full audit trail."""
+    client = StubElabftwClient(
+        seeds={
+            42: {
+                "id": 42,
+                "title": "PCR optimization for EF1a promoter",
+                "body": "<p>Body 42</p>",
+                "metadata": {"extra_fields": {}},
+            },
+            43: {
+                "id": 43,
+                "title": "PCR for CRISPR guide",
+                "body": "<p>Body 43</p>",
+                "metadata": {"extra_fields": {}},
+            },
+        }
+    )
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=client,
+    )
+    result = adapter.search_my_experiments(
+        query="PCR",
+        limit=10,
+        mapped_identity=_identity(),
+        conversation_id="conv-1",
+        request_id="req-1",
+        provider="openai",
+        model_id="gpt-4o-mini",
+    )
+
+    # Result structure.
+    assert result.query == "PCR"
+    assert result.total_returned == 2
+    assert len(result.experiments) == 2
+    ids = {e.experiment_id for e in result.experiments}
+    assert ids == {42, 43}
+    titles = {e.title for e in result.experiments}
+    assert titles == {
+        "PCR optimization for EF1a promoter",
+        "PCR for CRISPR guide",
+    }
+
+    # Audit record.
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["tool_name"] == "elabftw.search_my_experiments"
+    assert row["policy_decision"] == "allow"
+
+    # api_call_summary has query/limit/offset.
+    import json as _json
+
+    api = _json.loads(row["api_call_summary_json"])
+    assert api["query"] == "PCR"
+    assert api["limit"] == 10
+    assert api["offset"] == 0
+
+    # result_summary has record_count + record_ids.
+    res_meta = _json.loads(row["result_summary_json"])
+    assert res_meta["record_count"] == 2
+    assert set(res_meta["record_ids"]) == {42, 43}
+
+    # context_refs has one entry per returned record.
+    ctx = _json.loads(row["context_refs_json"])
+    assert len(ctx) == 2
+    ctx_ids = {r["id"] for r in ctx if r["kind"] == "experiment"}
+    assert ctx_ids == {42, 43}
+
+    # to_dict roundtrip.
+    d = result.to_dict()
+    assert d["query"] == "PCR"
+    assert d["total_returned"] == 2
+    assert len(d["experiments"]) == 2
+
+
+def test_search_unmapped_caller_denies(
+    adapter: ElabftwReadAdapter,
+    audit: AuditStore,
+) -> None:
+    """Unmapped caller (mapped_identity=None) → UnmappedCaller, audit deny."""
+    with pytest.raises(UnmappedCaller):
+        adapter.search_my_experiments(
+            query="PCR",
+            mapped_identity=None,
+        )
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "deny"
+    assert row["tool_name"] == "elabftw.search_my_experiments"
+    assert "UNMAPPED_CALLER" in (row["error_json"] or "")
+
+
+def test_search_policy_denied(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """Kill switch on search tool → PolicyDenied, audit deny."""
+    engine = PolicyEngine(kill_switches=("elabftw.search_my_experiments",))
+    client = StubElabftwClient(seeds={42: {"id": 42, "title": "A", "body": ""}})
+    adapter = ElabftwReadAdapter(
+        policy_engine=engine,
+        audit_store=audit,
+        client=client,
+    )
+    with pytest.raises(PolicyDenied):
+        adapter.search_my_experiments(
+            query="A",
+            mapped_identity=_identity(),
+        )
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "deny"
+    assert "kill_switch" in (row["error_json"] or "")
+
+
+def test_search_client_not_configured(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """client=None → ElabftwAdapterError, audit deny."""
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=None,
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.search_my_experiments(
+            query="PCR",
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "elabftw_not_configured"
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert "ELABFTW_NOT_CONFIGURED" in (row["error_json"] or "")
+
+
+def test_search_client_error(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """Client raises → ElabftwAdapterError(reason='client_error'), audit allow."""
+
+    # Custom client whose search_experiments always raises.
+    class _FailingClient:
+        def search_experiments(self, query, limit=20, offset=0):
+            raise ConnectionError("downstream unreachable")
+
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=_FailingClient(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.search_my_experiments(
+            query="PCR",
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "client_error"
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "allow"
+    assert "CLIENT_ERROR" in (row["error_json"] or "")
+
+
+def test_search_limit_clamped_to_max(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """limit=100 clamped to _MAX_SEARCH_RESULTS (50) in audit record."""
+    from lab_copilot_gateway.elabftw import _MAX_SEARCH_RESULTS
+
+    client = StubElabftwClient(seeds={1: {"id": 1, "title": "PCR", "body": ""}})
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=client,
+    )
+    adapter.search_my_experiments(
+        query="PCR",
+        limit=100,
+        offset=5,
+        mapped_identity=_identity(),
+    )
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    import json as _json
+
+    api = _json.loads(row["api_call_summary_json"])
+    assert api["limit"] == _MAX_SEARCH_RESULTS
+    # offset is clamped to >= 0, so 5 stays 5.
+    assert api["offset"] == 5
+
+
+def test_search_audit_persistence_failure_blocks_result(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """Failing audit store on success path → ElabftwAdapterError."""
+
+    class _FailingAuditStore(AuditStore):
+        def append(self, record):
+            # Fail on the success (allow + api_call_summary) path only.
+            if record.policy_decision == "allow" and record.api_call_summary:
+                raise RuntimeError("simulated audit DB outage")
+            return super().append(record)
+
+    failing_store = _FailingAuditStore(db_path=":memory:")
+    client = StubElabftwClient(seeds={42: {"id": 42, "title": "PCR", "body": ""}})
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=failing_store,
+        client=client,
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.search_my_experiments(
+            query="PCR",
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "audit_persistence_failed"
+    failing_store.close()
+
+
+# -- ElabftwReadAdapter.read_experiment_by_id --
+
+
+def test_read_by_id_success(
+    adapter: ElabftwReadAdapter,
+    audit: AuditStore,
+) -> None:
+    """Happy path: reads experiment 42 by id, returns ReadResult, full audit."""
+    result = adapter.read_experiment_by_id(
+        experiment_id=42,
+        mapped_identity=_identity(),
+        conversation_id="conv-1",
+        request_id="req-1",
+        provider="openai",
+        model_id="gpt-4o-mini",
+    )
+
+    assert result.experiment_id == 42
+    assert result.title == "PCR optimization for EF1a promoter"
+    assert "<p>Test experiment body</p>" in result.body
+    assert result.metadata == {"extra_fields": {}}
+
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["tool_name"] == "elabftw.read_experiment_by_id"
+    assert row["policy_decision"] == "allow"
+    assert "GET" in (row["api_call_summary_json"] or "")
+    assert "42" in (row["context_refs_json"] or "")
+    assert row["conversation_id"] == "conv-1"
+    assert row["provider"] == "openai"
+
+
+def test_read_by_id_unmapped_caller_denies(
+    adapter: ElabftwReadAdapter,
+    audit: AuditStore,
+) -> None:
+    """mapped_identity=None → UnmappedCaller, audit deny."""
+    with pytest.raises(UnmappedCaller):
+        adapter.read_experiment_by_id(
+            experiment_id=42,
+            mapped_identity=None,
+        )
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "deny"
+    assert row["tool_name"] == "elabftw.read_experiment_by_id"
+    assert "UNMAPPED_CALLER" in (row["error_json"] or "")
+
+
+def test_read_by_id_policy_denied(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """Kill switch on read_by_id → PolicyDenied, audit deny."""
+    engine = PolicyEngine(kill_switches=("elabftw.read_experiment_by_id",))
+    adapter = ElabftwReadAdapter(
+        policy_engine=engine,
+        audit_store=audit,
+        client=StubElabftwClient(
+            seeds={42: {"id": 42, "title": "A", "body": "", "metadata": None}}
+        ),
+    )
+    with pytest.raises(PolicyDenied):
+        adapter.read_experiment_by_id(
+            experiment_id=42,
+            mapped_identity=_identity(),
+        )
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "deny"
+    assert "kill_switch" in (row["error_json"] or "")
+
+
+def test_read_by_id_client_not_configured(
+    audit: AuditStore,
+    policy: PolicyEngine,
+) -> None:
+    """client=None → ElabftwAdapterError(reason='elabftw_not_configured')."""
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=None,
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.read_experiment_by_id(
+            experiment_id=42,
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "elabftw_not_configured"
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert "ELABFTW_NOT_CONFIGURED" in (row["error_json"] or "")
+
+
+def test_read_by_id_client_error(
+    adapter: ElabftwReadAdapter,
+    audit: AuditStore,
+) -> None:
+    """Experiment id not in stub seeds → KeyError → ElabftwAdapterError."""
+    # Experiment 999 is not in the stub client's seeds.
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.read_experiment_by_id(
+            experiment_id=999,
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "client_error"
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "allow"
+    assert "CLIENT_ERROR" in (row["error_json"] or "")

@@ -42,11 +42,13 @@ from lab_copilot_gateway.tools import (
 
 
 def test_catalog_has_all_13_c06_tools() -> None:
-    """C06 plan lists 13 initial tools (now 16 with C15, C24, C35); the catalog must declare exactly these."""
+    """C06 plan lists 13 initial tools (now 18 with C15, C24, C35, C36); the catalog must declare exactly these."""
     catalog = list_tools()
     names = {entry["name"] for entry in catalog}
     expected = {
         "elabftw.read_current_experiment",
+        "elabftw.search_my_experiments",
+        "elabftw.read_experiment_by_id",
         "elabftw.draft_experiment_update",
         "elabftw.amend_my_experiment_after_approval",
         "elabftw.edit_experiment_section",
@@ -63,7 +65,7 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "bentolab.get_status",
         "bentolab.validate_pcr_profile",
     }
-    assert len(catalog) == 16  # noqa: PLR2004 — V1 catalog size is a contract is a contract
+    assert len(catalog) == 18  # noqa: PLR2004 — V1 catalog size is a contract
     assert names == expected
 
 
@@ -480,5 +482,5 @@ def test_default_registry_is_the_v1_catalog() -> None:
     """The default registry is built from the curated _CATALOG tuple (13 tools)."""
     reset_tool_registry()
     reg = get_tool_registry()
-    assert len(reg.list()) == 16  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(reg.list()) == 18  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()

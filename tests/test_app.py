@@ -158,7 +158,7 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["approval_backend"] == "db"
     assert body["dependencies"]["approval_db"] == "memory"
     # C06 curated tool catalog.
-    assert body["dependencies"]["tool_count"] == 16  # noqa: PLR2004 — V1 catalog size is a contract
+    assert body["dependencies"]["tool_count"] == 18  # noqa: PLR2004 — V1 catalog size is a contract
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -186,7 +186,7 @@ def test_tools_registry_returns_curated_catalog() -> None:
 
     assert response.status_code == 200
     tools = response.json()["tools"]
-    assert len(tools) == 16  # noqa: PLR2004 — V1 catalog size is a contract is a contract
+    assert len(tools) == 18  # noqa: PLR2004 — V1 catalog size is a contract
 
     required_fields = {
         "name",
@@ -214,9 +214,11 @@ def test_tools_registry_returns_curated_catalog() -> None:
         assert not (forbidden_fields & set(entry.keys()))
         names.add(entry["name"])
 
-    # All 13 tools from the C06 plan must be present (now 16 with C15, C24, C35).
+    # All 13 tools from the C06 plan must be present (now 18 with C15, C24, C35, C36).
     expected_names = {
         "elabftw.read_current_experiment",
+        "elabftw.search_my_experiments",
+        "elabftw.read_experiment_by_id",
         "elabftw.draft_experiment_update",
         "elabftw.amend_my_experiment_after_approval",
         "elabftw.edit_experiment_section",
@@ -1296,7 +1298,7 @@ def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
 def test_invoke_does_not_modify_registry() -> None:
     """Dispatch is read-only on the registry: invoking a tool neither
     adds nor removes registry entries.  /health still reports
-    tool_count: 16 and /tools still returns the same catalog."""
+    tool_count: 18 and /tools still returns the same catalog."""
     client = make_client()
     before = client.get("/tools").json()["tools"]
     # Hit a couple of paths that exercise different code branches.
@@ -1317,7 +1319,7 @@ def test_invoke_does_not_modify_registry() -> None:
     after = client.get("/tools").json()["tools"]
     assert before == after
     health = client.get("/health").json()
-    assert health["dependencies"]["tool_count"] == 16  # noqa: PLR2004
+    assert health["dependencies"]["tool_count"] == 18  # noqa: PLR2004
 
 
 def test_invoke_amend_missing_approval_id_denies() -> None:
@@ -1363,7 +1365,7 @@ def test_invoke_health_reflects_tool_count() -> None:
     the custom-endpoint service can discover whether /invoke is wired
     to a non-empty registry."""
     body = make_client().get("/health").json()
-    assert body["dependencies"]["tool_count"] == 16  # noqa: PLR2004
+    assert body["dependencies"]["tool_count"] == 18  # noqa: PLR2004
 
 
 # ============================================================================
@@ -1703,3 +1705,92 @@ def test_policy_kill_switch_writes_audit_record() -> None:
     assert record is not None
     assert record["tool_name"] == "__kill_switch__"
     assert record["policy_decision"] == "deny"
+
+
+# ============================================================================
+# C36 — multi-record retrieval /invoke dispatch
+# ============================================================================
+
+
+def test_invoke_dispatches_search_my_experiments() -> None:
+    """Set up identity mapping, POST /invoke with
+    tool_name='elabftw.search_my_experiments', assert ok=True and result
+    has query/total_returned/experiments."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.search_my_experiments",
+            "context_token": "",  # not used by C36 tools, but required by InvokeBody
+            "args": {"query": "test", "limit": 10},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-1",
+            "request_id": "req-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["tool_name"] == "elabftw.search_my_experiments"
+    result = out["result"]
+    assert result["query"] == "test"
+    assert result["total_returned"] >= 0
+    assert isinstance(result["experiments"], list)
+    # The stub client seed has title "HTTP test experiment" which matches "test".
+    assert result["total_returned"] >= 1
+    titles = [e["title"] for e in result["experiments"]]
+    assert "HTTP test experiment" in titles
+
+
+def test_invoke_dispatches_read_experiment_by_id() -> None:
+    """Set up identity mapping, POST /invoke with
+    tool_name='elabftw.read_experiment_by_id', assert ok=True and result
+    has experiment_id=42 and correct title."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.read_experiment_by_id",
+            "context_token": "",  # not used by C36 tools, but required by InvokeBody
+            "args": {"experiment_id": 42},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-2",
+            "request_id": "req-2",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["tool_name"] == "elabftw.read_experiment_by_id"
+    result = out["result"]
+    assert result["experiment_id"] == 42
+    assert result["title"] == "HTTP test experiment"
+    assert "body" in result
