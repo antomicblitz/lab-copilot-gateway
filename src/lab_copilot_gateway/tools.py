@@ -263,6 +263,14 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="read",
         description="Simulate a cloning assembly from input fragments and return the predicted construct.",
     ),
+    Tool(
+        name="opencloning.writeback_artifact",
+        tier=Tier.BOUNDED_WRITES,
+        adapter="opencloning",
+        requires_approval=True,
+        mutability="append",
+        description="Attach an approved OpenCloning design artifact (GenBank/FASTA) to the user's experiment with provenance.",
+    ),
     # --- Wallac status, proposal, validation (no execution in V1) --------
     Tool(
         name="wallac.get_status",

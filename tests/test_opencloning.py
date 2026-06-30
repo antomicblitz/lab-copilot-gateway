@@ -25,10 +25,16 @@ import datetime as _dt
 
 import pytest
 
+from lab_copilot_gateway.approval import (
+    ApprovalRequest,
+    ApprovalStore,
+    compute_args_hash,
+)
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
     InvalidContextToken,
+    StubElabftwClient,
     UnmappedCaller,
     mint_context_token,
 )
@@ -49,7 +55,7 @@ from lab_copilot_gateway.opencloning import (
     get_opencloning_adapter,
     reset_opencloning_adapter,
 )
-from lab_copilot_gateway.policy import PolicyEngine
+from lab_copilot_gateway.policy import PolicyEngine, Tier
 
 
 SECRET = b"test-secret-do-not-use-in-prod"
@@ -717,3 +723,323 @@ def test_stub_client_records_calls() -> None:
     assert stub.calls[1]["method"] == "manual_sequence"
     assert stub.calls[2]["method"] == "oligo_hybridization"
     assert stub.calls[3]["method"] == "simulate_assembly"
+
+
+# ============================================================================
+# C17 — OpenCloning eLabFTW writeback tests
+# ============================================================================
+#
+# Acceptance checks (from build plan):
+#     1. User approves artifact writeback.
+#     2. Artifact is attached or linked in eLabFTW.
+#     3. Audit ID is visible in provenance.
+
+
+@pytest.fixture
+def approval_store() -> ApprovalStore:
+    s = ApprovalStore(db_path=":memory:")
+    yield s
+    s.close()
+
+
+@pytest.fixture
+def elabftw_stub() -> StubElabftwClient:
+    """Pre-seed experiment 42 for writeback tests."""
+    return StubElabftwClient(
+        seeds={
+            42: {
+                "id": 42,
+                "title": "Cloning experiment",
+                "body": "<p>Original body</p>",
+                "metadata": {"extra_fields": {}},
+                "state": 1,
+                "locked": 0,
+                "uploads": [],
+            },
+        }
+    )
+
+
+@pytest.fixture
+def writeback_adapter(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    approval_store: ApprovalStore,
+    elabftw_stub: StubElabftwClient,
+) -> OpenCloningAdapter:
+    return OpenCloningAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=None,  # OpenCloning client not needed for writeback
+        elabftw_client=elabftw_stub,
+        approval_store=approval_store,
+    )
+
+
+def _issue_writeback_approval(
+    store: ApprovalStore,
+    *,
+    args: dict,
+    target_record: str | None = "42",
+) -> str:
+    """Issue and return an approval_id bound to the given args."""
+    req = ApprovalRequest(
+        tool_name="opencloning.writeback_artifact",
+        args_hash=compute_args_hash(args),
+        target_record=target_record,
+        tier=int(Tier.BOUNDED_WRITES),
+        keycloak_subject="kc-human-1",
+        librechat_user_id="lc-human-1",
+        mapped_elabftw_user_id="elab-human-1",
+        provider="openai",
+        model_id="gpt-4o-mini",
+        ttl_seconds=600,
+    )
+    approval_id, _expires = store.request(req)
+    return approval_id
+
+
+# --- writeback: happy path --------------------------------------------------
+
+
+def test_writeback_attaches_artifact_to_experiment(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """Acceptance #1+#2: approved artifact is attached to eLabFTW experiment."""
+    artifact_content = "LOCUS test 100 bp DNA\nORIGIN\nATCG\n//"
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": artifact_content,
+        "artifact_comment": "OpenCloning design artifact",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+    assert result.tool_name == "opencloning.writeback_artifact"
+    assert result.result["upload_id"] is not None
+    assert result.result["experiment_id"] == 42
+    assert result.result["artifact_filename"] == "construct.gb"
+
+    # Verify the attachment was uploaded to the eLabFTW stub.
+    uploads = elabftw_stub.seeds[42]["uploads"]
+    assert len(uploads) == 1
+    assert uploads[0]["real_name"] == "construct.gb"
+    assert uploads[0]["comment"] == "OpenCloning design artifact"
+
+    # Verify provenance was written to metadata.
+    metadata = elabftw_stub.seeds[42]["metadata"]
+    assert "extra_fields" in metadata
+    assert "lab_copilot_audit_id" in metadata["extra_fields"]
+    assert (
+        metadata["extra_fields"]["lab_copilot_tool"] == "opencloning.writeback_artifact"
+    )
+
+    # Verify audit row.
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "allow"
+    assert rows[0]["tool_name"] == "opencloning.writeback_artifact"
+    assert rows[0]["approval_id"] == approval_id
+    assert rows[0]["tool_args_hash"] is not None
+
+
+# --- writeback: approval consumed ------------------------------------------
+
+
+def test_writeback_consumes_approval_token(
+    writeback_adapter: OpenCloningAdapter,
+    approval_store: ApprovalStore,
+) -> None:
+    """Approval token is consumed (single-use) after writeback."""
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    # The approval token should now be consumed.
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.consumed_at is not None
+
+
+# --- writeback: no approval ------------------------------------------------
+
+
+def test_writeback_without_approval_denies(
+    adapter: OpenCloningAdapter,
+    audit: AuditStore,
+) -> None:
+    """Writeback without approval token is denied by policy."""
+    # This adapter has no approval_store and no elabftw_client.
+    with pytest.raises(PolicyDenied):
+        adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id="",
+            approval_args={"artifact_filename": "x.gb", "artifact_content": "x"},
+            mapped_identity=_identity(),
+        )
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "deny"
+
+
+# --- writeback: eLabFTW not configured --------------------------------------
+
+
+def test_writeback_without_elabftw_client_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    approval_store: ApprovalStore,
+) -> None:
+    """Writeback without eLabFTW client raises structured error."""
+    adapter = OpenCloningAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=None,
+        elabftw_client=None,
+        approval_store=approval_store,
+    )
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+    with pytest.raises(OpenCloningAdapterError) as exc_info:
+        adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert exc_info.value.reason == "elabftw_not_configured"
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "ELABFTW_NOT_CONFIGURED"
+
+
+# --- writeback: file-size limit --------------------------------------------
+
+
+def test_writeback_rejects_oversized_artifact(
+    writeback_adapter: OpenCloningAdapter,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """Oversized artifact is rejected before upload."""
+    oversized = "A" * (MAX_FILE_SIZE_BYTES + 1)
+    approval_args = {
+        "artifact_filename": "huge.gb",
+        "artifact_content": oversized,
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+    with pytest.raises(FileTooLarge):
+        writeback_adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "FILE_TOO_LARGE"
+
+
+# --- writeback: unmapped caller --------------------------------------------
+
+
+def test_writeback_unmapped_caller_denies(
+    writeback_adapter: OpenCloningAdapter,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """Unmapped caller denies before any upload."""
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+    with pytest.raises(UnmappedCaller):
+        writeback_adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=None,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "UNMAPPED_CALLER"
+
+
+# --- writeback: audit ID in provenance --------------------------------------
+
+
+def test_writeback_audit_id_in_provenance(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Acceptance #3: audit ID is visible in experiment metadata provenance."""
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    # The audit_action_id should be in the experiment's metadata.
+    metadata = elabftw_stub.seeds[42]["metadata"]
+    assert metadata["extra_fields"]["lab_copilot_audit_id"] == result.audit_action_id
+
+
+# --- writeback: client error ------------------------------------------------
+
+
+def test_writeback_client_error_propagates(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    approval_store: ApprovalStore,
+) -> None:
+    """eLabFTW upload error is structured and audited."""
+    # Use a stub with no seeds — upload will raise KeyError.
+    elabftw_stub = StubElabftwClient(seeds={})
+    adapter = OpenCloningAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=None,
+        elabftw_client=elabftw_stub,
+        approval_store=approval_store,
+    )
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+    with pytest.raises(OpenCloningAdapterError) as exc_info:
+        adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert exc_info.value.reason == "client_error"
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "CLIENT_ERROR"

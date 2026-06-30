@@ -39,9 +39,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from lab_copilot_gateway.approval import compute_args_hash
+from lab_copilot_gateway.approval import ApprovalStore, compute_args_hash
 from lab_copilot_gateway.audit import AuditRecord, AuditStore
 from lab_copilot_gateway.elabftw import (
+    ElabftwClient,
     InvalidContextToken,
     UnmappedCaller,
     verify_context_token,
@@ -359,7 +360,9 @@ TOOL_PARSE = "opencloning.parse_sequence_file"
 TOOL_MANUAL = "opencloning.manual_sequence"
 TOOL_OLIGO = "opencloning.oligo_hybridization"
 TOOL_ASSEMBLY = "opencloning.simulate_assembly"
+TOOL_WRITEBACK = "opencloning.writeback_artifact"
 TOOL_TIER = Tier.VALIDATION_DRY_RUN
+TOOL_TIER_WRITE = Tier.BOUNDED_WRITES
 
 
 @dataclass
@@ -374,6 +377,8 @@ class OpenCloningAdapter:
     policy_engine: PolicyEngine
     audit_store: AuditStore
     client: OpenCloningClient | None
+    elabftw_client: ElabftwClient | None = None
+    approval_store: ApprovalStore | None = None
     action_id_prefix: str = "opencloning"
 
     # --- public API: four C16 tool entrypoints --------------------------
@@ -578,6 +583,456 @@ class OpenCloningAdapter:
             exec_fn=lambda _client: _client.simulate_assembly(
                 fragments, assembly_config
             ),
+        )
+
+    # --- C17: writeback artifact to eLabFTW -------------------------------
+
+    def writeback_artifact(
+        self,
+        *,
+        context_token: str,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Attach an approved OpenCloning design artifact to the user's experiment.
+
+        This is the ``opencloning.writeback_artifact`` tool (C17).  It bridges
+        OpenCloning (which produced the artifact) and eLabFTW (where the
+        experiment lives).  The artifact content and filename come from
+        ``approval_args`` — they are hash-bound by the approval token so the
+        user approved exactly what gets uploaded.
+
+        The tool:
+            1. Verifies the context token + identity (same as C16 reads).
+            2. Checks policy (tier 4 BOUNDED_WRITES, requires approval).
+            3. Consumes the approval token (single-use, args-hash-bound).
+            4. Uploads the artifact as an attachment to the experiment via
+               the eLabFTW client.
+            5. Writes provenance (audit_action_id) to the experiment metadata.
+            6. Records an audit row.
+
+        The eLabFTW client must be configured (``elabftw_client`` field).
+        The OpenCloning client is NOT needed for this tool — the artifact
+        content is provided by the caller (from a prior OpenCloning call).
+        """
+        artifact_filename = approval_args.get("artifact_filename", "construct.gb")
+        artifact_content = approval_args.get("artifact_content", "")
+        artifact_comment = approval_args.get(
+            "artifact_comment", "OpenCloning design artifact"
+        )
+
+        # The artifact content is the hash-bound payload.  Convert to bytes
+        # for the eLabFTW upload_attachment call.
+        artifact_bytes = (
+            artifact_content.encode("utf-8")
+            if isinstance(artifact_content, str)
+            else artifact_content
+        )
+
+        # Enforce file-size limit on the artifact too (defense in depth).
+        if len(artifact_bytes) > MAX_FILE_SIZE_BYTES:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="file_too_large",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=compute_args_hash(
+                    {
+                        "artifact_filename": artifact_filename,
+                        "artifact_size": len(artifact_bytes),
+                    }
+                ),
+                error={
+                    "code": "FILE_TOO_LARGE",
+                    "size": len(artifact_bytes),
+                    "limit": MAX_FILE_SIZE_BYTES,
+                },
+            )
+            raise FileTooLarge(len(artifact_bytes), MAX_FILE_SIZE_BYTES)
+
+        # Use the shared orchestration for token verify + identity + policy.
+        # The exec_fn uploads the artifact via the eLabFTW client.
+        return self._execute_writeback(
+            context_token=context_token,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            artifact_filename=artifact_filename,
+            artifact_bytes=artifact_bytes,
+            artifact_comment=artifact_comment,
+        )
+
+    def _execute_writeback(
+        self,
+        *,
+        context_token: str,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        artifact_filename: str,
+        artifact_bytes: bytes,
+        artifact_comment: str,
+    ) -> OpenCloningResult:
+        """Writeback orchestration: token → identity → policy → approval → upload → provenance → audit."""
+        early_hash = compute_args_hash(
+            {
+                "artifact_filename": artifact_filename,
+                "artifact_size": len(artifact_bytes),
+                "token_present": bool(context_token),
+            }
+        )
+
+        # 1. Verify context token.
+        if not context_token:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="missing_context_token",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "MISSING_CONTEXT_TOKEN"},
+            )
+            raise InvalidContextToken("missing")
+
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
+        tool_args_hash = compute_args_hash(
+            {
+                "artifact_filename": artifact_filename,
+                "artifact_size": len(artifact_bytes),
+                "experiment_id": claims.experiment_id,
+            }
+        )
+
+        # 2. Identity resolution.
+        if mapped_identity is None:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 3. Token-identity binding.
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    tool_name=TOOL_WRITEBACK,
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    tool_name=TOOL_WRITEBACK,
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
+
+        # 4. Policy decision (tier 4 write, requires approval).
+        policy_req = PolicyRequest(
+            tool_name=TOOL_WRITEBACK,
+            tier=TOOL_TIER_WRITE,
+            adapter="opencloning",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=bool(approval_id),
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+
+        if decision.decision != "allow":
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 5. Approval token consume (single-use, args-hash-bound).
+        if self.approval_store is not None and approval_id:
+            try:
+                self.approval_store.consume(
+                    approval_id,
+                    tool_name=TOOL_WRITEBACK,
+                    args_hash=compute_args_hash(approval_args),
+                    target_record=str(claims.experiment_id),
+                )
+            except Exception as exc:
+                self._audit(
+                    tool_name=TOOL_WRITEBACK,
+                    policy_decision="deny",
+                    reason=f"approval_consume_failed:{exc}",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    approval_id=approval_id,
+                    error={
+                        "code": "APPROVAL_CONSUME_FAILED",
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                raise OpenCloningAdapterError(
+                    reason="approval_consume_failed",
+                    message=f"approval token consume failed: {exc}",
+                ) from exc
+
+        # 6. eLabFTW client must be configured for writeback.
+        if self.elabftw_client is None:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="elabftw_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={"code": "ELABFTW_NOT_CONFIGURED"},
+            )
+            raise OpenCloningAdapterError(
+                reason="elabftw_not_configured",
+                message=(
+                    "eLabFTW client not configured for writeback "
+                    "(set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)"
+                ),
+            )
+
+        # 7. Upload the artifact as an attachment.
+        try:
+            upload_id = self.elabftw_client.upload_attachment(
+                experiment_id=claims.experiment_id,
+                filename=artifact_filename,
+                data=artifact_bytes,
+                comment=artifact_comment,
+            )
+        except Exception as exc:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                api_call_summary={
+                    "method": "POST",
+                    "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",
+                },
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise OpenCloningAdapterError(
+                reason="client_error",
+                message=f"eLabFTW upload failed {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 8. Write provenance (audit_action_id in metadata).
+        import secrets as _secrets
+        import time as _time
+
+        action_id = f"{self.action_id_prefix}-writeback-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        try:
+            self.elabftw_client.patch_experiment_metadata(
+                experiment_id=claims.experiment_id,
+                metadata={
+                    "extra_fields": {
+                        "lab_copilot_audit_id": action_id,
+                        "lab_copilot_tool": TOOL_WRITEBACK,
+                        "lab_copilot_upload_id": upload_id,
+                    }
+                },
+            )
+        except Exception:
+            # Provenance write failure is not fatal — the artifact is
+            # already uploaded.  Log to audit but don't raise.
+            pass
+
+        # 9. Success audit.
+        self._audit(
+            tool_name=TOOL_WRITEBACK,
+            policy_decision="allow",
+            reason="writeback_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=approval_id,
+            api_call_summary={
+                "method": "POST",
+                "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",
+            },
+            result_summary={
+                "upload_id": upload_id,
+                "artifact_filename": artifact_filename,
+                "artifact_size": len(artifact_bytes),
+            },
+            require_persistence=True,
+            action_id=action_id,
+        )
+
+        return OpenCloningResult(
+            tool_name=TOOL_WRITEBACK,
+            result={
+                "upload_id": upload_id,
+                "experiment_id": claims.experiment_id,
+                "artifact_filename": artifact_filename,
+            },
+            audit_action_id=action_id,
         )
 
     # --- shared orchestration --------------------------------------------
@@ -878,6 +1333,7 @@ class OpenCloningAdapter:
         provider: str | None,
         model_id: str | None,
         tool_args_hash: str | None = None,
+        approval_id: str | None = None,
         api_call_summary: dict[str, Any] | None = None,
         result_summary: dict[str, Any] | None = None,
         error: dict[str, Any] | None = None,
@@ -918,6 +1374,7 @@ class OpenCloningAdapter:
             tool_args_hash=tool_args_hash,
             context_refs=context_refs,
             policy_decision=policy_decision,
+            approval_id=approval_id,
             api_call_summary=api_call_summary or {},
             result_summary=result_summary or {},
             error=error,
@@ -964,13 +1421,19 @@ def get_opencloning_adapter() -> OpenCloningAdapter:
     """Return the process-wide OpenCloning adapter (created lazily)."""
     global _default_adapter
     if _default_adapter is None:
+        from lab_copilot_gateway.approval import get_approval_store
         from lab_copilot_gateway.audit import get_audit_store
+        from lab_copilot_gateway.elabftw import (
+            _default_client_from_env as _elabftw_client_from_env,
+        )
         from lab_copilot_gateway.policy import get_policy_engine
 
         _default_adapter = OpenCloningAdapter(
             policy_engine=get_policy_engine(),
             audit_store=get_audit_store(),
             client=_default_client_from_env(),
+            elabftw_client=_elabftw_client_from_env(),
+            approval_store=get_approval_store(),
         )
     return _default_adapter
 

@@ -910,6 +910,24 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": result.to_dict(),
                     }
+                elif tool.name == "opencloning.writeback_artifact":
+                    result = adapter.writeback_artifact(
+                        context_token=body.context_token,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
                 else:
                     return {
                         "ok": False,
