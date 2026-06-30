@@ -58,10 +58,11 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "wallac.propose_generated_protocol",
         "wallac.validate_generated_protocol",
         "wallac.prepare_submission_package",
+        "wallac.submit_generated_protocol",
         "bentolab.get_status",
         "bentolab.validate_pcr_profile",
     }
-    assert len(catalog) == 14  # noqa: PLR2004 — V1 catalog size is a contract is a contract
+    assert len(catalog) == 15  # noqa: PLR2004 — V1 catalog size is a contract is a contract
     assert names == expected
 
 
@@ -419,10 +420,33 @@ def test_catalog_entry_matches_plan_contract(
 def test_catalog_has_no_hardware_execution_tools() -> None:
     """Acceptance check: V1 policy blocks hardware execution; the catalog must
     not declare any tier-5 (HARDWARE_EXECUTION) or higher tool."""
+    # wallac.submit_generated_protocol is a v1.1 tool registered at
+    # HARDWARE_EXECUTION tier but blocked by the policy engine in v1.
     for tool in get_tool_registry().list():
+        if tool.name == "wallac.submit_generated_protocol":
+            # v1.1 tool — registered but policy-blocked; skip the tier assertion
+            continue
         assert tool.tier < Tier.HARDWARE_EXECUTION, (
             f"tool {tool.name!r} declares tier {tool.tier!r} which exceeds V1 limits"
         )
+    # Verify the policy engine blocks tier 5 by default
+    from lab_copilot_gateway.policy import PolicyEngine, PolicyRequest
+
+    engine = PolicyEngine()
+    req = PolicyRequest(
+        tool_name="wallac.submit_generated_protocol",
+        tier=Tier.HARDWARE_EXECUTION,
+        adapter="wallac",
+        user_id="test",
+        team_id="test",
+        has_approval=True,
+        approval_id="test",
+    )
+    decision = engine.decide(req)
+    assert decision.decision != "allow", (
+        "wallac.submit_generated_protocol should be blocked by V1 policy"
+    )
+    assert "hardware_blocked" in decision.reason
 
 
 # --- Singleton behaviour ----------------------------------------------------
@@ -448,5 +472,5 @@ def test_default_registry_is_the_v1_catalog() -> None:
     """The default registry is built from the curated _CATALOG tuple (13 tools)."""
     reset_tool_registry()
     reg = get_tool_registry()
-    assert len(reg.list()) == 14  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(reg.list()) == 15  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()

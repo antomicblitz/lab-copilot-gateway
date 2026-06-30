@@ -304,6 +304,15 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="read",
         description="Prepare an approval-ready Wallac submission package; execution remains blocked in v1.",
     ),
+    # --- Wallac hardware execution (v1.1 — blocked by policy in v1) ------
+    Tool(
+        name="wallac.submit_generated_protocol",
+        tier=Tier.HARDWARE_EXECUTION,
+        adapter="wallac",
+        requires_approval=True,
+        mutability="mutate",
+        description="Submit an approved Wallac generated protocol for hardware execution; requires explicit user approval (blocked in v1).",
+    ),
     # --- BentoLab status and validation (no execution until wrapper ready) --
     Tool(
         name="bentolab.get_status",

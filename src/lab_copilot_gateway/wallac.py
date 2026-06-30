@@ -48,9 +48,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from lab_copilot_gateway.approval import compute_args_hash
+from lab_copilot_gateway.approval import ApprovalStore, compute_args_hash
 from lab_copilot_gateway.audit import AuditRecord, AuditStore
 from lab_copilot_gateway.elabftw import (
+    ElabftwClient,
     InvalidContextToken,
     UnmappedCaller,
     verify_context_token,
@@ -207,6 +208,14 @@ class WallacBridgeClient(Protocol):
         """
         ...
 
+    def submit_job(self, job_item_id: int) -> dict[str, Any]:
+        """POST /api/jobs/{id}/submit — submit a job for hardware execution.
+
+        Returns a dict with ``job_id``, ``status`` (e.g. ``submitted``,
+        ``aborted``, ``failed``), and ``audit_action_id``.
+        """
+        ...
+
     def get_health(self) -> dict[str, Any]:
         """GET /health — bridge health check."""
         ...
@@ -231,6 +240,13 @@ class StubWallacBridgeClient:
             "errors": [],
         }
     )
+    submit_response: dict[str, Any] = field(
+        default_factory=lambda: {
+            "job_id": 1,
+            "status": "submitted",
+            "audit_action_id": "bridge-audit-1",
+        }
+    )
     health_response: dict[str, Any] = field(default_factory=lambda: {"status": "ok"})
     error: Exception | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -240,6 +256,12 @@ class StubWallacBridgeClient:
         if self.error is not None:
             raise self.error
         return dict(self.validation_response)
+
+    def submit_job(self, job_item_id: int) -> dict[str, Any]:
+        self.calls.append({"method": "submit_job", "job_item_id": job_item_id})
+        if self.error is not None:
+            raise self.error
+        return dict(self.submit_response)
 
     def get_health(self) -> dict[str, Any]:
         if self.error is not None:
@@ -277,6 +299,13 @@ class HttpWallacBridgeClient:
 
     def validate_protocol(self, job_item_id: int) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}/api/jobs/{job_item_id}/validate"
+        s = self._connect()
+        resp = s.post(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+    def submit_job(self, job_item_id: int) -> dict[str, Any]:
+        url = f"{self.base_url.rstrip('/')}/api/jobs/{job_item_id}/submit"
         s = self._connect()
         resp = s.post(url, timeout=self.timeout_seconds)
         resp.raise_for_status()
@@ -357,12 +386,16 @@ TOOL_GET_STATUS = "wallac.get_status"
 TOOL_PROPOSE = "wallac.propose_generated_protocol"
 TOOL_VALIDATE = "wallac.validate_generated_protocol"
 TOOL_PREPARE_SUBMISSION = "wallac.prepare_submission_package"
+TOOL_SUBMIT = "wallac.submit_generated_protocol"
 
 # C18 status is tier 2 (OPERATIONAL_READ_ONLY).
 TOOL_TIER = Tier.OPERATIONAL_READ_ONLY
 
 # C19 proposal/validation is tier 3 (VALIDATION_DRY_RUN).
 TOOL_TIER_C19 = Tier.VALIDATION_DRY_RUN
+
+# C21 hardware execution is tier 5 (HARDWARE_EXECUTION).
+TOOL_TIER_SUBMIT = Tier.HARDWARE_EXECUTION
 
 
 @dataclass
@@ -384,6 +417,8 @@ class WallacAdapter:
     audit_store: AuditStore
     client: WallacClient | None
     bridge_client: WallacBridgeClient | None = None
+    approval_store: ApprovalStore | None = None
+    elabftw_client: ElabftwClient | None = None
     action_id_prefix: str = "wallac"
 
     # --- public API: C18 tool entrypoint --------------------------------
@@ -576,6 +611,52 @@ class WallacAdapter:
             tier_override=TOOL_TIER_C19,
         )
 
+    # --- C21: approval-gated submit --------------------------------------
+
+    def submit_generated_protocol(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        job_item_id: int,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Submit an approved Wallac generated protocol for hardware execution.
+
+        Orchestrates:
+            token verify -> identity -> policy (tier 5) -> approval consume
+            -> bridge submit -> eLabFTW provenance writeback -> audit
+
+        The approval consume happens AFTER policy allow but BEFORE the
+        bridge call, so a consumed-but-failed submission still has an
+        audit trail (the approval is NOT refunded).
+
+        ``job_item_id`` identifies the job in the Wallac bridge that was
+        prepared by the C19 prepare+validate flow.  ``approval_id`` and
+        ``approval_args`` are the single-use approval token and its
+        bound args (issued via POST /approval/request).
+        """
+        return self._execute_submit(
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            job_item_id=job_item_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+        )
+
     # --- shared orchestration --------------------------------------------
 
     def _call_bridge_validate(self, job_item_id: int) -> dict[str, Any]:
@@ -594,6 +675,394 @@ class WallacAdapter:
                 ),
             )
         return self.bridge_client.validate_protocol(job_item_id)
+
+    def _call_bridge_submit(self, job_item_id: int) -> dict[str, Any]:
+        """Call the Wallac bridge to submit a job for execution.
+
+        Separated from the lambda so the bridge-not-configured check
+        happens at the right point in the orchestration (after approval
+        consume, before the downstream call).
+        """
+        if self.bridge_client is None:
+            raise WallacAdapterError(
+                reason="wallac_bridge_not_configured",
+                message=(
+                    "Wallac bridge client not configured "
+                    "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
+                ),
+            )
+        return self.bridge_client.submit_job(job_item_id)
+
+    def _execute_submit(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        job_item_id: int,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+    ) -> WallacResult:
+        """Submit orchestration: token -> identity -> policy -> approval -> bridge -> provenance -> audit.
+
+        Mirrors the OpenCloning adapter's ``_execute_writeback`` pattern.
+        The approval is consumed AFTER the policy allow but BEFORE the
+        bridge call — the token is single-use and NOT refunded on bridge
+        failure, preventing replay.
+
+        Unknown/abort statuses from the bridge are returned as results
+        (not exceptions) so the caller sees the actual execution outcome.
+        """
+        import secrets as _secrets
+        import time as _time
+
+        # Compute early redacted args hash for audit on failure paths.
+        early_hash = compute_args_hash(
+            {
+                "tool": "submit_generated_protocol",
+                "job_item_id": job_item_id,
+                "token_present": bool(context_token),
+            }
+        )
+
+        # 1. Verify context token (signature + expiry).
+        if not context_token:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="deny",
+                reason="missing_context_token",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "MISSING_CONTEXT_TOKEN"},
+            )
+            raise InvalidContextToken("missing")
+
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
+        tool_args_hash = compute_args_hash(
+            {
+                "tool": "submit_generated_protocol",
+                "job_item_id": job_item_id,
+                "experiment_id": claims.experiment_id,
+            }
+        )
+
+        # 2. Identity resolution — unmapped caller denies.
+        if mapped_identity is None:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 3. Token-identity binding (three-way check).
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    tool_name=TOOL_SUBMIT,
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    tool_name=TOOL_SUBMIT,
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
+
+        # 4. Policy decision (tier 5 HARDWARE_EXECUTION, requires approval).
+        policy_req = PolicyRequest(
+            tool_name=TOOL_SUBMIT,
+            tier=TOOL_TIER_SUBMIT,
+            adapter="wallac",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=bool(approval_id),
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+
+        if decision.decision != "allow":
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id if approval_id else None,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 5. Approval token consume (single-use, args-hash-bound).
+        #    Happens AFTER policy allow, BEFORE the bridge call.
+        if self.approval_store is not None:
+            try:
+                self.approval_store.consume(
+                    approval_id,
+                    tool_name=TOOL_SUBMIT,
+                    args_hash=compute_args_hash(approval_args),
+                    target_record=f"wallac:job:{job_item_id}",
+                )
+            except Exception as exc:
+                from lab_copilot_gateway.approval import ApprovalError
+
+                reason_code = "approval_consume_failed"
+                error_payload: dict[str, Any] = {
+                    "code": "APPROVAL_CONSUME_FAILED",
+                    "exception": type(exc).__name__,
+                }
+                if isinstance(exc, ApprovalError):
+                    reason_code = f"approval_denied:{exc.reason}"
+                    error_payload["approval_reason"] = exc.reason
+                    error_payload["approval_id"] = exc.approval_id
+                self._audit(
+                    tool_name=TOOL_SUBMIT,
+                    policy_decision="deny",
+                    reason=reason_code,
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    approval_id=approval_id,
+                    error=error_payload,
+                )
+                raise WallacAdapterError(
+                    reason=reason_code,
+                    message=f"approval token consume failed: {exc}",
+                ) from exc
+
+        # 6. Bridge client must be configured.
+        if self.bridge_client is None:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="allow",
+                reason="wallac_bridge_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={"code": "WALLAC_BRIDGE_NOT_CONFIGURED"},
+            )
+            raise WallacAdapterError(
+                reason="wallac_bridge_not_configured",
+                message=(
+                    "Wallac bridge client not configured "
+                    "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
+                ),
+            )
+
+        # 7. Bridge submit call.
+        try:
+            bridge_result = self._call_bridge_submit(job_item_id)
+        except Exception as exc:
+            self._audit(
+                tool_name=TOOL_SUBMIT,
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                api_call_summary={
+                    "method": "POST",
+                    "path": f"/api/jobs/{job_item_id}/submit",
+                },
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise WallacAdapterError(
+                reason="client_error",
+                message=f"Wallac bridge submitted raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 8. Pre-compute the action_id for audit + provenance writeback.
+        action_id = f"{self.action_id_prefix}-submit-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        # 9. eLabFTW provenance writeback (best-effort, non-fatal).
+        if self.elabftw_client is not None:
+            try:
+                self.elabftw_client.patch_experiment_metadata(
+                    experiment_id=claims.experiment_id,
+                    metadata={
+                        "extra_fields": {
+                            "wallac_job_id": bridge_result.get("job_id"),
+                            "wallac_job_status": bridge_result.get("status"),
+                            "wallac_bridge_audit_action_id": bridge_result.get(
+                                "audit_action_id"
+                            ),
+                            "wallac_submit_tool": TOOL_SUBMIT,
+                            "wallac_gateway_audit_action_id": action_id,
+                        }
+                    },
+                )
+            except Exception:
+                # Provenance write failure is not fatal — the job was
+                # already submitted to the bridge.
+                pass
+
+        # 10. Success audit.
+
+        self._audit(
+            tool_name=TOOL_SUBMIT,
+            policy_decision="allow",
+            reason="call_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=approval_id,
+            api_call_summary={
+                "method": "POST",
+                "path": f"/api/jobs/{job_item_id}/submit",
+            },
+            result_summary={
+                "job_id": bridge_result.get("job_id"),
+                "status": bridge_result.get("status"),
+                "bridge_audit_action_id": bridge_result.get("audit_action_id"),
+            },
+            require_persistence=True,
+            action_id=action_id,
+        )
+
+        return WallacResult(
+            tool_name=TOOL_SUBMIT,
+            result={
+                "job_id": bridge_result.get("job_id"),
+                "status": bridge_result.get("status"),
+                "bridge_audit_action_id": bridge_result.get("audit_action_id"),
+            },
+            audit_action_id=action_id,
+        )
 
     def _execute(
         self,
@@ -941,6 +1410,7 @@ class WallacAdapter:
         error: dict[str, Any] | None = None,
         require_persistence: bool = False,
         action_id: str | None = None,
+        approval_id: str | None = None,
     ) -> None:
         """Persist an audit record.
 
@@ -974,6 +1444,7 @@ class WallacAdapter:
             model_id=model_id,
             tool_name=tool_name,
             tool_args_hash=tool_args_hash,
+            approval_id=approval_id,
             context_refs=context_refs,
             policy_decision=policy_decision,
             api_call_summary=api_call_summary or {},
@@ -1000,7 +1471,11 @@ def get_wallac_adapter() -> WallacAdapter:
     """Return the process-wide Wallac adapter (created lazily)."""
     global _default_adapter
     if _default_adapter is None:
+        from lab_copilot_gateway.approval import get_approval_store
         from lab_copilot_gateway.audit import get_audit_store
+        from lab_copilot_gateway.elabftw import (
+            _default_client_from_env as _default_elabftw_client_from_env,
+        )
         from lab_copilot_gateway.policy import get_policy_engine
 
         _default_adapter = WallacAdapter(
@@ -1008,6 +1483,8 @@ def get_wallac_adapter() -> WallacAdapter:
             audit_store=get_audit_store(),
             client=_default_client_from_env(),
             bridge_client=_default_bridge_client_from_env(),
+            approval_store=get_approval_store(),
+            elabftw_client=_default_elabftw_client_from_env(),
         )
     return _default_adapter
 

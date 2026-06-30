@@ -30,15 +30,21 @@ import datetime as _dt
 
 import pytest
 
+from lab_copilot_gateway.approval import (
+    ApprovalStore,
+    ApprovalRequest,
+    compute_args_hash,
+)
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
     InvalidContextToken,
+    StubElabftwClient,
     UnmappedCaller,
     mint_context_token,
 )
 from lab_copilot_gateway.identity import MappedIdentity
-from lab_copilot_gateway.policy import PolicyEngine
+from lab_copilot_gateway.policy import PolicyEngine, Tier
 from lab_copilot_gateway.wallac import (
     HttpWallacBridgeClient,
     HttpWallacClient,
@@ -48,6 +54,7 @@ from lab_copilot_gateway.wallac import (
     WallacAdapter,
     WallacAdapterError,
     WallacResult,
+    TOOL_SUBMIT,
     _default_bridge_client_from_env,
     _default_client_from_env,
     get_wallac_adapter,
@@ -75,6 +82,13 @@ def audit() -> AuditStore:
 
 
 @pytest.fixture
+def approval() -> ApprovalStore:
+    s = ApprovalStore(db_path=":memory:")
+    yield s
+    s.close()
+
+
+@pytest.fixture
 def policy() -> PolicyEngine:
     return PolicyEngine()  # default: max_tier=6, no kill switches
 
@@ -82,6 +96,11 @@ def policy() -> PolicyEngine:
 @pytest.fixture
 def stub_client() -> StubWallacClient:
     return StubWallacClient()
+
+
+@pytest.fixture
+def stub_elabftw() -> StubElabftwClient:
+    return StubElabftwClient(seeds={42: {"id": 42, "title": "test", "metadata": None}})
 
 
 @pytest.fixture
@@ -1022,3 +1041,646 @@ def test_singleton_bridge_client_none_when_unset(monkeypatch) -> None:
         assert adapter.bridge_client is None
     finally:
         reset_wallac_adapter()
+
+
+# ============================================================================
+# C21: submit_generated_protocol
+# ============================================================================
+
+
+def _approval_token(
+    approval_store: ApprovalStore,
+    *,
+    tool_name: str = TOOL_SUBMIT,
+    args: dict | None = None,
+    target_record: str | None = None,
+    tier: int = 5,
+) -> str:
+    """Helper: issue an approval token for submit tests."""
+    req = ApprovalRequest(
+        tool_name=tool_name,
+        args_hash=compute_args_hash(args or {"job_item_id": 99}),
+        target_record=target_record or "wallac:job:99",
+        tier=tier,
+    )
+    approval_id, _ = approval_store.request(req)
+    return approval_id
+
+
+# --- policy blocks in V1 ---------------------------------------------------
+
+
+def test_submit_hardware_blocked_in_v1(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Default policy engine blocks hardware execution (V1 acceptance)."""
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+    with pytest.raises(PolicyDenied) as exc_info:
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id=approval_id,
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    assert "hardware_blocked" in exc_info.value.reason
+    # Audit records the deny
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "deny"
+    assert rows[0]["error"]["reason"] == "hardware_blocked"
+    # No bridge call was made
+    assert len(stub_bridge_client.calls) == 0
+
+
+# --- approval gated happy path (with policy override) ----------------------
+
+
+def test_submit_happy_path(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Approved generated-protocol run executes (acceptance check)."""
+    # Allow tier 5 by raising block_hardware_above past HARDWARE_EXECUTION.
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+
+    result = adapter.submit_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        approval_args={"job_item_id": 99},
+        job_item_id=99,
+    )
+
+    assert isinstance(result, WallacResult)
+    assert result.tool_name == TOOL_SUBMIT
+    assert result.result["job_id"] == 1
+    assert result.result["status"] == "submitted"
+    assert result.result["bridge_audit_action_id"] == "bridge-audit-1"
+    assert result.audit_action_id is not None
+    assert result.audit_action_id.startswith("wallac-submit-")
+
+    # Bridge was called
+    assert len(stub_bridge_client.calls) == 1
+    assert stub_bridge_client.calls[0]["method"] == "submit_job"
+    assert stub_bridge_client.calls[0]["job_item_id"] == 99
+
+    # Approval was consumed
+    record = approval.get(approval_id)
+    assert record is not None
+    assert record.is_consumed()
+
+    # Audit row written
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "allow"
+    assert rows[0]["tool_name"] == TOOL_SUBMIT
+    assert rows[0]["tool_args_hash"] is not None
+    assert rows[0]["result_summary"]["job_id"] == 1
+    assert rows[0]["result_summary"]["status"] == "submitted"
+
+
+def test_submit_elabftw_provenance_written(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+    stub_elabftw: StubElabftwClient,
+) -> None:
+    """Results write back to eLabFTW (provenance)."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+        elabftw_client=stub_elabftw,
+    )
+    approval_id = _approval_token(approval)
+
+    result = adapter.submit_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        approval_args={"job_item_id": 99},
+        job_item_id=99,
+    )
+
+    # eLabFTW experiment 42 should have provenance metadata
+    exp = stub_elabftw.get_experiment(42)
+    assert exp["metadata"] is not None
+    meta = exp["metadata"]
+    extra = meta.get("extra_fields", {})
+    assert extra.get("wallac_job_id") == 1
+    assert extra.get("wallac_job_status") == "submitted"
+    assert extra.get("wallac_bridge_audit_action_id") == "bridge-audit-1"
+    assert extra.get("wallac_submit_tool") == TOOL_SUBMIT
+    assert extra.get("wallac_gateway_audit_action_id") is not None
+    assert result.audit_action_id == extra["wallac_gateway_audit_action_id"]
+
+
+# --- result package includes audit ID (acceptance check) --------------------
+
+
+def test_submit_result_includes_audit_id(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Result package includes audit ID (acceptance check)."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+
+    result = adapter.submit_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        approval_args={"job_item_id": 99},
+        job_item_id=99,
+    )
+    # Result includes audit_action_id
+    assert result.audit_action_id is not None
+    assert result.to_dict()["audit_action_id"] == result.audit_action_id
+
+
+# --- no approval denies ----------------------------------------------------
+
+
+def test_submit_no_approval_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Missing approval_id is denied by policy (approval_required)."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(PolicyDenied) as exc_info:
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id="",  # no approval
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    assert "approval_required" in exc_info.value.reason
+    # No bridge call
+    assert len(stub_bridge_client.calls) == 0
+    # Audit records the deny
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "deny"
+
+
+# --- mismatched approval args ----------------------------------------------
+
+
+def test_submit_mismatched_approval_args_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Approval with wrong args hash is denied at consume time."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    # Issue approval bound to args={"job_item_id": 99}
+    approval_id = _approval_token(approval)
+
+    # Call with different args (different hash)
+    with pytest.raises(WallacAdapterError) as exc_info:
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id=approval_id,
+            approval_args={"job_item_id": 999},  # different from what was approved
+            job_item_id=999,
+        )
+    assert "approval" in exc_info.value.reason.lower()
+    # Approval was NOT consumed (mismatch prevents consume)
+    record = approval.get(approval_id)
+    assert record is not None
+    assert not record.is_consumed()
+    # No bridge call
+    assert len(stub_bridge_client.calls) == 0
+
+
+# --- bridge not configured -------------------------------------------------
+
+
+def test_submit_bridge_not_configured_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    approval: ApprovalStore,
+) -> None:
+    """Bridge not configured raises structured error."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=None,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+    with pytest.raises(WallacAdapterError) as exc_info:
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id=approval_id,
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    assert exc_info.value.reason == "wallac_bridge_not_configured"
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "WALLAC_BRIDGE_NOT_CONFIGURED"
+
+
+# --- bridge error propagates -----------------------------------------------
+
+
+def test_submit_bridge_error_propagates(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    approval: ApprovalStore,
+) -> None:
+    """Bridge client error propagates after audit."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    bridge = StubWallacBridgeClient(error=ConnectionError("bridge offline"))
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=bridge,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+    with pytest.raises(WallacAdapterError) as exc_info:
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id=approval_id,
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    assert exc_info.value.reason == "client_error"
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "CLIENT_ERROR"
+    assert rows[0]["policy_decision"] == "allow"  # policy allowed, bridge failed
+    # Approval was consumed before bridge call
+    record = approval.get(approval_id)
+    assert record is not None
+    assert record.is_consumed()
+
+
+# --- abort path ------------------------------------------------------------
+
+
+def test_submit_abort_path(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Abort path produces operator-review state (acceptance check)."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    # Simulate bridge returning aborted status
+    stub_bridge_client.submit_response = {
+        "job_id": 1,
+        "status": "aborted",
+        "audit_action_id": "bridge-audit-1",
+    }
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+
+    result = adapter.submit_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        approval_args={"job_item_id": 99},
+        job_item_id=99,
+    )
+    # Non-submitted status is returned in result (not raised)
+    assert result.result["status"] == "aborted"
+    assert result.result["job_id"] == 1
+    assert result.result["bridge_audit_action_id"] == "bridge-audit-1"
+    # Audit records the status
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["result_summary"]["status"] == "aborted"
+
+
+# --- audit hash on all paths -----------------------------------------------
+
+
+def test_submit_audit_hash_present_on_success(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """tool_args_hash is present on success path."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(approval)
+    adapter.submit_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        approval_args={"job_item_id": 99},
+        job_item_id=99,
+    )
+    rows = _audit_rows(audit)
+    assert rows[0]["tool_args_hash"] is not None
+    assert len(rows[0]["tool_args_hash"]) == 64
+
+
+def test_submit_audit_hash_present_on_deny(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """tool_args_hash is present on deny path (no approval)."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(PolicyDenied):
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id="",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["tool_args_hash"] is not None
+
+
+def test_submit_audit_hash_present_on_unknown(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """tool_args_hash present when unmapped caller denies."""
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(UnmappedCaller):
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=None,
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["tool_args_hash"] is not None
+
+
+# --- context token checks --------------------------------------------------
+
+
+def test_submit_missing_context_token(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Missing context token denies."""
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(InvalidContextToken, match="missing"):
+        adapter.submit_generated_protocol(
+            context_token="",
+            mapped_identity=_identity(),
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "MISSING_CONTEXT_TOKEN"
+
+
+def test_submit_invalid_context_token(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Invalid context token denies."""
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(InvalidContextToken):
+        adapter.submit_generated_protocol(
+            context_token="garbage",
+            mapped_identity=_identity(),
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "INVALID_CONTEXT_TOKEN"
+
+
+def test_submit_unmapped_caller_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Unmapped caller denies before any downstream call."""
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(UnmappedCaller):
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=None,
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "UNMAPPED_CALLER"
+
+
+def test_submit_token_user_mismatch_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Token-identity mismatch denies."""
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(InvalidContextToken):
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(elab_user_id="other-user"),
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "CONTEXT_TOKEN_USER_MISMATCH"
+
+
+# --- kill switch deny ------------------------------------------------------
+
+
+def test_submit_kill_switch_denies(
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Kill switch denies wallac.submit_generated_protocol."""
+    policy = PolicyEngine(kill_switches=("wallac.submit_*",))
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(PolicyDenied):
+        adapter.submit_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id="test",
+            approval_args={"job_item_id": 99},
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert "kill_switch" in rows[0]["error"]["reason"]
