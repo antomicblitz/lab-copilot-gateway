@@ -1834,6 +1834,7 @@ class ElabftwWriteAdapter:
         librechat_user_id: str | None = None,
         provider: str | None = None,
         model_id: str | None = None,
+        plan_approval_id: str | None = None,
     ) -> WriteResult:
         """Replace the body of the user's experiment with approved content (C35).
 
@@ -1890,6 +1891,7 @@ class ElabftwWriteAdapter:
             model_id=model_id,
             precomputed_claims=claims,
             precomputed_tool_args_hash=tool_args_hash,
+            plan_approval_id=plan_approval_id,
             exec_fn=lambda client, _claims: self._exec_edit_section(
                 client,
                 target_experiment_id=target_experiment_id,
@@ -1919,6 +1921,7 @@ class ElabftwWriteAdapter:
         exec_fn: Any,  # Callable[[ElabftwClient, ContextTokenClaims], int]
         precomputed_claims: ContextTokenClaims | None = None,
         precomputed_tool_args_hash: str | None = None,
+        plan_approval_id: str | None = None,
     ) -> WriteResult:
         """Run the C09 orchestration template.
 
@@ -1930,6 +1933,9 @@ class ElabftwWriteAdapter:
             2. Policy decision (tier 4 bounded write).
             3. Append-only enforcement (only when ``apply_append_only``).
             4. Approval token consume (single-use, args-hash-bound).
+               SKIPPED when ``plan_approval_id`` is set — the plan executor
+               has already consumed the plan-level approval (bound to the
+               plan hash, which covers all step args).
             5. Downstream write.
             6. Provenance writeback (audit action_id in metadata).
             7. Success audit row (require_persistence=True).
@@ -2055,54 +2061,64 @@ class ElabftwWriteAdapter:
         # now and verify the approval token was bound to the same hash.  This
         # is the server-side enforcement single point — LibreChat cannot forge
         # the token because the gateway is the one comparing hashes.
-        args_hash_now = compute_args_hash(approval_args)
-        target_record_str = (
-            f"elabftw:experiment:{target_experiment_id}"
-            if target_experiment_id is not None
-            else None
-        )
-        try:
-            self.approval_store.consume(
-                approval_id,
-                tool_name=tool_name,
-                args_hash=args_hash_now,
-                target_record=target_record_str,
+        #
+        # C39: when ``plan_approval_id`` is set, the plan executor has
+        # already consumed the plan-level approval (bound to the plan hash,
+        # which covers all step args).  Skip the per-step consume and use
+        # the plan approval_id in audit records.
+        if plan_approval_id:
+            effective_approval_id = plan_approval_id
+        else:
+            args_hash_now = compute_args_hash(approval_args)
+            target_record_str = (
+                f"elabftw:experiment:{target_experiment_id}"
+                if target_experiment_id is not None
+                else None
             )
-        except Exception as exc:
-            # Reason: any approval-consume failure (not_found, expired,
-            # already_consumed, mismatch) is treated as an unauthorized write
-            # attempt.  We surface the underlying reason code in the audit.
-            from lab_copilot_gateway.approval import ApprovalError
+            try:
+                self.approval_store.consume(
+                    approval_id,
+                    tool_name=tool_name,
+                    args_hash=args_hash_now,
+                    target_record=target_record_str,
+                )
+                effective_approval_id = approval_id
+            except Exception as exc:
+                # Reason: any approval-consume failure (not_found, expired,
+                # already_consumed, mismatch) is treated as an unauthorized
+                # write attempt.  We surface the underlying reason code in
+                # the audit.
+                from lab_copilot_gateway.approval import ApprovalError
 
-            reason_code = "approval_consume_failed"
-            error_payload: dict[str, Any] = {
-                "code": "APPROVAL_CONSUME_FAILED",
-                "exception": type(exc).__name__,
-            }
-            if isinstance(exc, ApprovalError):
-                reason_code = f"approval_denied:{exc.reason}"
-                error_payload["approval_reason"] = exc.reason
-                error_payload["approval_id"] = exc.approval_id
-            self._audit(
-                policy_decision="deny",
-                reason=reason_code,
-                mapped_identity=mapped_identity,
-                experiment_id=target_experiment_id or claims.experiment_id,
-                tool_name=tool_name,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
-                error=error_payload,
-            )
-            raise ElabftwAdapterError(
-                reason=reason_code,
-                message=f"approval token consume failed: {exc}",
-            ) from exc
+                reason_code = "approval_consume_failed"
+                error_payload: dict[str, Any] = {
+                    "code": "APPROVAL_CONSUME_FAILED",
+                    "exception": type(exc).__name__,
+                }
+                if isinstance(exc, ApprovalError):
+                    reason_code = f"approval_denied:{exc.reason}"
+                    error_payload["approval_reason"] = exc.reason
+                    error_payload["approval_id"] = exc.approval_id
+                self._audit(
+                    policy_decision="deny",
+                    reason=reason_code,
+                    mapped_identity=mapped_identity,
+                    experiment_id=target_experiment_id or claims.experiment_id,
+                    tool_name=tool_name,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    approval_id=approval_id,
+                    error=error_payload,
+                )
+                raise ElabftwAdapterError(
+                    reason=reason_code,
+                    message=f"approval token consume failed: {exc}",
+                ) from exc
 
         # 5. Client must be present — checked after approval to keep the
         # audit trail consistent ("approved, but misconfigured gateway").
@@ -2120,7 +2136,7 @@ class ElabftwWriteAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 error={"code": "ELABFTW_NOT_CONFIGURED"},
             )
             raise ElabftwAdapterError(
@@ -2158,7 +2174,7 @@ class ElabftwWriteAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 error={
                     "code": exc.reason.upper(),
                     "exception": type(exc).__name__,
@@ -2180,7 +2196,7 @@ class ElabftwWriteAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 error={
                     "code": "CLIENT_ERROR",
                     "exception": type(exc).__name__,
@@ -2204,7 +2220,7 @@ class ElabftwWriteAdapter:
             experiment_id=effective_experiment_id,
             existing_audit_action_id=None,  # set below via _audit
             tool_args_hash=tool_args_hash,
-            approval_id=approval_id,
+            approval_id=effective_approval_id,
             mapped_identity=mapped_identity,
             tool_name=tool_name,
             conversation_id=conversation_id,
@@ -2230,7 +2246,7 @@ class ElabftwWriteAdapter:
             provider=provider,
             model_id=model_id,
             tool_args_hash=tool_args_hash,
-            approval_id=approval_id,
+            approval_id=effective_approval_id,
             api_call_summary={
                 "operation": operation,
                 "downstream_id": downstream_id,

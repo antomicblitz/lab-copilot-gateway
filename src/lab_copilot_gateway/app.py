@@ -56,6 +56,8 @@ from lab_copilot_gateway.policy import (
     set_kill_category,
 )
 from lab_copilot_gateway.tools import get_tool_registry, list_tools
+from lab_copilot_gateway.plan import Plan, PlanValidationError
+from lab_copilot_gateway.plan_executor import get_plan_executor
 
 
 class AuditBody(BaseModel):
@@ -296,6 +298,20 @@ class InvokeBody(BaseModel):
     context_token: str
     args: dict[str, Any] = Field(default_factory=dict)
     approval_id: str | None = None
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+
+
+class PlanExecuteBody(BaseModel):
+    """Request body for POST /plan/execute (C39)."""
+
+    plan: dict[str, Any]
+    approval_id: str
+    context_token: str = ""
     keycloak_subject: str | None = None
     librechat_user_id: str | None = None
     conversation_id: str | None = None
@@ -1255,6 +1271,54 @@ def create_app() -> FastAPI:
                 "(lands in C19+)"
             ),
         }
+
+    # ========================================================================
+    # C39 — Plan execution endpoint
+    # ========================================================================
+
+    @api.post("/plan/execute")
+    def plan_execute(
+        body: PlanExecuteBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        """Execute a validated plan with plan-level approval (C39).
+
+        Accepts a plan dict (C38 schema), an approval_id bound to the plan
+        hash, and identity context.  The plan executor validates the plan,
+        consumes the approval, executes steps in order, and returns a
+        per-step result summary.
+        """
+        # Parse the plan dict into a Plan object.
+        try:
+            plan = Plan.from_dict(body.plan)
+        except PlanValidationError as exc:
+            return {
+                "ok": False,
+                "plan_id": body.plan.get("plan_id", ""),
+                "reason": "plan_validation_failed",
+                "errors": exc.errors,
+            }
+
+        # Resolve identity.
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+
+        executor = get_plan_executor()
+        result = executor.execute(
+            plan,
+            approval_id=body.approval_id,
+            context_token=body.context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return {"ok": result.status == "completed", **result.to_dict()}
 
     return api
 

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
-from lab_copilot_gateway.approval import ApprovalStore
+from lab_copilot_gateway.approval import ApprovalRequest, ApprovalStore
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
@@ -20,6 +20,7 @@ from lab_copilot_gateway.elabftw import (
     mint_context_token,
 )
 from lab_copilot_gateway.identity import DbIdentityMapper
+from lab_copilot_gateway.plan import Plan, PlanRiskTier, PlanStep
 from lab_copilot_gateway.policy import PolicyEngine
 
 
@@ -32,6 +33,7 @@ def _reset_audit_store(monkeypatch) -> None:
     import lab_copilot_gateway.elabftw as elabmod
     import lab_copilot_gateway.identity as identitymod
     import lab_copilot_gateway.policy as policymod
+    import lab_copilot_gateway.plan_executor as pemod
     import lab_copilot_gateway.tools as toolsmod
 
     # Pin the context-token secret for HTTP-level tests that mint tokens.
@@ -84,6 +86,8 @@ def _reset_audit_store(monkeypatch) -> None:
     )
     original_tools = toolsmod._default_registry
     toolsmod._default_registry = None  # fall back to the curated catalog
+    # Reset the plan executor singleton so it picks up the new adapters.
+    pemod.reset_plan_executor(None)
     yield
     store.close()
     approval_store.close()
@@ -94,6 +98,7 @@ def _reset_audit_store(monkeypatch) -> None:
     elabmod._default_adapter = None
     elabmod._default_write_adapter = None
     toolsmod._default_registry = original_tools
+    pemod.reset_plan_executor(None)
     authmod.reset_auth_config()  # clear auth singleton for next test
 
 
@@ -1794,3 +1799,184 @@ def test_invoke_dispatches_read_experiment_by_id() -> None:
     assert result["experiment_id"] == 42
     assert result["title"] == "HTTP test experiment"
     assert "body" in result
+
+
+# --- /plan/execute HTTP roundtrips (C39) ----------------------------------
+
+
+def _plan_dict_for_test(experiment_id: int = 42) -> dict:
+    """A valid plan dict targeting a supported read + write tool."""
+    body = "<p>body</p>"  # matches the fixture's stub seed
+    body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    plan = Plan(
+        plan_id="plan-http-test",
+        intent="Review and correct this notebook entry",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": str(experiment_id),
+        },
+        risk_tier=PlanRiskTier.SINGLE_RECORD_EDIT,
+        summary="Correct grammar and clarify the PCR setup section.",
+        reads=[
+            PlanStep(
+                tool_name="elabftw.read_experiment_by_id",
+                record_id=f"elabftw:experiment:{experiment_id}",
+                args={"experiment_id": experiment_id},
+            ),
+        ],
+        writes=[
+            PlanStep(
+                tool_name="elabftw.edit_experiment_section",
+                record_id=f"elabftw:experiment:{experiment_id}",
+                args={
+                    "old_body_hash": body_hash,
+                    "new_body": "<p>corrected</p>",
+                },
+                preview_type="diff",
+            ),
+        ],
+        artifacts=[],
+        approval_required=True,
+        rollback="eLabFTW revision history",
+    )
+    return plan.to_dict()
+
+
+def _create_plan_approval(plan_dict: dict) -> str:
+    """Create a plan-level approval token bound to the plan hash.
+
+    Returns the approval_id.
+    """
+    import lab_copilot_gateway.approval as approvalmod
+
+    plan_hash = hashlib.sha256(
+        __import__("json")
+        .dumps(plan_dict, sort_keys=True, separators=(",", ":"))
+        .encode("utf-8")
+    ).hexdigest()
+    store = approvalmod._default_store
+    approval_id, _ = store.request(
+        ApprovalRequest(
+            tool_name="plan.execute",
+            args_hash=plan_hash,
+            target_record="plan:plan-http-test",
+            tier=4,
+            keycloak_subject="kc-http-1",
+            librechat_user_id="lc-http-1",
+            mapped_elabftw_user_id="elab-http-1",
+            provider="openai",
+            model_id="gpt-4o-mini",
+            ttl_seconds=300,
+        )
+    )
+    return approval_id
+
+
+def test_plan_execute_endpoint_valid_plan() -> None:
+    """POST /plan/execute with valid plan + approval → 200, ok=True."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    plan_dict = _plan_dict_for_test(experiment_id=42)
+    approval_id = _create_plan_approval(plan_dict)
+
+    client = make_client()
+    r = client.post(
+        "/plan/execute",
+        json={
+            "plan": plan_dict,
+            "approval_id": approval_id,
+            "context_token": _http_token(_http_claims(experiment_id=42)),
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-1",
+            "request_id": "req-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["status"] == "completed"
+    assert out["plan_id"] == "plan-http-test"
+    assert "plan_hash" in out
+    assert len(out["step_results"]) == 2
+    for sr in out["step_results"]:
+        assert sr["status"] == "success"
+
+
+def test_plan_execute_endpoint_invalid_plan() -> None:
+    """POST /plan/execute with malformed plan dict → 200, ok=False."""
+    client = make_client()
+    r = client.post(
+        "/plan/execute",
+        json={
+            "plan": {
+                "plan_id": "bad-plan",
+                # risk_tier is intentionally invalid → Plan.from_dict fails.
+                "risk_tier": "nonexistent_tier",
+                "intent": "test",
+                "summary": "test",
+                "anchor": {
+                    "system": "elabftw",
+                    "record_type": "experiment",
+                    "record_id": "42",
+                },
+            },
+            "approval_id": "any-id",
+            "context_token": _http_token(),
+            "keycloak_subject": "kc-http-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "plan_validation_failed"
+    assert "risk_tier" in str(out.get("errors", ""))
+
+
+def test_plan_execute_endpoint_invalid_approval() -> None:
+    """POST /plan/execute with valid plan but bad approval_id → ok=False."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    plan_dict = _plan_dict_for_test(experiment_id=42)
+
+    client = make_client()
+    r = client.post(
+        "/plan/execute",
+        json={
+            "plan": plan_dict,
+            "approval_id": "nonexistent-approval-id",
+            "context_token": _http_token(_http_claims(experiment_id=42)),
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "conversation_id": "conv-1",
+            "request_id": "req-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["status"] == "rejected"
+    assert "Approval consume failed" in out["summary"]
