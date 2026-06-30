@@ -894,6 +894,42 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": result.to_dict(),
                     }
+                elif tool.name == "elabftw.search_my_experiments":
+                    adapter = get_elabftw_read_adapter()
+                    result = adapter.search_my_experiments(
+                        query=body.args.get("query", ""),
+                        limit=body.args.get("limit", 20),
+                        offset=body.args.get("offset", 0),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.read_experiment_by_id":
+                    adapter = get_elabftw_read_adapter()
+                    result = adapter.read_experiment_by_id(
+                        experiment_id=int(body.args.get("experiment_id", 0)),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
                 elif tool.name == "elabftw.draft_experiment_update":
                     adapter = get_elabftw_write_adapter()
                     result = adapter.draft_experiment_update(
@@ -973,7 +1009,7 @@ def create_app() -> FastAPI:
                 else:
                     # elabftw adapter but no known tool mapping —
                     # shouldn't happen (registry only contains the
-                    # three above), but fail closed just in case.
+                    # six elabftw tools above), but fail closed.
                     return {
                         "ok": False,
                         "tool_name": tool.name,

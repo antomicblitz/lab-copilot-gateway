@@ -215,6 +215,22 @@ _CATALOG: tuple[Tool, ...] = (
         description="Read the title, body, and metadata of the user's current experiment context.",
     ),
     Tool(
+        name="elabftw.search_my_experiments",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="Search the user's accessible experiments by free-text query. Returns compact summaries (id, title, dates) suitable for citation; use read_experiment_by_id for full content.",
+    ),
+    Tool(
+        name="elabftw.read_experiment_by_id",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="Read the full title, body, and metadata of a specific experiment by its numeric id. Per-record permissions enforced server-side by eLabFTW.",
+    ),
+    Tool(
         name="elabftw.draft_experiment_update",
         tier=Tier.BOUNDED_WRITES,
         adapter="elabftw",

@@ -393,13 +393,26 @@ class ElabftwClient(Protocol):
     ``StubElabftwClient`` for tests; ``HttpElabftwClient`` for live calls.
     """
 
-    # --- read (C08) ------------------------------------------------------
+    # --- read (C08 / C36) -----------------------------------------------
 
     def get_experiment(self, experiment_id: int) -> dict[str, Any]:
         """Return one experiment payload by id, or raise on error.
 
         Implementations: ``StubElabftwClient`` for tests; ``HttpElabftwClient``
         for live calls against an eLabFTW instance.
+        """
+        ...
+
+    def search_experiments(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Search experiments by free-text query.
+
+        Returns a list of experiment payload dicts (same shape as
+        ``get_experiment`` returns, but potentially truncated by the
+        upstream API).  Per-record permissions are enforced server-side
+        by the eLabFTW API key; the gateway additionally maps the caller
+        identity before invoking this.
         """
         ...
 
@@ -460,6 +473,18 @@ class StubElabftwClient:
         if experiment_id not in self.seeds:
             raise KeyError(f"experiment {experiment_id} not found in stub")
         return dict(self.seeds[experiment_id])
+
+    def search_experiments(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        q = query.lower()
+        matches = [
+            dict(v)
+            for v in self.seeds.values()
+            if q in str(v.get("title", "")).lower()
+            or q in str(v.get("body", "")).lower()
+        ]
+        return matches[offset : offset + limit]
 
     def create_experiment(self, title: str | None = None) -> int:
         new_id = self._next_id
@@ -551,6 +576,32 @@ class HttpElabftwClient:
         resp = s.get(url, timeout=self.timeout_seconds)
         resp.raise_for_status()
         return resp.json()
+
+    def search_experiments(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """GET /api/v2/experiments?q=...&limit=...&offset=...
+
+        eLabFTW REST v2 supports the ``q`` query parameter for free-text
+        search across experiment title and body.  The response is a JSON
+        array of experiment objects (same shape as ``get_experiment``).
+        """
+        url = f"{self.base_url.rstrip('/')}/api/v2/experiments"
+        s = self._connect()
+        resp = s.get(
+            url,
+            params={"q": query, "limit": limit, "offset": offset},
+            timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        # Reason: eLabFTW may return a dict with a "data" key or a bare
+        # list depending on version; normalise to list[dict].
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return data["data"]
+        return []
 
     # --- write (C09) ------------------------------------------------------
 
@@ -681,11 +732,59 @@ class ReadResult:
         }
 
 
+@dataclass(frozen=True)
+class ExperimentSummary:
+    """Compact summary of one experiment in a search result (C36).
+
+    Deliberately excludes ``body`` — the full content is available via
+    ``read_experiment_by_id`` if the LLM needs it.  Returning only
+    summaries keeps the context window manageable for multi-record
+    searches.
+    """
+
+    experiment_id: int
+    title: str
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "experiment_id": self.experiment_id,
+            "title": self.title,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """Outcome of a successful ``search_my_experiments`` call (C36)."""
+
+    query: str
+    total_returned: int
+    experiments: list[ExperimentSummary]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "total_returned": self.total_returned,
+            "experiments": [e.to_dict() for e in self.experiments],
+        }
+
+
 # --- adapter -------------------------------------------------------------
 
 
 TOOL_NAME = "elabftw.read_current_experiment"
 TOOL_TIER = Tier.PERMISSIONED_ELABFTW_READ
+
+# C36 — multi-record retrieval tool names (same tier, no approval).
+TOOL_NAME_SEARCH = "elabftw.search_my_experiments"
+TOOL_NAME_READ_BY_ID = "elabftw.read_experiment_by_id"
+
+# Maximum results returned by search_my_experiments.  Keeps context window
+# manageable and bounds the audit record size.
+_MAX_SEARCH_RESULTS = 50
 
 
 @dataclass
@@ -978,6 +1077,363 @@ class ElabftwReadAdapter:
         )
         return result
 
+    # --- C36: multi-record retrieval -------------------------------------
+
+    def search_my_experiments(
+        self,
+        *,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> SearchResult:
+        """Search the caller's accessible experiments by free-text query.
+
+        C36 orchestration (simpler than ``read_current_experiment`` — no
+        context-token binding because the search is not scoped to a single
+        experiment):
+
+            1. Identity resolution (mapped user required).
+            2. Policy decision (tier 2 read, no approval).
+            3. Downstream client search.
+            4. Audit: query envelope + returned record IDs.
+
+        Per-record permissions are enforced server-side by the eLabFTW API
+        key; the gateway additionally maps the caller identity before
+        invoking the search.
+        """
+        # Clamp limit to the maximum to prevent context-blowing queries.
+        clamped_limit = min(max(1, limit), _MAX_SEARCH_RESULTS)
+        clamped_offset = max(0, offset)
+
+        tool_args_hash = compute_args_hash(
+            {"query": query, "limit": clamped_limit, "offset": clamped_offset}
+        )
+
+        # 1. Identity resolution — unmapped caller → deny before any HTTP.
+        if mapped_identity is None:
+            self._audit(
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 2. Policy decision — tier 2 read with mapped caller.
+        policy_req = PolicyRequest(
+            tool_name=TOOL_NAME_SEARCH,
+            tier=TOOL_TIER,
+            adapter="elabftw",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=False,
+            approval_id=None,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision != "allow":
+            self._audit(
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 3. Downstream client.
+        if self.client is None:
+            self._audit(
+                policy_decision="deny",
+                reason="elabftw_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "ELABFTW_NOT_CONFIGURED"},
+            )
+            raise ElabftwAdapterError(
+                reason="elabftw_not_configured",
+                message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
+            )
+
+        # 4. Make the call.
+        try:
+            payloads = self.client.search_experiments(
+                query, limit=clamped_limit, offset=clamped_offset
+            )
+        except Exception as exc:
+            self._audit(
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise ElabftwAdapterError(
+                reason="client_error",
+                message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 5. Build summaries + successful audit record.  Only id/title/
+        # timestamps are returned — bodies are available via
+        # read_experiment_by_id if the LLM needs them.
+        summaries = [
+            ExperimentSummary(
+                experiment_id=int(p.get("id", 0)),
+                title=str(p.get("title", "")),
+                created_at=p.get("created_at") or p.get("createdat"),
+                updated_at=p.get("updated_at") or p.get("updatedat"),
+            )
+            for p in payloads
+        ]
+        result = SearchResult(
+            query=query,
+            total_returned=len(summaries),
+            experiments=summaries,
+        )
+
+        record_ids = [s.experiment_id for s in summaries]
+        self._audit(
+            policy_decision="allow",
+            reason="search_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=None,
+            tool_name=TOOL_NAME_SEARCH,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary={
+                "method": "GET",
+                "path": "/api/v2/experiments",
+                "query": query,
+                "limit": clamped_limit,
+                "offset": clamped_offset,
+            },
+            result_summary={
+                "record_count": result.total_returned,
+                "record_ids": record_ids,
+            },
+            extra_context_refs=[
+                {"kind": "experiment", "id": rid} for rid in record_ids
+            ],
+            require_persistence=True,
+        )
+        return result
+
+    def read_experiment_by_id(
+        self,
+        *,
+        experiment_id: int,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> ReadResult:
+        """Read a specific experiment by id (C36).
+
+        Unlike ``read_current_experiment``, the experiment id comes from
+        the tool args (the LLM specifies which record to read), not from
+        a context token.  No context-token binding is required — the
+        identity mapper + policy engine + eLabFTW API key permissions
+        are sufficient.
+
+        Orchestration:
+            1. Identity resolution (mapped user required).
+            2. Policy decision (tier 2 read, no approval).
+            3. Downstream client read.
+            4. Audit with experiment_id in context_refs.
+        """
+        tool_args_hash = compute_args_hash({"experiment_id": experiment_id})
+
+        # 1. Identity resolution.
+        if mapped_identity is None:
+            self._audit(
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=experiment_id,
+                tool_name=TOOL_NAME_READ_BY_ID,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 2. Policy decision.
+        policy_req = PolicyRequest(
+            tool_name=TOOL_NAME_READ_BY_ID,
+            tier=TOOL_TIER,
+            adapter="elabftw",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=False,
+            approval_id=None,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision != "allow":
+            self._audit(
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                tool_name=TOOL_NAME_READ_BY_ID,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 3. Downstream client.
+        if self.client is None:
+            self._audit(
+                policy_decision="deny",
+                reason="elabftw_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                tool_name=TOOL_NAME_READ_BY_ID,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "ELABFTW_NOT_CONFIGURED"},
+            )
+            raise ElabftwAdapterError(
+                reason="elabftw_not_configured",
+                message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
+            )
+
+        # 4. Make the call.
+        try:
+            payload = self.client.get_experiment(experiment_id)
+        except Exception as exc:
+            self._audit(
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                tool_name=TOOL_NAME_READ_BY_ID,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise ElabftwAdapterError(
+                reason="client_error",
+                message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 5. Build the read result + successful audit record.
+        result = ReadResult(
+            experiment_id=experiment_id,
+            title=str(payload.get("title", "")),
+            body=str(payload.get("body", "")),
+            metadata=_normalize_metadata(payload.get("metadata")),
+            raw=payload,
+        )
+
+        self._audit(
+            policy_decision="allow",
+            reason="read_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=experiment_id,
+            tool_name=TOOL_NAME_READ_BY_ID,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary={
+                "method": "GET",
+                "path": f"/api/v2/experiments/{experiment_id}",
+            },
+            result_summary={
+                "title_length": len(result.title),
+                "body_length": len(result.body),
+            },
+            require_persistence=True,
+        )
+        return result
+
     # --- audit writer ----------------------------------------------------
 
     def _audit(
@@ -994,8 +1450,10 @@ class ElabftwReadAdapter:
         provider: str | None,
         model_id: str | None,
         tool_args_hash: str | None = None,
+        tool_name: str = TOOL_NAME,
         api_call_summary: dict[str, Any] | None = None,
         result_summary: dict[str, Any] | None = None,
+        extra_context_refs: list[dict[str, Any]] | None = None,
         error: dict[str, Any] | None = None,
         require_persistence: bool = False,
     ) -> None:
@@ -1009,6 +1467,13 @@ class ElabftwReadAdapter:
         failure raises ``ElabftwAdapterError`` — a read that succeeds without
         an audit trail violates the gateway's safety contract and must not
         return data to the caller.
+
+        ``tool_name`` defaults to ``TOOL_NAME`` (read_current_experiment)
+        for backward compatibility; C36 methods pass their own tool name.
+
+        ``extra_context_refs`` appends additional context references beyond
+        the single ``experiment_id`` — used by C36 search to record every
+        returned record id in the audit trail.
         """
         import secrets as _secrets
         import time as _time
@@ -1017,6 +1482,8 @@ class ElabftwReadAdapter:
         context_refs: list[dict[str, Any]] = []
         if experiment_id is not None:
             context_refs.append({"kind": "experiment", "id": experiment_id})
+        if extra_context_refs:
+            context_refs.extend(extra_context_refs)
 
         record = AuditRecord(
             action_id=action_id,
@@ -1032,7 +1499,7 @@ class ElabftwReadAdapter:
             ),
             provider=provider,
             model_id=model_id,
-            tool_name=TOOL_NAME,
+            tool_name=tool_name,
             tool_args_hash=tool_args_hash,
             context_refs=context_refs,
             policy_decision=policy_decision,
