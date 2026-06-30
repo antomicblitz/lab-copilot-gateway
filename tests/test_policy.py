@@ -195,3 +195,253 @@ def test_decide_is_deterministic(engine: PolicyEngine) -> None:
     decisions = [engine.decide(req) for _ in range(20)]
     assert all(d.decision == "allow" for d in decisions)
     assert all(d.reason == "default_allow" for d in decisions)
+
+
+# --- Kill switch categories (C26) -----------------------------------------
+
+
+class TestKillSwitchCategories:
+    """Named kill switch category tests."""
+
+    def test_kill_all_denies_every_tool(self) -> None:
+        eng = PolicyEngine(kill_categories={"all": True})
+        d = eng.decide(_req(tier=Tier.STATIC_HELP, tool_name="help.faq"))
+        assert d.decision == "deny"
+        assert d.reason == "kill_switch_match"
+        assert d.matched_kill_switches == ["all"]
+
+    def test_kill_all_denies_tier6_tool(self) -> None:
+        eng = PolicyEngine(kill_categories={"all": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="bentolab.run_autonomous",
+                has_approval=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert "all" in d.matched_kill_switches
+
+    def test_kill_mutating_denies_tier4_but_allows_tier3(self) -> None:
+        eng = PolicyEngine(kill_categories={"mutating": True})
+        # Tier 3 (validation / dry-run) allowed.
+        d = eng.decide(
+            _req(
+                tier=Tier.VALIDATION_DRY_RUN,
+                tool_name="opencloning.parse_sequence_file",
+            )
+        )
+        assert d.decision == "allow"
+        # Tier 4 (bounded write) denied.
+        d = eng.decide(
+            _req(
+                tier=Tier.BOUNDED_WRITES,
+                tool_name="elabftw.amend_experiment",
+                has_approval=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert "mutating" in d.matched_kill_switches
+
+    def test_kill_hardware_denies_tier5_but_allows_tier4(self) -> None:
+        """Hardware kill switch is checked before the default hardware block."""
+        eng = PolicyEngine(kill_categories={"hardware": True})
+        # Tier 4 with approval allowed (hardware kill switch does not match).
+        d = eng.decide(
+            _req(
+                tier=Tier.BOUNDED_WRITES,
+                tool_name="elabftw.draft_experiment_update",
+                has_approval=True,
+            )
+        )
+        assert d.decision == "allow"
+        # Tier 5 denied by hardware kill switch (checked at step 0, before
+        # the default ``hardware_blocked`` check).
+        d = eng.decide(
+            _req(
+                tier=Tier.HARDWARE_EXECUTION,
+                tool_name="wallac.run_measurement",
+                has_approval=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert "hardware" in d.matched_kill_switches
+
+    def test_kill_autonomy_denies_tier6_but_allows_tier5(self) -> None:
+        """Autonomy kill switch is checked before the default hardware block."""
+        eng = PolicyEngine(kill_categories={"autonomy": True})
+        # Tier 5 is NOT matched by autonomy (tier 5 < 6).  It is eventually
+        # denied by the default ``hardware_blocked`` check — that is standard
+        # behaviour unrelated to the kill switch.
+        matched = eng._matched_kill_categories(
+            _req(
+                tier=Tier.HARDWARE_EXECUTION,
+                tool_name="wallac.run_measurement",
+            )
+        )
+        assert matched == []
+        # Tier 6 is matched by autonomy kill switch (step 0, before
+        # ``hardware_blocked`` would trigger).
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.run",
+            )
+        )
+        assert d.decision == "deny"
+        assert "autonomy" in d.matched_kill_switches
+
+    def test_kill_adapter_elabftw_denies_elabftw_but_allows_opencloning(
+        self,
+    ) -> None:
+        eng = PolicyEngine(kill_categories={"adapter_elabftw": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.PERMISSIONED_ELABFTW_READ,
+                tool_name="elabftw.read_current_experiment",
+                adapter="elabftw",
+            )
+        )
+        assert d.decision == "deny"
+        assert "adapter_elabftw" in d.matched_kill_switches
+        d = eng.decide(
+            _req(
+                tier=Tier.VALIDATION_DRY_RUN,
+                tool_name="opencloning.parse_sequence_file",
+                adapter="opencloning",
+            )
+        )
+        assert d.decision == "allow"
+
+    def test_kill_adapter_wallac_denies_wallac_but_allows_elabftw(
+        self,
+    ) -> None:
+        eng = PolicyEngine(kill_categories={"adapter_wallac": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.OPERATIONAL_READ_ONLY,
+                tool_name="wallac.get_status",
+                adapter="wallac",
+            )
+        )
+        assert d.decision == "deny"
+        assert "adapter_wallac" in d.matched_kill_switches
+        d = eng.decide(
+            _req(
+                tier=Tier.PERMISSIONED_ELABFTW_READ,
+                tool_name="elabftw.read_current_experiment",
+                adapter="elabftw",
+            )
+        )
+        assert d.decision == "allow"
+
+    def test_adapter_detected_from_tool_name_when_adapter_not_set(
+        self,
+    ) -> None:
+        """Adapter-specific kill switches work even when adapter field is None."""
+        eng = PolicyEngine(kill_categories={"adapter_bentolab": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.OPERATIONAL_READ_ONLY,
+                tool_name="bentolab.get_status",
+            )
+        )
+        assert d.decision == "deny"
+        assert "adapter_bentolab" in d.matched_kill_switches
+
+    def test_adapter_no_match_when_tool_has_no_adapter_prefix(
+        self,
+    ) -> None:
+        """Tool without '.' in name does not match adapter categories."""
+        eng = PolicyEngine(kill_categories={"adapter_elabftw": True})
+        d = eng.decide(_req(tier=Tier.STATIC_HELP, tool_name="help"))
+        assert d.decision == "allow"
+
+    def test_named_categories_take_precedence_over_fnmatch(self) -> None:
+        """Named categories are evaluated before fnmatch patterns."""
+        eng = PolicyEngine(
+            kill_categories={"adapter_elabftw": True},
+            kill_switches=("opencloning.*",),
+        )
+        # Named category denies elabftw tools.
+        d = eng.decide(
+            _req(
+                tier=Tier.PERMISSIONED_ELABFTW_READ,
+                tool_name="elabftw.read_experiment",
+                adapter="elabftw",
+            )
+        )
+        assert d.decision == "deny"
+        assert "adapter_elabftw" in d.matched_kill_switches
+        # fnmatch pattern still works for opencloning tools.
+        d = eng.decide(
+            _req(
+                tier=Tier.VALIDATION_DRY_RUN,
+                tool_name="opencloning.parse_sequence_file",
+                adapter="opencloning",
+            )
+        )
+        assert d.decision == "deny"
+        assert "opencloning.*" in d.matched_kill_switches
+
+    def test_fnmatch_still_works_alongside_named_categories(self) -> None:
+        """Both named categories and fnmatch patterns are enforced."""
+        eng = PolicyEngine(
+            kill_categories={"adapter_elabftw": True},
+            kill_switches=("wallac.*",),
+        )
+        # elabftw denied by named category.
+        d = eng.decide(
+            _req(
+                tier=Tier.PERMISSIONED_ELABFTW_READ,
+                tool_name="elabftw.read_experiment",
+                adapter="elabftw",
+            )
+        )
+        assert d.decision == "deny"
+        assert "adapter_elabftw" in d.matched_kill_switches
+        # wallac denied by fnmatch pattern.
+        d = eng.decide(
+            _req(
+                tier=Tier.OPERATIONAL_READ_ONLY,
+                tool_name="wallac.get_status",
+                adapter="wallac",
+            )
+        )
+        assert d.decision == "deny"
+        assert "wallac.*" in d.matched_kill_switches
+        # opencloning allowed (no matching switch).
+        d = eng.decide(
+            _req(
+                tier=Tier.VALIDATION_DRY_RUN,
+                tool_name="opencloning.parse_sequence_file",
+                adapter="opencloning",
+            )
+        )
+        assert d.decision == "allow"
+
+    def test_kill_all_bypasses_other_categories(self) -> None:
+        """When ``all`` is active, no other category checks are needed."""
+        eng = PolicyEngine(
+            kill_categories={"all": True, "adapter_elabftw": True},
+        )
+        d = eng.decide(
+            _req(
+                tier=Tier.STATIC_HELP,
+                tool_name="help.faq",
+            )
+        )
+        assert d.decision == "deny"
+        # Only "all" is in matched list (short-circuit).
+        assert d.matched_kill_switches == ["all"]
+
+    def test_empty_categories_no_effect(self) -> None:
+        """Engine with empty kill_categories behaves like no categories."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.STATIC_HELP,
+                tool_name="help.faq",
+            )
+        )
+        assert d.decision == "allow"

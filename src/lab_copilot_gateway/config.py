@@ -16,6 +16,38 @@ def get_kill_switches() -> list[str]:
     return _csv_env("LAB_COPILOT_KILL_SWITCHES")
 
 
+# Mapping from named kill switch category -> env var name.
+_KILL_SWITCH_CATEGORY_ENV_VARS: dict[str, str] = {
+    "all": "LAB_COPILOT_KILL_ALL",
+    "mutating": "LAB_COPILOT_KILL_MUTATING",
+    "hardware": "LAB_COPILOT_KILL_HARDWARE",
+    "autonomy": "LAB_COPILOT_KILL_AUTONOMY",
+    "adapter_elabftw": "LAB_COPILOT_KILL_ADAPTER_ELABFTW",
+    "adapter_opencloning": "LAB_COPILOT_KILL_ADAPTER_OPENCLONING",
+    "adapter_wallac": "LAB_COPILOT_KILL_ADAPTER_WALLAC",
+    "adapter_bentolab": "LAB_COPILOT_KILL_ADAPTER_BENTOLAB",
+}
+
+#: The set of valid named kill switch category names.
+KILL_SWITCH_CATEGORY_NAMES: frozenset[str] = frozenset(
+    _KILL_SWITCH_CATEGORY_ENV_VARS.keys()
+)
+
+
+def get_kill_switch_categories() -> dict[str, bool]:
+    """Read named kill switch categories from env vars.
+
+    Returns a dict mapping category name to bool.  Only categories whose
+    env var is ``"1"``, ``"true"``, or ``"yes"`` (case-insensitive) are
+    considered enabled.
+    """
+    _true_values = {"1", "true", "yes"}
+    return {
+        name: os.getenv(env_var, "0").strip().lower() in _true_values
+        for name, env_var in _KILL_SWITCH_CATEGORY_ENV_VARS.items()
+    }
+
+
 def get_public_config(*, service_name: str, version: str) -> dict[str, object]:
     """Return config safe to expose to authenticated clients."""
     return {

@@ -1361,3 +1361,119 @@ def test_invoke_health_reflects_tool_count() -> None:
     to a non-empty registry."""
     body = make_client().get("/health").json()
     assert body["dependencies"]["tool_count"] == 14  # noqa: PLR2004
+
+
+# ============================================================================
+# C26 — Kill switch categories (POST /policy/kill_switch)
+# ============================================================================
+
+
+def test_health_reports_kill_switch_categories() -> None:
+    """/health includes a ``kill_switch_categories`` dict, empty by default."""
+    body = make_client().get("/health").json()
+    deps = body["dependencies"]
+    assert "kill_switch_categories" in deps
+    assert deps["kill_switch_categories"] == {}
+
+
+def test_policy_kill_switch_roundtrip() -> None:
+    """POST /policy/kill_switch enables and disables a category at runtime.
+
+    Verifies the change is reflected by /health and the policy engine
+    singleton.
+    """
+    client = make_client()
+
+    # Enable the ``all`` switch.
+    r = client.post("/policy/kill_switch", json={"switch": "all", "enabled": True})
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["switch"] == "all"
+    assert out["enabled"] is True
+    assert out["audit_action_id"]
+
+    # Health now reports the active category.
+    health = client.get("/health").json()
+    assert health["dependencies"]["kill_switch_categories"] == {"all": True}
+
+    # Disable it.
+    r = client.post("/policy/kill_switch", json={"switch": "all", "enabled": False})
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    assert r.json()["enabled"] is False
+
+    health = client.get("/health").json()
+    assert health["dependencies"]["kill_switch_categories"] == {}
+
+
+def test_policy_kill_switch_affects_policy_engine() -> None:
+    """Enabling a kill switch category causes the policy engine to deny
+    matching tools via POST /policy/evaluate."""
+    import lab_copilot_gateway.policy as policymod
+
+    client = make_client()
+
+    # Enable the adapter_elabftw switch.
+    r = client.post(
+        "/policy/kill_switch",
+        json={"switch": "adapter_elabftw", "enabled": True},
+    )
+    assert r.status_code == 200
+
+    # The singleton engine now has the category active.
+    assert policymod._default_engine.kill_categories.get("adapter_elabftw") is True
+
+    # POST /policy/evaluate for an elabftw tool is denied.
+    eval_r = client.post(
+        "/policy/evaluate",
+        json={
+            "tool_name": "elabftw.read_current_experiment",
+            "tier": 2,
+            "adapter": "elabftw",
+            "user_id": "elab-user-1",
+        },
+    )
+    assert eval_r.status_code == 200
+    out = eval_r.json()
+    assert out["decision"] == "deny"
+    assert out["reason"] == "kill_switch_match"
+    assert "adapter_elabftw" in out["matched_kill_switches"]
+
+
+def test_policy_kill_switch_rejects_unknown_switch() -> None:
+    """An unknown switch name returns ok:false with reason unknown_switch."""
+    client = make_client()
+    r = client.post(
+        "/policy/kill_switch",
+        json={"switch": "nonexistent_category", "enabled": True},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "unknown_switch"
+
+
+def test_policy_kill_switch_writes_audit_record() -> None:
+    """Each kill switch change is recorded in the audit store."""
+    import lab_copilot_gateway.audit as auditmod
+
+    client = make_client()
+    count_before = auditmod._default_store.count()
+
+    r = client.post(
+        "/policy/kill_switch",
+        json={"switch": "mutating", "enabled": True},
+    )
+    assert r.status_code == 200
+    action_id = r.json()["audit_action_id"]
+    assert action_id
+
+    # One new audit record.
+    assert auditmod._default_store.count() == count_before + 1
+
+    # Verify its contents.
+    record = auditmod._default_store.get(action_id)
+    assert record is not None
+    assert record["tool_name"] == "__kill_switch__"
+    assert record["policy_decision"] == "deny"

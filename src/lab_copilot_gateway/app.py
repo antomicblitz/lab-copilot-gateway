@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import uuid as _uuid
 from typing import Any
 
 from fastapi import Depends, FastAPI
@@ -24,7 +25,10 @@ from lab_copilot_gateway.auth import (
     verified_principal,
 )
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
-from lab_copilot_gateway.config import get_public_config
+from lab_copilot_gateway.config import (
+    KILL_SWITCH_CATEGORY_NAMES,
+    get_public_config,
+)
 from lab_copilot_gateway.elabftw import (
     ElabftwAdapterError,
     mint_token_for_identity,
@@ -45,7 +49,12 @@ from lab_copilot_gateway.identity import (
     MappedIdentity,
     get_identity_mapper,
 )
-from lab_copilot_gateway.policy import PolicyRequest, Tier, get_policy_engine
+from lab_copilot_gateway.policy import (
+    PolicyRequest,
+    Tier,
+    get_policy_engine,
+    set_kill_category,
+)
 from lab_copilot_gateway.tools import get_tool_registry, list_tools
 
 
@@ -83,6 +92,13 @@ class PolicyRequestBody(BaseModel):
     autonomy_enabled: bool = False
     has_approval: bool = False
     approval_id: str | None = None
+
+
+class KillSwitchBody(BaseModel):
+    """Request body for POST /policy/kill_switch."""
+
+    switch: str
+    enabled: bool
 
 
 class IdentityResolveBody(BaseModel):
@@ -329,6 +345,9 @@ def create_app() -> FastAPI:
             "policy_engine": "ready",
             "policy_max_tier": int(policy_engine.max_tier),
             "kill_switches": list(policy_engine.kill_switches),
+            "kill_switch_categories": {
+                k: v for k, v in policy_engine.kill_categories.items() if v
+            },
             "elabftw": (
                 "configured" if elabftw_adapter.client is not None else "not_configured"
             ),
@@ -418,6 +437,51 @@ def create_app() -> FastAPI:
             "tier": decision.tier,
             "requires_approval": decision.requires_approval,
             "matched_kill_switches": decision.matched_kill_switches,
+        }
+
+    @api.post("/policy/kill_switch")
+    def set_kill_switch(
+        body: KillSwitchBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object]:
+        """Enable or disable a named kill switch category at runtime.
+
+        This is an admin-only endpoint (no auth enforcement in v1, but
+        callers MUST be authorized operators).  Changes take effect
+        immediately on the process-wide policy engine singleton and are
+        recorded in the audit log with ``tool_name="__kill_switch__"``.
+        """
+        if body.switch not in KILL_SWITCH_CATEGORY_NAMES:
+            return {
+                "ok": False,
+                "reason": "unknown_switch",
+                "message": (
+                    f"unknown kill switch category {body.switch!r}; "
+                    f"valid switches: {sorted(KILL_SWITCH_CATEGORY_NAMES)}"
+                ),
+            }
+
+        # Write audit record.
+        action_id = str(_uuid.uuid4())
+        record = AuditRecord(
+            action_id=action_id,
+            tool_name="__kill_switch__",
+            policy_decision="deny" if body.enabled else "allow",
+            api_call_summary={
+                "switch": body.switch,
+                "enabled": body.enabled,
+            },
+        )
+        audit_store.append(record)
+
+        # Update policy engine at runtime (in-place dict mutation).
+        set_kill_category(body.switch, body.enabled)
+
+        return {
+            "ok": True,
+            "switch": body.switch,
+            "enabled": body.enabled,
+            "audit_action_id": action_id,
         }
 
     @api.post("/identity/resolve")
