@@ -50,12 +50,48 @@ from lab_copilot_gateway.plan import (
 )
 
 
+# --- retry semantics (C40) ---------------------------------------------------
+#
+# Error reasons that are transient — the step can be retried with a fresh
+# plan-level approval.  Permanent failures (body drift, append-only
+# violation, approval denied) require the user to re-preview and re-approve
+# a new plan, not just retry.
+
+RETRYABLE_REASONS: frozenset[str] = frozenset(
+    {
+        "client_error",
+        "state_check_failed",
+        "audit_persistence_failed",
+    }
+)
+
+
+def _is_retryable(error_str: str) -> bool:
+    """Check if an error string starts with a retryable reason code."""
+    return any(error_str.startswith(r) for r in RETRYABLE_REASONS)
+
+
 # --- result models -----------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class StepResult:
-    """Outcome of one step in a plan execution."""
+    """Outcome of one step in a plan execution (C40 enriched).
+
+    Fields:
+        step_index: position in the plan's read+write sequence.
+        tool_name: the gateway tool invoked.
+        status: "success" | "failed" | "skipped".
+        result: the tool's return value (dict) on success.
+        error: error string on failure (format: "reason: message").
+        audit_action_id: the audit row's action_id for mutating steps
+            (extracted from WriteResult).  None for reads or failures
+            before the audit row was written.
+        retryable: whether the step can be retried with a fresh plan-level
+            approval (C40).  True for transient failures (client_error,
+            state_check_failed, audit_persistence_failed).  False for
+            permanent failures (body_drift, append_only_violation, etc.).
+    """
 
     step_index: int
     tool_name: str
@@ -63,12 +99,14 @@ class StepResult:
     result: dict[str, Any] | None = None
     error: str | None = None
     audit_action_id: str | None = None
+    retryable: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "step_index": self.step_index,
             "tool_name": self.tool_name,
             "status": self.status,
+            "retryable": self.retryable,
         }
         if self.result is not None:
             d["result"] = self.result
@@ -230,26 +268,42 @@ class PlanExecutor:
                         tool_name=step.tool_name,
                         status="success",
                         result=result,
+                        # C40: extract audit_action_id from write results
+                        # (WriteResult.to_dict() includes it).
+                        audit_action_id=(
+                            result.get("audit_action_id")
+                            if step_type == "write" and isinstance(result, dict)
+                            else None
+                        ),
                     )
                 )
             except ElabftwAdapterError as exc:
+                error_str = f"{exc.reason}: {exc.message}"
                 step_results.append(
                     StepResult(
                         step_index=step_index,
                         tool_name=step.tool_name,
                         status="failed",
-                        error=f"{exc.reason}: {exc.message}",
+                        error=error_str,
+                        # C40: transient failures are retryable with a
+                        # fresh plan-level approval.
+                        retryable=_is_retryable(exc.reason),
                     )
                 )
                 if step_type == "write":
                     write_failed = True
             except Exception as exc:
+                error_str = f"unexpected error: {type(exc).__name__}: {exc}"
                 step_results.append(
                     StepResult(
                         step_index=step_index,
                         tool_name=step.tool_name,
                         status="failed",
-                        error=f"unexpected error: {type(exc).__name__}: {exc}",
+                        error=error_str,
+                        # C40: unexpected errors are treated as transient
+                        # (retryable) — the caller should investigate before
+                        # retrying, but the step itself may succeed on retry.
+                        retryable=True,
                     )
                 )
                 if step_type == "write":
