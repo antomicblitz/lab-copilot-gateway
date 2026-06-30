@@ -1185,6 +1185,7 @@ class WriteResult:
 # bounded writes and require approval tokens.
 TOOL_NAME_DRAFT = "elabftw.draft_experiment_update"
 TOOL_NAME_AMEND = "elabftw.amend_my_experiment_after_approval"
+TOOL_NAME_EDIT_SECTION = "elabftw.edit_experiment_section"
 TOOL_TIER_WRITE = Tier.BOUNDED_WRITES
 
 
@@ -1350,6 +1351,82 @@ class ElabftwWriteAdapter:
                 attachment_filename=attachment_filename,
                 attachment_data=attachment_data,
                 attachment_comment=attachment_comment,
+            ),
+        )
+
+    def edit_experiment_section(
+        self,
+        *,
+        context_token: str,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WriteResult:
+        """Replace the body of the user's experiment with approved content (C35).
+
+        This is the ``elabftw.edit_experiment_section`` tool. Unlike the
+        append-only amend (C09), this is a DIRECT edit: the approved
+        ``new_body`` REPLACES the experiment body wholesale. Rollback is
+        provided by eLabFTW's own revision history (each PATCH creates a
+        revision snapshot upstream); the gateway records audit/provenance.
+
+        Safety model:
+          - The approval args MUST include ``old_body_hash`` (SHA-256 hex of
+            the body as it was when the user approved the edit) and
+            ``new_body`` (the replacement content). The approval token's
+            args_hash binds both (tamper-detection).
+          - At execution, the adapter re-reads the current body and recomputes
+            its hash. If it no longer matches ``old_body_hash`` (the record
+            changed between approval and execution), the edit is refused with
+            ``ElabftwAdapterError(reason="body_drift_since_approval")`` — a
+            stale edit must never silently clobber a newer state.
+          - Locked / archived / deleted records are refused (same state/locked
+            guard as the amend path) — you cannot direct-edit a non-editable
+            record.
+        """
+        verified = self._verify_token_and_identity(
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_name=TOOL_NAME_EDIT_SECTION,
+            early_args_for_hash=approval_args,
+        )
+        if len(verified) == 1:
+            raise verified[0]  # type: ignore[misc]
+        claims, tool_args_hash = verified  # type: ignore[assignment]
+        target_experiment_id = claims.experiment_id
+        return self._execute(
+            operation="edit_section",
+            tool_name=TOOL_NAME_EDIT_SECTION,
+            context_token=context_token,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=mapped_identity,
+            target_experiment_id=target_experiment_id,
+            apply_append_only=True,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            precomputed_claims=claims,
+            precomputed_tool_args_hash=tool_args_hash,
+            exec_fn=lambda client, _claims: self._exec_edit_section(
+                client,
+                target_experiment_id=target_experiment_id,
+                approval_args=approval_args,
             ),
         )
 
@@ -1592,8 +1669,36 @@ class ElabftwWriteAdapter:
         # after the audit row persists.  The approval was already consumed —
         # a downstream failure does NOT "refund" the approval.  Callers retry
         # with a fresh approval; the audit row explains what happened.
+        #
+        # C35: an exec_fn may raise a SEMANTIC ElabftwAdapterError (e.g.
+        # body_drift_since_approval) that already carries the correct reason
+        # code + message. Re-raise those directly (after the audit row) so
+        # the reason isn't clobbered to "client_error"; only wrap unexpected
+        # non-adapter exceptions as client_error.
         try:
             downstream_id = exec_fn(self.client, claims)
+        except ElabftwAdapterError as exc:
+            self._audit(
+                policy_decision="allow",
+                reason=exc.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=target_experiment_id or claims.experiment_id,
+                tool_name=tool_name,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": exc.reason.upper(),
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise
         except Exception as exc:
             self._audit(
                 policy_decision="allow",
@@ -1899,6 +2004,50 @@ class ElabftwWriteAdapter:
         if not existing_body:
             return section
         return existing_body.rstrip() + "\n\n" + section
+
+    def _exec_edit_section(
+        self,
+        client: ElabftwClient,
+        *,
+        target_experiment_id: int,
+        approval_args: dict[str, Any],
+    ) -> int:
+        """Direct-edit executor (C35): verify body hasn't drifted, then PATCH.
+
+        Reads the current body, recomputes its SHA-256, and compares to the
+        ``old_body_hash`` captured in the approval args. If they differ, the
+        record changed between approval and execution → refuse (a stale edit
+        must not clobber a newer state). On match, PATCH the body to the
+        approved ``new_body``. Returns 0 (no upload id for a direct edit).
+        """
+        expected_old_hash = str(approval_args.get("old_body_hash") or "")
+        new_body = str(approval_args.get("new_body") or "")
+        current = client.get_experiment(target_experiment_id)
+        current_body = str(current.get("body", "") or "")
+        current_hash = hashlib.sha256(current_body.encode("utf-8")).hexdigest()
+        # C35: old_body_hash is REQUIRED, not optional. The orchestrator
+        # always reads the body before proposing an edit (to generate the
+        # preview), so it always has the hash. Refusing on a missing hash
+        # closes the safety hole where a stale edit could clobber a newer
+        # state with zero drift protection.
+        if not expected_old_hash:
+            raise ElabftwAdapterError(
+                reason="missing_old_body_hash",
+                message=f"edit_experiment_section requires old_body_hash in approval_args for experiment {target_experiment_id}",
+            )
+        if current_hash != expected_old_hash:
+            # Body drifted since the approval was issued. Do NOT patch —
+            # the user approved an edit against a now-stale snapshot. The
+            # caller must re-read, re-preview, and re-approve.
+            # NOTE: TOCTOU window exists between this read and the patch
+            # below; eLabFTW revision history mitigates (both versions
+            # are preserved upstream).
+            raise ElabftwAdapterError(
+                reason="body_drift_since_approval",
+                message=f"body drift detected for experiment {target_experiment_id}",
+            )
+        client.patch_experiment_body(target_experiment_id, new_body)
+        return 0
 
     # --- provenance writeback --------------------------------------------
 

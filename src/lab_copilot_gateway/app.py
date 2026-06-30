@@ -243,6 +243,27 @@ class ElabftwAmendBody(BaseModel):
     attachment_comment: str = ""
 
 
+class ElabftwEditBody(BaseModel):
+    """Request body for POST /elabftw/edit_experiment_section (C35).
+
+    Direct edit (not append-only): the approved ``new_body`` REPLACES the
+    experiment body. The approval_args MUST carry ``old_body_hash`` (SHA-256
+    hex of the body at approval time) + ``new_body``; the adapter re-reads
+    the current body at execution and refuses if the hash drifted (stale-edit
+    guard). Rollback is via eLabFTW revision history.
+    """
+
+    context_token: str
+    approval_id: str
+    approval_args: dict[str, Any] = Field(default_factory=dict)
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    conversation_id: str | None = None
+    request_id: str | None = None
+    provider: str | None = None
+    model_id: str | None = None
+
+
 class InvokeBody(BaseModel):
     """Request body for POST /invoke (C13 — LibreChat tool surface).
 
@@ -758,6 +779,42 @@ def create_app() -> FastAPI:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "write": result.to_dict()}
 
+    @api.post("/elabftw/edit_experiment_section")
+    def elabftw_edit_experiment_section(
+        body: ElabftwEditBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        """Replace the experiment body with approved content (C35 direct edit).
+
+        Unlike the append-only amend, this is a direct edit: the approved
+        ``new_body`` replaces the body wholesale. The adapter re-reads the
+        current body and refuses if its hash no longer matches the
+        ``old_body_hash`` captured at approval time (stale-edit guard).
+        Rollback is via eLabFTW revision history; the gateway records
+        audit/provenance.
+        """
+        adapter = get_elabftw_write_adapter()
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        try:
+            result = adapter.edit_experiment_section(
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+        except ElabftwAdapterError as exc:
+            return {"ok": False, **exc.to_dict()}
+        return {"ok": True, "write": result.to_dict()}
+
     # --- C13: LibreChat tool-surface dispatcher -------------------------
     #
     # POST /invoke is the single entry point used by the LibreChat
@@ -888,6 +945,25 @@ def create_app() -> FastAPI:
                         attachment_filename=attachment_filename,
                         attachment_data=attachment_data,
                         attachment_comment=body.args.get("attachment_comment", ""),
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.edit_experiment_section":
+                    adapter = get_elabftw_write_adapter()
+                    result = adapter.edit_experiment_section(
+                        context_token=body.context_token,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
                     )
                     return {
                         "ok": True,

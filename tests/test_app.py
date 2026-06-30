@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -157,7 +158,7 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["approval_backend"] == "db"
     assert body["dependencies"]["approval_db"] == "memory"
     # C06 curated tool catalog.
-    assert body["dependencies"]["tool_count"] == 15  # noqa: PLR2004 — V1 catalog size is a contract
+    assert body["dependencies"]["tool_count"] == 16  # noqa: PLR2004 — V1 catalog size is a contract
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -185,7 +186,7 @@ def test_tools_registry_returns_curated_catalog() -> None:
 
     assert response.status_code == 200
     tools = response.json()["tools"]
-    assert len(tools) == 15  # noqa: PLR2004 — V1 catalog size is a contract is a contract
+    assert len(tools) == 16  # noqa: PLR2004 — V1 catalog size is a contract is a contract
 
     required_fields = {
         "name",
@@ -213,11 +214,12 @@ def test_tools_registry_returns_curated_catalog() -> None:
         assert not (forbidden_fields & set(entry.keys()))
         names.add(entry["name"])
 
-    # All 13 tools from the C06 plan must be present.
+    # All 13 tools from the C06 plan must be present (now 16 with C15, C24, C35).
     expected_names = {
         "elabftw.read_current_experiment",
         "elabftw.draft_experiment_update",
         "elabftw.amend_my_experiment_after_approval",
+        "elabftw.edit_experiment_section",
         "opencloning.parse_sequence_file",
         "opencloning.manual_sequence",
         "opencloning.oligo_hybridization",
@@ -1294,7 +1296,7 @@ def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
 def test_invoke_does_not_modify_registry() -> None:
     """Dispatch is read-only on the registry: invoking a tool neither
     adds nor removes registry entries.  /health still reports
-    tool_count: 13 and /tools still returns the same catalog."""
+    tool_count: 16 and /tools still returns the same catalog."""
     client = make_client()
     before = client.get("/tools").json()["tools"]
     # Hit a couple of paths that exercise different code branches.
@@ -1315,7 +1317,7 @@ def test_invoke_does_not_modify_registry() -> None:
     after = client.get("/tools").json()["tools"]
     assert before == after
     health = client.get("/health").json()
-    assert health["dependencies"]["tool_count"] == 15  # noqa: PLR2004
+    assert health["dependencies"]["tool_count"] == 16  # noqa: PLR2004
 
 
 def test_invoke_amend_missing_approval_id_denies() -> None:
@@ -1361,7 +1363,230 @@ def test_invoke_health_reflects_tool_count() -> None:
     the custom-endpoint service can discover whether /invoke is wired
     to a non-empty registry."""
     body = make_client().get("/health").json()
-    assert body["dependencies"]["tool_count"] == 15  # noqa: PLR2004
+    assert body["dependencies"]["tool_count"] == 16  # noqa: PLR2004
+
+
+# ============================================================================
+# C35 — Direct edit (POST /invoke + per-tool endpoint roundtrips)
+# ============================================================================
+
+
+def _http_edit_body(
+    *,
+    context_token: str,
+    approval_id: str,
+    args: dict,
+) -> dict[str, object]:
+    return {
+        "context_token": context_token,
+        "approval_id": approval_id,
+        "approval_args": args,
+        "keycloak_subject": "kc-http-1",
+        "librechat_user_id": "lc-http-1",
+        "conversation_id": "conv-edit",
+        "request_id": "req-edit",
+        "provider": "openai",
+        "model_id": "gpt-4o-mini",
+    }
+
+
+def test_invoke_edit_experiment_section() -> None:
+    """Happy path: /invoke dispatches elabftw.edit_experiment_section with
+    approval and replaces the experiment body."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    old_body = "<p>body</p>"  # matches the seed from _reset_audit_store
+    new_body = "<p>edited body</p>"
+    old_hash = hashlib.sha256(old_body.encode()).hexdigest()
+    edit_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": new_body,
+    }
+
+    client = make_client()
+    # Issue approval bound to the edit args.
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.edit_experiment_section",
+            "args": edit_args,
+            "target_record": "elabftw:experiment:42",
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    assert approval_resp.status_code == 200
+    approval_id = approval_resp.json()["approval_id"]
+
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.edit_experiment_section",
+            "context_token": mint_context_token(_http_write_claims()),
+            "approval_id": approval_id,
+            "args": edit_args,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert out["tool_name"] == "elabftw.edit_experiment_section"
+    assert out["result"]["operation"] == "edit_section"
+    assert out["result"]["experiment_id"] == 42
+
+
+def test_invoke_edit_experiment_section_missing_approval_denies() -> None:
+    """Calling edit_experiment_section via /invoke without an approval_id
+    returns ok:false with an approval-related reason."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    client = make_client()
+    r = client.post(
+        "/invoke",
+        json={
+            "tool_name": "elabftw.edit_experiment_section",
+            "context_token": mint_context_token(_http_write_claims()),
+            "args": {"experiment_id": 42, "new_body": "X"},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert "approval" in out["reason"] or "consum" in out["reason"]
+
+
+def test_edit_experiment_section_endpoint() -> None:
+    """Happy path: POST /elabftw/edit_experiment_section with valid approval
+    replaces the body and returns ok:true."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    old_body = "<p>body</p>"
+    new_body = "<p>direct edit result</p>"
+    old_hash = hashlib.sha256(old_body.encode()).hexdigest()
+    edit_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": new_body,
+    }
+
+    client = make_client()
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.edit_experiment_section",
+            "args": edit_args,
+            "target_record": "elabftw:experiment:42",
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    approval_id = approval_resp.json()["approval_id"]
+
+    body = _http_edit_body(
+        context_token=mint_context_token(_http_write_claims()),
+        approval_id=approval_id,
+        args=edit_args,
+    )
+    r = client.post("/elabftw/edit_experiment_section", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    write = out["write"]
+    assert write["operation"] == "edit_section"
+
+
+def test_edit_experiment_section_endpoint_body_drift() -> None:
+    """POST /elabftw/edit_experiment_section with a stale old_body_hash
+    returns ok:false with reason body_drift_since_approval."""
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    # Hash of something that is NOT the current body.
+    bogus_hash = hashlib.sha256(b"NOT THE REAL BODY").hexdigest()
+    edit_args = {
+        "experiment_id": 42,
+        "old_body_hash": bogus_hash,
+        "new_body": "<p>stale edit</p>",
+    }
+
+    client = make_client()
+    approval_resp = client.post(
+        "/approval/request",
+        json={
+            "tool_name": "elabftw.edit_experiment_section",
+            "args": edit_args,
+            "target_record": "elabftw:experiment:42",
+            "tier": 4,
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "mapped_elabftw_user_id": "elab-http-1",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+            "ttl_seconds": 300,
+        },
+    )
+    approval_id = approval_resp.json()["approval_id"]
+
+    body = _http_edit_body(
+        context_token=mint_context_token(_http_write_claims()),
+        approval_id=approval_id,
+        args=edit_args,
+    )
+    r = client.post("/elabftw/edit_experiment_section", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "body_drift_since_approval"
 
 
 # ============================================================================
