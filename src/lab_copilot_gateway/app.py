@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
 
 from lab_copilot_gateway import __version__
@@ -15,6 +15,13 @@ from lab_copilot_gateway.approval import (
     ApprovalStore,
     compute_args_hash,
     get_approval_store,
+)
+from lab_copilot_gateway.auth import (
+    AuthenticatedPrincipal,
+    get_auth_config,
+    get_jwks_cache,
+    register_auth_exception_handler,
+    verified_principal,
 )
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.config import get_public_config
@@ -288,6 +295,7 @@ def create_app() -> FastAPI:
     """Create the ASGI application."""
     service_name = "lab-copilot-gateway"
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
+    register_auth_exception_handler(api)
 
     # Eagerly initialize audit store, policy engine, identity mapper,
     # approval store, eLabFTW read adapter (C08), and eLabFTW write adapter
@@ -321,6 +329,21 @@ def create_app() -> FastAPI:
         deps.update(_identity_backend_status(identity_mapper))
         deps.update(_approval_backend_status(approval_store))
         deps["tool_count"] = len(get_tool_registry().list())
+
+        # C14 auth status
+        auth_cfg = get_auth_config()
+        auth_status: dict[str, object] = {
+            "auth_mode": "dev" if not auth_cfg.verify_enabled else "jwt",
+            "verify_enabled": auth_cfg.verify_enabled,
+        }
+        if auth_cfg.verify_enabled:
+            try:
+                jwks_status = get_jwks_cache().status()
+                auth_status["jwks"] = jwks_status
+            except Exception:
+                auth_status["jwks"] = {"error": "unavailable"}
+        deps["auth"] = auth_status
+
         return {
             "service": service_name,
             "version": __version__,
@@ -337,17 +360,26 @@ def create_app() -> FastAPI:
         return {"tools": list_tools()}
 
     @api.post("/audit")
-    def append_audit(body: AuditBody) -> dict[str, object]:
+    def append_audit(
+        body: AuditBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object]:
         record = AuditRecord(**body.model_dump())
         created_at = audit_store.append(record)
         return {"action_id": record.action_id, "created_at": created_at}
 
     @api.get("/audit/{action_id}")
-    def get_audit(action_id: str) -> dict[str, object] | None:
+    def get_audit(
+        action_id: str,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object] | None:
         return audit_store.get(action_id)
 
     @api.post("/policy/evaluate")
-    def evaluate_policy(body: PolicyRequestBody) -> dict[str, object]:
+    def evaluate_policy(
+        body: PolicyRequestBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object]:
         req = PolicyRequest(
             tool_name=body.tool_name,
             tier=Tier(body.tier),
@@ -368,9 +400,12 @@ def create_app() -> FastAPI:
         }
 
     @api.post("/identity/resolve")
-    def resolve_identity(body: IdentityResolveBody) -> dict[str, object]:
+    def resolve_identity(
+        body: IdentityResolveBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
         identity = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         if identity is None:
@@ -381,7 +416,10 @@ def create_app() -> FastAPI:
         return _identity_to_dict(identity)
 
     @api.post("/approval/request")
-    def request_approval(body: ApprovalRequestBody) -> dict[str, object]:
+    def request_approval(
+        body: ApprovalRequestBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object]:
         """Issue a single-use approval token bound to (tool, args hash, target).
 
         The caller (typically the gateway's tool-execution path or the
@@ -412,7 +450,10 @@ def create_app() -> FastAPI:
         }
 
     @api.post("/approval/consume")
-    def consume_approval(body: ApprovalConsumeBody) -> dict[str, object]:
+    def consume_approval(
+        body: ApprovalConsumeBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object]:
         """Verify + consume a single-use approval token.
 
         Returns ``{"consumed": true, ...}`` on success or
@@ -441,7 +482,10 @@ def create_app() -> FastAPI:
         }
 
     @api.get("/approval/{approval_id}")
-    def get_approval(approval_id: str) -> dict[str, object] | None:
+    def get_approval(
+        approval_id: str,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> dict[str, object] | None:
         """Fetch one approval row by id (admin / test reads)."""
         record = approval_store.get(approval_id)
         if record is None:
@@ -449,7 +493,10 @@ def create_app() -> FastAPI:
         return record.to_dict()
 
     @api.post("/elabftw/read_current_experiment")
-    def elabftw_read_current_experiment(body: ElabftwReadBody) -> dict[str, object]:
+    def elabftw_read_current_experiment(
+        body: ElabftwReadBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
         """Read the experiment referenced by the caller's context token.
 
         Orchestrates token verification → identity resolution → policy decision
@@ -461,7 +508,7 @@ def create_app() -> FastAPI:
         # Resolve the mapped identity before invoking the adapter so the
         # adapter receives a `MappedIdentity | None` to fail closed on.
         mapped_identity = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         try:
@@ -480,7 +527,10 @@ def create_app() -> FastAPI:
         return {"ok": True, "experiment": result.to_dict()}
 
     @api.post("/elabftw/mint_context_token")
-    def elabftw_mint_context_token(body: ElabftwMintBody) -> dict[str, object]:
+    def elabftw_mint_context_token(
+        body: ElabftwMintBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
         """Mint a short-lived context token for the C11 launcher.
 
         Resolves the caller to a mapped eLabFTW identity via the identity
@@ -494,14 +544,14 @@ def create_app() -> FastAPI:
 
         In C11, trust is the identity mapper (callers self-attest their
         ``keycloak_subject``/``librechat_user_id``; only pre-registered
-        mappings resolve).  C14 will wrap this endpoint with Keycloak
+        mappings resolve).  C14 wraps this endpoint with Keycloak
         session cookie verification layered on top.
         """
         # Fail-closed auth gate: identity mapper must resolve the caller.
         # Either keycloak_subject or librechat_user_id may be the lookup key
         # depending on the mapper backend; both-None is always unmapped.
         mapped = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         if mapped is None:
@@ -521,7 +571,7 @@ def create_app() -> FastAPI:
         token, expires_at = mint_token_for_identity(
             experiment_id=body.experiment_id,
             mapped_elabftw_user_id=mapped.elabftw_user_id,
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
             ttl_seconds=body.requested_ttl_seconds,
         )
@@ -534,7 +584,10 @@ def create_app() -> FastAPI:
         }
 
     @api.post("/elabftw/draft_experiment_update")
-    def elabftw_draft_experiment_update(body: ElabftwDraftBody) -> dict[str, object]:
+    def elabftw_draft_experiment_update(
+        body: ElabftwDraftBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
         """Create a new draft experiment through the C09 write adapter.
 
         Orchestrates token verification → identity resolution → policy
@@ -546,7 +599,7 @@ def create_app() -> FastAPI:
         """
         adapter = get_elabftw_write_adapter()
         mapped_identity = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         try:
@@ -569,6 +622,7 @@ def create_app() -> FastAPI:
     @api.post("/elabftw/amend_my_experiment_after_approval")
     def elabftw_amend_my_experiment_after_approval(
         body: ElabftwAmendBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
         """Append an approved amendment section to the user's experiment.
 
@@ -595,7 +649,7 @@ def create_app() -> FastAPI:
 
         adapter = get_elabftw_write_adapter()
         mapped_identity = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         try:
@@ -641,7 +695,10 @@ def create_app() -> FastAPI:
     # chat-completions tool-call response without per-tool branching.
 
     @api.post("/invoke")
-    def invoke(body: InvokeBody) -> dict[str, object]:
+    def invoke(
+        body: InvokeBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
         """Invoke a registered tool by name (C13 LibreChat surface).
 
         Acceptance #4 (gateway rejects direct privileged calls not in
@@ -668,7 +725,7 @@ def create_app() -> FastAPI:
         # (token verify, identity binding, policy, approval consume,
         # audit) are preserved exactly.
         mapped_identity = identity_mapper.map(
-            keycloak_subject=body.keycloak_subject,
+            keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
 

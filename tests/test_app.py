@@ -36,6 +36,14 @@ def _reset_audit_store(monkeypatch) -> None:
     # Pin the context-token secret for HTTP-level tests that mint tokens.
     monkeypatch.setenv("LAB_COPILOT_TOKEN_SECRET", "http-test-secret")
 
+    # Set up dev auth for C14 — all tests use dev mode (verify=false).
+    monkeypatch.setenv("LAB_COPILOT_KEYCLOAK_VERIFY", "false")
+    monkeypatch.setenv("LAB_COPILOT_ENV", "local")
+    monkeypatch.setenv("LAB_COPILOT_DEV_AUTH_SECRET", "test-dev-secret")
+    import lab_copilot_gateway.auth as authmod
+
+    authmod.reset_auth_config()  # force re-creation with new env vars
+
     original_audit = appmod.get_audit_store()
     store = AuditStore(db_path=":memory:")
     approval_store = ApprovalStore(db_path=":memory:")
@@ -85,10 +93,47 @@ def _reset_audit_store(monkeypatch) -> None:
     elabmod._default_adapter = None
     elabmod._default_write_adapter = None
     toolsmod._default_registry = original_tools
+    authmod.reset_auth_config()  # clear auth singleton for next test
 
 
-def make_client() -> TestClient:
-    return TestClient(create_app())
+TEST_DEV_SECRET = "test-dev-secret"
+
+
+class _DevAuthClient:
+    """TestClient wrapper that auto-injects dev-auth headers.
+
+    Extracts keycloak_subject from JSON body to set X-Lab-Copilot-Dev-Sub,
+    so existing tests don't need to change their request bodies.
+    """
+
+    def __init__(self, app):
+        self._client = TestClient(app)
+
+    def _headers(self, kwargs):
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers["X-Lab-Copilot-Dev-Auth"] = TEST_DEV_SECRET
+        json_body = kwargs.get("json")
+        if isinstance(json_body, dict) and "keycloak_subject" in json_body:
+            ks = json_body["keycloak_subject"]
+            if ks is not None:
+                headers["X-Lab-Copilot-Dev-Sub"] = str(ks)
+        return headers
+
+    def get(self, url, **kwargs):
+        headers = self._headers(kwargs)
+        return self._client.get(url, headers=headers, **kwargs)
+
+    def post(self, url, **kwargs):
+        headers = self._headers(kwargs)
+        return self._client.post(url, headers=headers, **kwargs)
+
+    @property
+    def headers(self):
+        return self._client.headers
+
+
+def make_client() -> _DevAuthClient:
+    return _DevAuthClient(create_app())
 
 
 def test_health_returns_version_and_dependency_status() -> None:
@@ -335,7 +380,10 @@ def test_identity_resolve_by_librechat_user_id_works() -> None:
     )
 
     client = make_client()
-    r = client.post("/identity/resolve", json={"librechat_user_id": "lc-app-2"})
+    r = client.post(
+        "/identity/resolve",
+        json={"keycloak_subject": "kc-app-2", "librechat_user_id": "lc-app-2"},
+    )
     assert r.status_code == 200
     body = r.json()
     assert body["mapped"] is True
