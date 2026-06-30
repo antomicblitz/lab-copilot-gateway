@@ -31,6 +31,10 @@ from lab_copilot_gateway.elabftw import (
     get_elabftw_read_adapter,
     get_elabftw_write_adapter,
 )
+from lab_copilot_gateway.opencloning import (
+    OpenCloningAdapterError,
+    get_opencloning_adapter,
+)
 from lab_copilot_gateway.identity import (
     DbIdentityMapper,
     IdentityMapper,
@@ -298,8 +302,8 @@ def create_app() -> FastAPI:
     register_auth_exception_handler(api)
 
     # Eagerly initialize audit store, policy engine, identity mapper,
-    # approval store, eLabFTW read adapter (C08), and eLabFTW write adapter
-    # (C09) so /health reflects state.
+    # approval store, eLabFTW read adapter (C08), eLabFTW write adapter
+    # (C09), and OpenCloning adapter (C16) so /health reflects state.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
     identity_mapper = get_identity_mapper()
@@ -308,6 +312,7 @@ def create_app() -> FastAPI:
     # Trigger construction of the write adapter singleton (no binding needed
     # here, but the call ensures /health shows the configured state).
     get_elabftw_write_adapter()
+    opencloning_adapter = get_opencloning_adapter()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -322,7 +327,11 @@ def create_app() -> FastAPI:
             "elabftw": (
                 "configured" if elabftw_adapter.client is not None else "not_configured"
             ),
-            "opencloning": "not_configured",
+            "opencloning": (
+                "configured"
+                if opencloning_adapter.client is not None
+                else "not_configured"
+            ),
             "wallac": "not_configured",
             "bentolab": "not_configured",
         }
@@ -825,7 +834,101 @@ def create_app() -> FastAPI:
             except ElabftwAdapterError as exc:
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
-        # Adapters that don't exist yet (C16+).  Return a structured
+        if tool.adapter == "opencloning":
+            try:
+                adapter = get_opencloning_adapter()
+                if tool.name == "opencloning.parse_sequence_file":
+                    result = adapter.parse_sequence_file(
+                        context_token=body.context_token,
+                        file_content=body.args.get("file_content", ""),
+                        file_format=body.args.get("file_format", "genbank"),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "opencloning.manual_sequence":
+                    result = adapter.manual_sequence(
+                        context_token=body.context_token,
+                        sequence=body.args.get("sequence", ""),
+                        circular=body.args.get("circular", False),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "opencloning.oligo_hybridization":
+                    result = adapter.oligo_hybridization(
+                        context_token=body.context_token,
+                        forward_oligo=body.args.get("forward_oligo", ""),
+                        reverse_oligo=body.args.get("reverse_oligo", ""),
+                        minimal_annealing=body.args.get("minimal_annealing", 20),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "opencloning.simulate_assembly":
+                    result = adapter.simulate_assembly(
+                        context_token=body.context_token,
+                        fragments=body.args.get("fragments", []),
+                        assembly_config=body.args.get("assembly_config", {}),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "tool_name": tool.name,
+                        "reason": "tool_not_dispatched",
+                        "message": (
+                            f"tool {tool.name!r} is in the opencloning adapter "
+                            "but has no /invoke dispatch path"
+                        ),
+                    }
+            except OpenCloningAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+            except ElabftwAdapterError as exc:
+                # OpenCloning adapter reuses eLabFTW's InvalidContextToken and
+                # UnmappedCaller, so those errors surface as ElabftwAdapterError
+                # subclasses. Map them to the same {ok:false, reason, message} shape.
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+        # Adapters that don't exist yet (C18+).  Return a structured
         # error so the LibreChat side can surface a clear "this tool
         # is not wired up yet" message instead of a transport 404.
         return {
@@ -835,7 +938,7 @@ def create_app() -> FastAPI:
             "message": (
                 f"tool {tool.name!r} is in the registry but its "
                 f"{tool.adapter!r} adapter is not implemented yet "
-                "(lands in C16+)"
+                "(lands in C18+)"
             ),
         }
 

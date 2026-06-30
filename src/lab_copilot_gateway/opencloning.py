@@ -1,0 +1,983 @@
+"""OpenCloning adapter for the lab copilot gateway (C16).
+
+Orchestrates gateway-enforced calls to the OpenCloning backend service for
+computational cloning design.  OpenCloning is a stateless FastAPI application
+running in the Docker compose network with no authentication of its own —
+the gateway is the auth/policy/audit boundary.
+
+This module follows the orchestration template established by the eLabFTW
+adapter (C08/C09):
+
+    context token verification
+        → identity resolution (mapped user required)
+        → policy engine decision (tier 3 VALIDATION_DRY_RUN, read-only)
+        → downstream client call (HTTP for production, stub for tests)
+        → audit record with tool_args_hash
+
+Key differences from the eLabFTW adapter:
+
+    * OpenCloning has no API key — the HTTP client only needs a base_url.
+    * All four V1 tools are tier 3 read-only (no approval tokens needed).
+    * File-size limits and file-type allowlists are enforced at the adapter
+      layer before any downstream call (OpenCloning itself has no file-size
+      limit — see upstream TODO in read_from_file).
+    * The context token's experiment_id is carried through as a context_ref
+      for audit correlation but is not used in the downstream call —
+      OpenCloning operations are computational, not experiment-scoped.
+
+Tools exposed (all already in the C06 tool registry):
+
+    opencloning.parse_sequence_file   — parse an uploaded sequence file
+    opencloning.manual_sequence       — validate a manually typed sequence
+    opencloning.oligo_hybridization  — compute oligo hybridization product
+    opencloning.simulate_assembly     — simulate a cloning assembly
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Any, Protocol
+
+from lab_copilot_gateway.approval import compute_args_hash
+from lab_copilot_gateway.audit import AuditRecord, AuditStore
+from lab_copilot_gateway.elabftw import (
+    InvalidContextToken,
+    UnmappedCaller,
+    verify_context_token,
+)
+from lab_copilot_gateway.identity import MappedIdentity
+from lab_copilot_gateway.policy import Decision, PolicyEngine, PolicyRequest, Tier
+
+
+# --- configuration --------------------------------------------------------
+
+# Maximum file size accepted by parse_sequence_file (1 MB).  OpenCloning
+# itself has no limit (upstream TODO), so the gateway enforces one.
+MAX_FILE_SIZE_BYTES = 1_048_576  # 1 MiB
+
+# Allowed file extensions for parse_sequence_file.  Matches the
+# SequenceFileFormat enum in OpenCloning's backend.
+ALLOWED_FILE_EXTENSIONS: frozenset[str] = frozenset(
+    {".gb", ".gbk", ".ape", ".fasta", ".fa", ".dna", ".embl"}
+)
+
+# Request timeout for downstream OpenCloning calls (seconds).  Assembly
+# simulation can take a few seconds; 15s is generous without being unbounded.
+DEFAULT_TIMEOUT_SECONDS = 15.0
+
+
+# --- exceptions -----------------------------------------------------------
+
+
+class OpenCloningAdapterError(Exception):
+    """Base class for OpenCloning adapter errors.
+
+    ``reason`` is a machine-readable code; ``message`` is human-readable.
+    Mirrors ``ElabftwAdapterError`` so the /invoke endpoint can handle
+    both uniformly.
+    """
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.message = message
+
+    def to_dict(self) -> dict[str, str]:
+        return {"reason": self.reason, "message": self.message}
+
+
+class PolicyDenied(OpenCloningAdapterError):
+    """Policy engine refused the call."""
+
+    def __init__(self, decision: Decision) -> None:
+        super().__init__(
+            reason=f"policy_denied:{decision.reason}",
+            message=f"policy engine denied call ({decision.reason})",
+        )
+
+
+class FileTooLarge(OpenCloningAdapterError):
+    """Uploaded file exceeds the gateway's size limit."""
+
+    def __init__(self, size: int, limit: int) -> None:
+        super().__init__(
+            reason="file_too_large",
+            message=f"file size {size} bytes exceeds limit {limit} bytes",
+        )
+        self.size = size
+        self.limit = limit
+
+
+class DisallowedFileType(OpenCloningAdapterError):
+    """File extension is not in the allowlist."""
+
+    def __init__(self, extension: str) -> None:
+        super().__init__(
+            reason="disallowed_file_type",
+            message=(
+                f"file extension {extension!r} not allowed "
+                f"(allowed: {sorted(ALLOWED_FILE_EXTENSIONS)})"
+            ),
+        )
+        self.extension = extension
+
+
+# --- downstream client ---------------------------------------------------
+
+
+class OpenCloningClient(Protocol):
+    """OpenCloning backend client surface the gateway adapter requires.
+
+    Implementations: ``StubOpenCloningClient`` for tests;
+    ``HttpOpenCloningClient`` for live calls.
+    """
+
+    def parse_sequence_file(
+        self, file_content: bytes, file_format: str
+    ) -> dict[str, Any]:
+        """POST /read_from_file — parse an uploaded sequence file.
+
+        Returns the parsed sequence description as a dict.
+        """
+        ...
+
+    def manual_sequence(self, sequence: str, circular: bool = False) -> dict[str, Any]:
+        """POST /manually_typed — validate a manually typed sequence.
+
+        Returns the validated sequence description as a dict.
+        """
+        ...
+
+    def oligo_hybridization(
+        self, forward_oligo: str, reverse_oligo: str, minimal_annealing: int = 20
+    ) -> dict[str, Any]:
+        """POST /oligonucleotide_hybridization — compute hybridization product.
+
+        Returns the product sequence description as a dict.
+        """
+        ...
+
+    def simulate_assembly(
+        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """POST /ligation (or other assembly endpoint) — simulate assembly.
+
+        Returns the predicted construct as a dict.
+        """
+        ...
+
+
+@dataclass
+class StubOpenCloningClient:
+    """In-memory ``OpenCloningClient`` for tests and offline dev.
+
+    Pre-seed ``responses`` with known return values keyed by method name.
+    Methods that aren't pre-seeded return a default empty-success response.
+    Set ``error`` to simulate a downstream failure.
+    """
+
+    responses: dict[str, dict[str, Any]] = field(default_factory=dict)
+    error: Exception | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def _record(self, method: str, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append({"method": method, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return dict(self.responses.get(method, {"ok": True}))
+
+    def parse_sequence_file(
+        self, file_content: bytes, file_format: str
+    ) -> dict[str, Any]:
+        return self._record(
+            "parse_sequence_file",
+            file_size=len(file_content),
+            file_format=file_format,
+        )
+
+    def manual_sequence(self, sequence: str, circular: bool = False) -> dict[str, Any]:
+        return self._record("manual_sequence", sequence=sequence, circular=circular)
+
+    def oligo_hybridization(
+        self, forward_oligo: str, reverse_oligo: str, minimal_annealing: int = 20
+    ) -> dict[str, Any]:
+        return self._record(
+            "oligo_hybridization",
+            forward_oligo=forward_oligo,
+            reverse_oligo=reverse_oligo,
+            minimal_annealing=minimal_annealing,
+        )
+
+    def simulate_assembly(
+        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        return self._record(
+            "simulate_assembly",
+            fragment_count=len(fragments),
+            assembly_config=assembly_config,
+        )
+
+
+@dataclass
+class HttpOpenCloningClient:
+    """Live OpenCloning backend client.
+
+    OpenCloning has no authentication — the client only needs a base_url.
+    Uses ``requests.Session`` for connection reuse, matching the lab HTTP
+    pattern (see AGENTS.md → "eLabFTW API — HTTP client patterns").
+    """
+
+    base_url: str
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    _session: Any = None
+
+    def __post_init__(self) -> None:
+        if not self.base_url:
+            raise ValueError("HttpOpenCloningClient requires non-empty base_url")
+
+    def _connect(self) -> Any:
+        if self._session is None:
+            import requests  # local import; not all deployments exercise HTTP
+
+            s = requests.Session()
+            s.verify = False  # internal service, self-signed or no TLS
+            self._session = s
+        return self._session
+
+    def _post_json(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url.rstrip('/')}{path}"
+        s = self._connect()
+        resp = s.post(url, json=body, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _post_multipart(
+        self, path: str, files: dict[str, Any], data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        url = f"{self.base_url.rstrip('/')}{path}"
+        s = self._connect()
+        resp = s.post(url, files=files, data=data or {}, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+    def parse_sequence_file(
+        self, file_content: bytes, file_format: str
+    ) -> dict[str, Any]:
+        # OpenCloning's read_from_file expects a multipart upload.
+        # The file_format is inferred from the extension by the backend.
+        filename = _format_to_filename(file_format)
+        files = {"file": (filename, file_content)}
+        return self._post_multipart("/read_from_file", files=files)
+
+    def manual_sequence(self, sequence: str, circular: bool = False) -> dict[str, Any]:
+        return self._post_json(
+            "/manually_typed",
+            {"sequence": sequence, "circular": circular},
+        )
+
+    def oligo_hybridization(
+        self, forward_oligo: str, reverse_oligo: str, minimal_annealing: int = 20
+    ) -> dict[str, Any]:
+        return self._post_json(
+            "/oligonucleotide_hybridization",
+            {
+                "forward_oligo": forward_oligo,
+                "reverse_oligo": reverse_oligo,
+                "minimal_annealing": minimal_annealing,
+            },
+        )
+
+    def simulate_assembly(
+        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+    ) -> dict[str, Any]:
+        # The assembly endpoint is determined by assembly_config["type"].
+        # V1 supports ligation; other types (gibson, restriction_and_ligation,
+        # etc.) can be added as the tool surface grows.
+        assembly_type = assembly_config.get("type", "ligation")
+        return self._post_json(
+            f"/{assembly_type}",
+            {"fragments": fragments, **assembly_config},
+        )
+
+
+def _format_to_filename(file_format: str) -> str:
+    """Map a file_format identifier to a dummy filename with the right
+    extension, so OpenCloning's backend can infer the parser to use."""
+    ext_map = {
+        "genbank": ".gb",
+        "fasta": ".fasta",
+        "snapgene": ".dna",
+        "embl": ".embl",
+    }
+    ext = ext_map.get(file_format, ".gb")
+    return f"sequence{ext}"
+
+
+def _default_client_from_env() -> OpenCloningClient | None:
+    """Construct the live HTTP client if env config is present.
+
+    Returns None if base_url is unset — the adapter then refuses calls
+    with ``opencloning_not_configured`` at call time.
+    """
+    base_url = os.getenv("LAB_COPILOT_OPENCLONING_BASE_URL", "")
+    if not base_url:
+        return None
+    timeout = float(
+        os.getenv("LAB_COPILOT_OPENCLONING_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))
+    )
+    return HttpOpenCloningClient(
+        base_url=base_url,
+        timeout_seconds=timeout,
+    )
+
+
+# --- result ---------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OpenCloningResult:
+    """Outcome of a successful OpenCloning adapter call."""
+
+    tool_name: str
+    result: dict[str, Any]
+    audit_action_id: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_name": self.tool_name,
+            "result": self.result,
+            "audit_action_id": self.audit_action_id,
+        }
+
+
+# --- adapter --------------------------------------------------------------
+
+
+# Tool names from the C06 registry.
+TOOL_PARSE = "opencloning.parse_sequence_file"
+TOOL_MANUAL = "opencloning.manual_sequence"
+TOOL_OLIGO = "opencloning.oligo_hybridization"
+TOOL_ASSEMBLY = "opencloning.simulate_assembly"
+TOOL_TIER = Tier.VALIDATION_DRY_RUN
+
+
+@dataclass
+class OpenCloningAdapter:
+    """Orchestrates OpenCloning calls through the gateway-enforced path.
+
+    Dependencies are injected so tests can swap the policy engine, audit
+    store, and downstream client individually.  In production, the
+    module-level ``get_opencloning_adapter()`` wires all the singletons.
+    """
+
+    policy_engine: PolicyEngine
+    audit_store: AuditStore
+    client: OpenCloningClient | None
+    action_id_prefix: str = "opencloning"
+
+    # --- public API: four C16 tool entrypoints --------------------------
+
+    def parse_sequence_file(
+        self,
+        *,
+        context_token: str,
+        file_content: str,
+        file_format: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Parse an uploaded sequence file via OpenCloning.
+
+        ``file_content`` is the raw file content as a string (base64-decoded
+        by the /invoke endpoint if needed).  ``file_format`` is one of
+        ``genbank``, ``fasta``, ``snapgene``, ``embl``.
+
+        Enforces file-size limit and file-type allowlist before any
+        downstream call.
+        """
+        # Decode file content to bytes for size check and downstream call.
+        raw_bytes = (
+            file_content.encode("utf-8")
+            if isinstance(file_content, str)
+            else file_content
+        )
+
+        # File-size limit (enforced before any downstream call).
+        if len(raw_bytes) > MAX_FILE_SIZE_BYTES:
+            self._audit(
+                tool_name=TOOL_PARSE,
+                policy_decision="deny",
+                reason="file_too_large",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=compute_args_hash(
+                    {"file_format": file_format, "file_size": len(raw_bytes)}
+                ),
+                error={
+                    "code": "FILE_TOO_LARGE",
+                    "size": len(raw_bytes),
+                    "limit": MAX_FILE_SIZE_BYTES,
+                },
+            )
+            raise FileTooLarge(len(raw_bytes), MAX_FILE_SIZE_BYTES)
+
+        # File-type allowlist.
+        ext = _infer_extension(file_format)
+        if ext not in ALLOWED_FILE_EXTENSIONS:
+            self._audit(
+                tool_name=TOOL_PARSE,
+                policy_decision="deny",
+                reason="disallowed_file_type",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=compute_args_hash(
+                    {"file_format": file_format, "file_size": len(raw_bytes)}
+                ),
+                error={
+                    "code": "DISALLOWED_FILE_TYPE",
+                    "extension": ext,
+                    "allowed": sorted(ALLOWED_FILE_EXTENSIONS),
+                },
+            )
+            raise DisallowedFileType(ext)
+
+        return self._execute(
+            tool_name=TOOL_PARSE,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={"file_format": file_format, "file_size": len(raw_bytes)},
+            api_call_summary={"method": "POST", "path": "/read_from_file"},
+            exec_fn=lambda _client: _client.parse_sequence_file(raw_bytes, file_format),
+        )
+
+    def manual_sequence(
+        self,
+        *,
+        context_token: str,
+        sequence: str,
+        circular: bool = False,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Validate a manually typed DNA sequence via OpenCloning."""
+        return self._execute(
+            tool_name=TOOL_MANUAL,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={"sequence_length": len(sequence), "circular": circular},
+            api_call_summary={"method": "POST", "path": "/manually_typed"},
+            exec_fn=lambda _client: _client.manual_sequence(sequence, circular),
+        )
+
+    def oligo_hybridization(
+        self,
+        *,
+        context_token: str,
+        forward_oligo: str,
+        reverse_oligo: str,
+        minimal_annealing: int = 20,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Compute the product of oligo hybridization via OpenCloning."""
+        return self._execute(
+            tool_name=TOOL_OLIGO,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={
+                "forward_length": len(forward_oligo),
+                "reverse_length": len(reverse_oligo),
+                "minimal_annealing": minimal_annealing,
+            },
+            api_call_summary={
+                "method": "POST",
+                "path": "/oligonucleotide_hybridization",
+            },
+            exec_fn=lambda _client: _client.oligo_hybridization(
+                forward_oligo, reverse_oligo, minimal_annealing
+            ),
+        )
+
+    def simulate_assembly(
+        self,
+        *,
+        context_token: str,
+        fragments: list[dict[str, Any]],
+        assembly_config: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Simulate a cloning assembly via OpenCloning."""
+        assembly_type = assembly_config.get("type", "ligation")
+        return self._execute(
+            tool_name=TOOL_ASSEMBLY,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={
+                "fragment_count": len(fragments),
+                "assembly_type": assembly_type,
+            },
+            api_call_summary={"method": "POST", "path": f"/{assembly_type}"},
+            exec_fn=lambda _client: _client.simulate_assembly(
+                fragments, assembly_config
+            ),
+        )
+
+    # --- shared orchestration --------------------------------------------
+
+    def _execute(
+        self,
+        *,
+        tool_name: str,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        args_for_hash: dict[str, Any],
+        api_call_summary: dict[str, Any],
+        exec_fn: Any,  # callable(client) -> dict
+    ) -> OpenCloningResult:
+        """Shared orchestration: token → identity → policy → client → audit.
+
+        All four tool methods delegate here.  The ``exec_fn`` lambda is the
+        only tool-specific part — it receives the client and returns the
+        downstream result dict.
+        """
+        # Compute early redacted args hash for audit on failure paths.
+        early_hash = compute_args_hash(
+            {**args_for_hash, "token_present": bool(context_token)}
+        )
+
+        # 1. Verify context token (signature + expiry).
+        if not context_token:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="missing_context_token",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "MISSING_CONTEXT_TOKEN"},
+            )
+            raise InvalidContextToken("missing")
+
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
+        # Once claims verified, use the experiment_id from the token for
+        # context_refs correlation.
+        tool_args_hash = compute_args_hash(
+            {**args_for_hash, "experiment_id": claims.experiment_id}
+        )
+
+        # 2. Identity resolution — unmapped caller denies before any HTTP.
+        if mapped_identity is None:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 3. Token-identity binding (three-way check).
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
+
+        # 4. Policy decision (tier 3 read-only, no approval needed).
+        policy_req = PolicyRequest(
+            tool_name=tool_name,
+            tier=TOOL_TIER,
+            adapter="opencloning",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=False,
+            approval_id=None,
+        )
+        decision = self.policy_engine.decide(policy_req)
+
+        if decision.decision != "allow":
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 5. Client-not-configured check.
+        if self.client is None:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="opencloning_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "OPENCLONING_NOT_CONFIGURED"},
+            )
+            raise OpenCloningAdapterError(
+                reason="opencloning_not_configured",
+                message=(
+                    "OpenCloning client not configured "
+                    "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+                ),
+            )
+
+        # 6. Downstream call.
+        try:
+            result = exec_fn(self.client)
+        except Exception as exc:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                api_call_summary=api_call_summary,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise OpenCloningAdapterError(
+                reason="client_error",
+                message=f"OpenCloning client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 7. Success — audit + return.
+        import secrets as _secrets
+        import time as _time
+
+        action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        self._audit(
+            tool_name=tool_name,
+            policy_decision="allow",
+            reason="call_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary=api_call_summary,
+            result_summary={
+                "result_keys": list(result.keys()) if isinstance(result, dict) else []
+            },
+            require_persistence=True,
+            action_id=action_id,
+        )
+
+        return OpenCloningResult(
+            tool_name=tool_name,
+            result=result,
+            audit_action_id=action_id,
+        )
+
+    # --- audit writer ----------------------------------------------------
+
+    def _audit(
+        self,
+        *,
+        tool_name: str,
+        policy_decision: str,
+        reason: str,
+        mapped_identity: MappedIdentity | None,
+        experiment_id: int | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str | None = None,
+        api_call_summary: dict[str, Any] | None = None,
+        result_summary: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+        require_persistence: bool = False,
+        action_id: str | None = None,
+    ) -> None:
+        """Persist an audit record.
+
+        Mirrors the eLabFTW adapter's audit pattern: deny/error paths
+        swallow audit-write failures; success paths raise if audit
+        persistence fails.
+        """
+        import secrets as _secrets
+        import time as _time
+
+        if action_id is None:
+            action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        context_refs: list[dict[str, Any]] = []
+        if experiment_id is not None:
+            context_refs.append({"kind": "experiment", "id": experiment_id})
+
+        record = AuditRecord(
+            action_id=action_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            mapped_elabftw_user_id=(
+                mapped_identity.elabftw_user_id if mapped_identity else None
+            ),
+            mapped_elabftw_team_id=(
+                mapped_identity.elabftw_team_id if mapped_identity else None
+            ),
+            provider=provider,
+            model_id=model_id,
+            tool_name=tool_name,
+            tool_args_hash=tool_args_hash,
+            context_refs=context_refs,
+            policy_decision=policy_decision,
+            api_call_summary=api_call_summary or {},
+            result_summary=result_summary or {},
+            error=error,
+        )
+        try:
+            self.audit_store.append(record)
+        except Exception as exc:
+            if require_persistence:
+                raise OpenCloningAdapterError(
+                    reason="audit_persistence_failed",
+                    message=f"audit append failed on success path: {exc}",
+                ) from exc
+            pass
+
+
+# --- helpers --------------------------------------------------------------
+
+
+def _infer_extension(file_format: str) -> str:
+    """Map a file_format identifier to its canonical extension.
+
+    Used for the file-type allowlist check in parse_sequence_file.
+    """
+    ext_map = {
+        "genbank": ".gb",
+        "gb": ".gb",
+        "gbk": ".gbk",
+        "ape": ".ape",
+        "fasta": ".fasta",
+        "fa": ".fa",
+        "snapgene": ".dna",
+        "dna": ".dna",
+        "embl": ".embl",
+    }
+    return ext_map.get(file_format.lower(), f".{file_format.lower()}")
+
+
+# --- module-level singleton for dependency injection ----------------------
+
+_default_adapter: OpenCloningAdapter | None = None
+
+
+def get_opencloning_adapter() -> OpenCloningAdapter:
+    """Return the process-wide OpenCloning adapter (created lazily)."""
+    global _default_adapter
+    if _default_adapter is None:
+        from lab_copilot_gateway.audit import get_audit_store
+        from lab_copilot_gateway.policy import get_policy_engine
+
+        _default_adapter = OpenCloningAdapter(
+            policy_engine=get_policy_engine(),
+            audit_store=get_audit_store(),
+            client=_default_client_from_env(),
+        )
+    return _default_adapter
+
+
+def reset_opencloning_adapter(
+    adapter: OpenCloningAdapter | None = None,
+) -> None:
+    """Test helper: replace or clear the singleton."""
+    global _default_adapter
+    _default_adapter = adapter
