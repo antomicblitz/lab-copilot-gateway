@@ -1,16 +1,19 @@
-"""Wallac adapter for the lab copilot gateway (C18).
+"""Wallac adapter for the lab copilot gateway (C18 + C19).
 
 Orchestrates gateway-enforced calls to the Wallac Victor2 vm-agent service
-for instrument status reads.  The vm-agent is a Python HTTP service running
-on a Windows 7 VM (192.168.122.203:8420) that controls the Wallac Victor2
-plate reader via COM.
+for instrument status reads (C18) and protocol proposal/validation (C19).
+The vm-agent is a Python HTTP service running on a Windows 7 VM
+(192.168.122.203:8420) that controls the Wallac Victor2 plate reader via
+COM.  The Wallac bridge (designer/validation) is a separate FastAPI service
+that handles protocol authoring and signed-spec validation.
 
 This module follows the orchestration template established by the eLabFTW
 adapter (C08/C09) and OpenCloning adapter (C16):
 
     context token verification
         → identity resolution (mapped user required)
-        → policy engine decision (tier 2 OPERATIONAL_READ_ONLY, read-only)
+        → policy engine decision (tier 2 OPERATIONAL_READ_ONLY for status,
+          tier 3 VALIDATION_DRY_RUN for proposal/validation)
         → downstream client call (HTTP for production, stub for tests)
         → audit record with tool_args_hash
 
@@ -22,15 +25,21 @@ Key differences from the eLabFTW/OpenCloning adapters:
       but is not used in the downstream call.
     * The vm-agent may be offline (VM down, network issue) — the adapter
       handles this gracefully with a structured error.
+    * C19 proposal and submission-package tools are gateway-side
+      computations (no downstream call) — they validate and structure
+      the protocol spec without calling the bridge.
+    * C19 validation calls the Wallac bridge's validation endpoint
+      (separate service from the vm-agent).
 
 Tools exposed (already in the C06 tool registry):
 
-    wallac.get_status — read instrument status and current job
+    wallac.get_status — read instrument status and current job (C18)
+    wallac.propose_generated_protocol — propose a protocol design (C19)
+    wallac.validate_generated_protocol — validate a signed bundle (C19)
+    wallac.prepare_submission_package — prepare approval-ready package (C19)
 
-Future chunks (C19/C20) will add:
-    wallac.propose_generated_protocol
-    wallac.validate_generated_protocol
-    wallac.prepare_submission_package
+Future chunks (C20/C21) will add:
+    wallac.submit_generated_protocol — approval-gated hardware execution
 """
 
 from __future__ import annotations
@@ -176,6 +185,131 @@ class HttpWallacClient:
         return resp.json()
 
 
+# --- C19: Wallac bridge client (designer/validation) -----------------------
+
+
+class WallacBridgeClient(Protocol):
+    """Wallac bridge client surface for protocol validation (C19).
+
+    The bridge is a separate FastAPI service (bridge_app.py +
+    designer_app.py in wallac-victor2-api).  It handles signed-spec
+    validation, protocol authoring, and job execution.
+
+    Implementations: ``StubWallacBridgeClient`` for tests;
+    ``HttpWallacBridgeClient`` for live calls.
+    """
+
+    def validate_protocol(self, job_item_id: int) -> dict[str, Any]:
+        """POST /api/jobs/{id}/validate — validate a signed bundle.
+
+        Returns a validation report dict with ``valid`` (bool),
+        ``checks`` (list), and ``errors`` (list).
+        """
+        ...
+
+    def get_health(self) -> dict[str, Any]:
+        """GET /health — bridge health check."""
+        ...
+
+
+@dataclass
+class StubWallacBridgeClient:
+    """In-memory ``WallacBridgeClient`` for tests and offline dev.
+
+    Pre-seed ``validation_response`` with the desired report.  Set
+    ``error`` to simulate a downstream failure.
+    """
+
+    validation_response: dict[str, Any] = field(
+        default_factory=lambda: {
+            "valid": True,
+            "checks": [
+                {"name": "signature", "passed": True},
+                {"name": "schema", "passed": True},
+                {"name": "lifecycle", "passed": True},
+            ],
+            "errors": [],
+        }
+    )
+    health_response: dict[str, Any] = field(default_factory=lambda: {"status": "ok"})
+    error: Exception | None = None
+    calls: list[dict[str, Any]] = field(default_factory=list)
+
+    def validate_protocol(self, job_item_id: int) -> dict[str, Any]:
+        self.calls.append({"method": "validate_protocol", "job_item_id": job_item_id})
+        if self.error is not None:
+            raise self.error
+        return dict(self.validation_response)
+
+    def get_health(self) -> dict[str, Any]:
+        if self.error is not None:
+            raise self.error
+        return dict(self.health_response)
+
+
+@dataclass
+class HttpWallacBridgeClient:
+    """Live Wallac bridge client.
+
+    The bridge uses optional Bearer token auth
+    (``WALLAC_DESIGNER_TOKEN`` / ``WALLAC_BRIDGE_TOKEN``).
+    """
+
+    base_url: str
+    bearer_token: str | None = None
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
+    _session: Any = None
+
+    def __post_init__(self) -> None:
+        if not self.base_url:
+            raise ValueError("HttpWallacBridgeClient requires non-empty base_url")
+
+    def _connect(self) -> Any:
+        if self._session is None:
+            import requests
+
+            s = requests.Session()
+            if self.bearer_token:
+                s.headers.update({"Authorization": f"Bearer {self.bearer_token}"})
+            s.verify = False  # internal service, no TLS
+            self._session = s
+        return self._session
+
+    def validate_protocol(self, job_item_id: int) -> dict[str, Any]:
+        url = f"{self.base_url.rstrip('/')}/api/jobs/{job_item_id}/validate"
+        s = self._connect()
+        resp = s.post(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_health(self) -> dict[str, Any]:
+        url = f"{self.base_url.rstrip('/')}/health"
+        s = self._connect()
+        resp = s.get(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+
+def _default_bridge_client_from_env() -> WallacBridgeClient | None:
+    """Construct the live bridge client if env config is present.
+
+    Returns None if base_url is unset — the adapter then refuses
+    validation calls with ``wallac_bridge_not_configured`` at call time.
+    """
+    base_url = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "")
+    if not base_url:
+        return None
+    bearer_token = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "") or None
+    timeout = float(
+        os.getenv("LAB_COPILOT_WALLAC_TIMEOUT", str(DEFAULT_TIMEOUT_SECONDS))
+    )
+    return HttpWallacBridgeClient(
+        base_url=base_url,
+        bearer_token=bearer_token,
+        timeout_seconds=timeout,
+    )
+
+
 def _default_client_from_env() -> WallacClient | None:
     """Construct the live HTTP client if env config is present.
 
@@ -220,21 +354,36 @@ class WallacResult:
 
 # Tool name from the C06 registry.
 TOOL_GET_STATUS = "wallac.get_status"
+TOOL_PROPOSE = "wallac.propose_generated_protocol"
+TOOL_VALIDATE = "wallac.validate_generated_protocol"
+TOOL_PREPARE_SUBMISSION = "wallac.prepare_submission_package"
+
+# C18 status is tier 2 (OPERATIONAL_READ_ONLY).
 TOOL_TIER = Tier.OPERATIONAL_READ_ONLY
+
+# C19 proposal/validation is tier 3 (VALIDATION_DRY_RUN).
+TOOL_TIER_C19 = Tier.VALIDATION_DRY_RUN
 
 
 @dataclass
 class WallacAdapter:
-    """Orchestrates Wallac vm-agent calls through the gateway-enforced path.
+    """Orchestrates Wallac vm-agent and bridge calls through the gateway-enforced path.
 
     Dependencies are injected so tests can swap the policy engine, audit
-    store, and downstream client individually.  In production, the
+    store, and downstream clients individually.  In production, the
     module-level ``get_wallac_adapter()`` wires all the singletons.
+
+    Two clients:
+        * ``client`` — vm-agent for status reads (C18).
+        * ``bridge_client`` — Wallac bridge for protocol validation (C19).
+          May be None when the bridge is not deployed; proposal and
+          submission-package tools still work (gateway-side computation).
     """
 
     policy_engine: PolicyEngine
     audit_store: AuditStore
     client: WallacClient | None
+    bridge_client: WallacBridgeClient | None = None
     action_id_prefix: str = "wallac"
 
     # --- public API: C18 tool entrypoint --------------------------------
@@ -273,7 +422,178 @@ class WallacAdapter:
             exec_fn=lambda _client: _client.get_status(),
         )
 
+    # --- C19 tools: proposal / validation / submission package -----------
+
+    def propose_generated_protocol(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        protocol_spec: dict[str, Any],
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Propose a generated-protocol package without execution.
+
+        Takes a protocol design spec (method, layout, analysis, job
+        parameters) and returns a structured proposal with a content hash.
+        This is a gateway-side computation — no downstream call is made.
+
+        The proposal includes:
+            - the validated spec
+            - a SHA-256 content hash (for approval binding)
+            - execution_blocked: True (v1 blocks hardware execution)
+        """
+        spec_hash = compute_args_hash(protocol_spec)
+
+        def _propose(_client: Any) -> dict[str, Any]:
+            return {
+                "proposal": protocol_spec,
+                "spec_hash": spec_hash,
+                "execution_blocked": True,
+                "message": (
+                    "Protocol proposal prepared. Execution remains blocked in v1. "
+                    "Use prepare_submission_package to create an approval-ready package."
+                ),
+            }
+
+        return self._execute(
+            tool_name=TOOL_PROPOSE,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={"tool": "propose_generated_protocol", "spec": protocol_spec},
+            api_call_summary={"method": "none", "path": "gateway-side"},
+            exec_fn=_propose,
+            tier_override=TOOL_TIER_C19,
+        )
+
+    def validate_generated_protocol(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        job_item_id: int,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Validate a generated-protocol package against the signed-spec schema.
+
+        Calls the Wallac bridge's validation endpoint to verify the
+        signed bundle (signature, schema, lifecycle, capabilities).
+        The bridge is a separate service — if not configured, returns
+        ``wallac_bridge_not_configured``.
+        """
+        return self._execute(
+            tool_name=TOOL_VALIDATE,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={
+                "tool": "validate_generated_protocol",
+                "job_item_id": job_item_id,
+            },
+            api_call_summary={
+                "method": "POST",
+                "path": f"/api/jobs/{job_item_id}/validate",
+            },
+            exec_fn=lambda _client: self._call_bridge_validate(job_item_id),
+            tier_override=TOOL_TIER_C19,
+            use_bridge=True,
+        )
+
+    def prepare_submission_package(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        protocol_spec: dict[str, Any],
+        validation_report: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Prepare an approval-ready Wallac submission package.
+
+        Assembles the protocol spec and validation report into a
+        structured submission package.  Execution remains blocked in v1 —
+        the package explicitly states ``execution_blocked: True``.
+
+        This is a gateway-side computation — no downstream call is made.
+        """
+        spec_hash = compute_args_hash(protocol_spec)
+
+        def _prepare(_client: Any) -> dict[str, Any]:
+            return {
+                "submission_package": {
+                    "spec": protocol_spec,
+                    "spec_hash": spec_hash,
+                    "validation": validation_report
+                    or {"valid": False, "reason": "not_validated"},
+                    "execution_blocked": True,
+                    "v1_notice": (
+                        "Hardware execution is blocked in v1. "
+                        "This package is approval-ready but cannot be submitted "
+                        "until v1.1 (C20/C21)."
+                    ),
+                }
+            }
+
+        return self._execute(
+            tool_name=TOOL_PREPARE_SUBMISSION,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={"tool": "prepare_submission_package", "spec": protocol_spec},
+            api_call_summary={"method": "none", "path": "gateway-side"},
+            exec_fn=_prepare,
+            tier_override=TOOL_TIER_C19,
+        )
+
     # --- shared orchestration --------------------------------------------
+
+    def _call_bridge_validate(self, job_item_id: int) -> dict[str, Any]:
+        """Call the Wallac bridge to validate a signed protocol bundle.
+
+        Separated from the lambda so the bridge-not-configured check
+        happens at the right point in the orchestration (after policy
+        allow, before the downstream call).
+        """
+        if self.bridge_client is None:
+            raise WallacAdapterError(
+                reason="wallac_bridge_not_configured",
+                message=(
+                    "Wallac bridge client not configured "
+                    "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
+                ),
+            )
+        return self.bridge_client.validate_protocol(job_item_id)
 
     def _execute(
         self,
@@ -290,10 +610,22 @@ class WallacAdapter:
         args_for_hash: dict[str, Any],
         api_call_summary: dict[str, Any],
         exec_fn: Any,  # callable(client) -> dict
+        tier_override: Tier | None = None,
+        use_bridge: bool = False,
     ) -> WallacResult:
         """Shared orchestration: token → identity → policy → client → audit.
 
         Mirrors the OpenCloning adapter's _execute method.
+
+        ``tier_override`` lets C19 tools use tier 3 (VALIDATION_DRY_RUN)
+        instead of the default tier 2 (OPERATIONAL_READ_ONLY).
+
+        ``use_bridge`` selects which client is checked for the
+        not-configured path: False (default) checks ``self.client``
+        (vm-agent), True checks ``self.bridge_client`` (Wallac bridge).
+        For gateway-side computations (propose, prepare_submission), the
+        exec_fn doesn't use the client at all, but we still require
+        ``self.client`` to be configured for the audit path to work.
         """
         # Compute early redacted args hash for audit on failure paths.
         early_hash = compute_args_hash(
@@ -429,10 +761,11 @@ class WallacAdapter:
                     "token librechat_user_id does not match resolved identity"
                 )
 
-        # 4. Policy decision (tier 2 read-only, no approval needed).
+        # 4. Policy decision (tier from override or default).
+        effective_tier = tier_override if tier_override is not None else TOOL_TIER
         policy_req = PolicyRequest(
             tool_name=tool_name,
-            tier=TOOL_TIER,
+            tier=effective_tier,
             adapter="wallac",
             user_id=mapped_identity.elabftw_user_id,
             team_id=mapped_identity.elabftw_team_id,
@@ -464,7 +797,36 @@ class WallacAdapter:
             raise PolicyDenied(decision)
 
         # 5. Client-not-configured check.
-        if self.client is None:
+        #    For bridge tools (validate_generated_protocol), check bridge_client.
+        #    For gateway-side tools (propose, prepare_submission), the exec_fn
+        #    doesn't use the client, but we still require self.client for
+        #    consistency (the adapter is wired).  For vm-agent tools
+        #    (get_status), check self.client.
+        if use_bridge:
+            if self.bridge_client is None:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="wallac_bridge_not_configured",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "WALLAC_BRIDGE_NOT_CONFIGURED"},
+                )
+                raise WallacAdapterError(
+                    reason="wallac_bridge_not_configured",
+                    message=(
+                        "Wallac bridge client not configured "
+                        "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
+                    ),
+                )
+        elif self.client is None:
             self._audit(
                 tool_name=tool_name,
                 policy_decision="deny",
@@ -488,8 +850,14 @@ class WallacAdapter:
             )
 
         # 6. Downstream call.
+        #    For gateway-side tools (propose, prepare_submission), exec_fn
+        #    ignores the client argument.  For bridge tools (validate),
+        #    exec_fn calls self._call_bridge_validate() which uses
+        #    self.bridge_client.  For vm-agent tools (get_status), exec_fn
+        #    calls client.get_status().  Pass the appropriate client.
+        downstream_client = self.bridge_client if use_bridge else self.client
         try:
-            result = exec_fn(self.client)
+            result = exec_fn(downstream_client)
         except Exception as exc:
             self._audit(
                 tool_name=tool_name,
@@ -639,6 +1007,7 @@ def get_wallac_adapter() -> WallacAdapter:
             policy_engine=get_policy_engine(),
             audit_store=get_audit_store(),
             client=_default_client_from_env(),
+            bridge_client=_default_bridge_client_from_env(),
         )
     return _default_adapter
 

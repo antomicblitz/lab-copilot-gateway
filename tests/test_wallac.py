@@ -1,10 +1,16 @@
-"""Tests for the Wallac adapter (C18).
+"""Tests for the Wallac adapter (C18 + C19).
 
 Acceptance checks (from build plan):
 
+C18:
     1. Gateway calls Wallac health/status.
     2. Tool is read-only and allowed for mapped users.
     3. Wallac offline state is handled gracefully.
+
+C19:
+    4. Copilot can prepare generated-protocol package.
+    5. Package can be validated.
+    6. Submission remains blocked in v1.
 
 Additional coverage (mirrors the OpenCloning adapter test patterns):
 
@@ -34,12 +40,15 @@ from lab_copilot_gateway.elabftw import (
 from lab_copilot_gateway.identity import MappedIdentity
 from lab_copilot_gateway.policy import PolicyEngine
 from lab_copilot_gateway.wallac import (
+    HttpWallacBridgeClient,
     HttpWallacClient,
     PolicyDenied,
+    StubWallacBridgeClient,
     StubWallacClient,
     WallacAdapter,
     WallacAdapterError,
     WallacResult,
+    _default_bridge_client_from_env,
     _default_client_from_env,
     get_wallac_adapter,
     reset_wallac_adapter,
@@ -88,7 +97,24 @@ def adapter(
     )
 
 
-# --- helpers ----------------------------------------------------------------
+@pytest.fixture
+def stub_bridge_client() -> StubWallacBridgeClient:
+    return StubWallacBridgeClient()
+
+
+@pytest.fixture
+def adapter_with_bridge(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> WallacAdapter:
+    return WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )  # --- helpers ----------------------------------------------------------------
 
 
 def _claims(
@@ -494,3 +520,505 @@ def test_stub_client_default_response() -> None:
     assert result["connected"] is True
     assert result["is_idle"] is True
     assert len(stub.calls) == 1
+
+
+# ============================================================================
+# C19: propose_generated_protocol
+# ============================================================================
+
+
+def test_propose_happy_path(adapter: WallacAdapter) -> None:
+    """Copilot can prepare a generated-protocol package (acceptance #4)."""
+    spec = {
+        "execution_mode": "generated_protocol",
+        "method": {"name": "fluorescence", "wavelength": 485},
+        "layout": {"rows": 8, "cols": 12},
+    }
+    result = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    assert result.tool_name == "wallac.propose_generated_protocol"
+    proposal = result.result["proposal"]
+    assert proposal == spec
+    assert "spec_hash" in result.result
+    assert len(result.result["spec_hash"]) == 64  # SHA-256 hex
+    assert result.result["execution_blocked"] is True
+
+
+def test_propose_execution_blocked_in_v1(adapter: WallacAdapter) -> None:
+    """Submission remains blocked in v1 (acceptance #6)."""
+    result = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"execution_mode": "generated_protocol"},
+    )
+    assert result.result["execution_blocked"] is True
+    assert "blocked" in result.result["message"].lower()
+
+
+def test_propose_unmapped_caller_denies(adapter: WallacAdapter) -> None:
+    """Unmapped caller denies before any computation."""
+    with pytest.raises(UnmappedCaller):
+        adapter.propose_generated_protocol(
+            context_token=_token(),
+            mapped_identity=None,
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "deny"
+    assert rows[0]["error"]["code"] == "UNMAPPED_CALLER"
+
+
+def test_propose_invalid_token_denies(adapter: WallacAdapter) -> None:
+    """Invalid token denies with audit."""
+    with pytest.raises(InvalidContextToken):
+        adapter.propose_generated_protocol(
+            context_token="garbage",
+            mapped_identity=_identity(),
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "INVALID_CONTEXT_TOKEN"
+
+
+def test_propose_kill_switch_denies(
+    policy: PolicyEngine, audit: AuditStore, stub_client: StubWallacClient
+) -> None:
+    """Kill switch denies wallac.propose_generated_protocol."""
+    p = PolicyEngine(kill_switches=("wallac.propose_*",))
+    adapter = WallacAdapter(policy_engine=p, audit_store=audit, client=stub_client)
+    with pytest.raises(PolicyDenied):
+        adapter.propose_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert "kill_switch" in rows[0]["error"]["reason"]
+
+
+def test_propose_audit_hash_persisted(adapter: WallacAdapter) -> None:
+    """Audit records carry tool_args_hash on success path."""
+    spec = {"execution_mode": "generated_protocol", "method": {"name": "absorbance"}}
+    adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["tool_args_hash"] is not None
+    assert len(rows[0]["tool_args_hash"]) == 64
+    assert rows[0]["tool_name"] == "wallac.propose_generated_protocol"
+    assert rows[0]["policy_decision"] == "allow"
+
+
+def test_propose_token_user_mismatch_denies(adapter: WallacAdapter) -> None:
+    """Token-identity mismatch denies with audit."""
+    claims = _claims(mapped_elabftw_user_id="elab-other-user")
+    with pytest.raises(InvalidContextToken):
+        adapter.propose_generated_protocol(
+            context_token=_token(claims),
+            mapped_identity=_identity(elab_user_id="elab-human-1"),
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "CONTEXT_TOKEN_USER_MISMATCH"
+
+
+def test_propose_empty_spec(adapter: WallacAdapter) -> None:
+    """Empty spec is still processed (gateway-side validation, not schema enforcement)."""
+    result = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={},
+    )
+    assert result.result["proposal"] == {}
+    assert result.result["execution_blocked"] is True
+
+
+def test_propose_spec_hash_is_deterministic(adapter: WallacAdapter) -> None:
+    """Same spec produces same hash."""
+    spec = {"execution_mode": "generated_protocol", "method": {"name": "fluorescence"}}
+    r1 = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    r2 = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    assert r1.result["spec_hash"] == r2.result["spec_hash"]
+
+
+def test_propose_different_specs_produce_different_hashes(
+    adapter: WallacAdapter,
+) -> None:
+    """Different specs produce different hashes."""
+    r1 = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"method": {"name": "absorbance"}},
+    )
+    r2 = adapter.propose_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"method": {"name": "fluorescence"}},
+    )
+    assert r1.result["spec_hash"] != r2.result["spec_hash"]
+
+
+# ============================================================================
+# C19: validate_generated_protocol
+# ============================================================================
+
+
+def test_validate_happy_path(adapter_with_bridge: WallacAdapter) -> None:
+    """Package can be validated (acceptance #5)."""
+    result = adapter_with_bridge.validate_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        job_item_id=99,
+    )
+    assert result.tool_name == "wallac.validate_generated_protocol"
+    assert result.result["valid"] is True
+    assert len(result.result["checks"]) == 3
+    assert result.result["errors"] == []
+
+
+def test_validate_bridge_not_configured(adapter: WallacAdapter) -> None:
+    """Bridge not configured → structured error."""
+    with pytest.raises(WallacAdapterError) as exc_info:
+        adapter.validate_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            job_item_id=99,
+        )
+    assert exc_info.value.reason == "wallac_bridge_not_configured"
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "WALLAC_BRIDGE_NOT_CONFIGURED"
+
+
+def test_validate_bridge_error_propagates(
+    policy: PolicyEngine, audit: AuditStore, stub_client: StubWallacClient
+) -> None:
+    """Bridge client error propagates after audit."""
+    bridge = StubWallacBridgeClient(error=ConnectionError("bridge offline"))
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=bridge,
+    )
+    with pytest.raises(WallacAdapterError) as exc_info:
+        adapter.validate_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            job_item_id=99,
+        )
+    assert exc_info.value.reason == "client_error"
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "CLIENT_ERROR"
+    assert rows[0]["policy_decision"] == "allow"
+
+
+def test_validate_invalid_token_denies(adapter_with_bridge: WallacAdapter) -> None:
+    """Invalid token denies before bridge call."""
+    with pytest.raises(InvalidContextToken):
+        adapter_with_bridge.validate_generated_protocol(
+            context_token="bad",
+            mapped_identity=_identity(),
+            job_item_id=99,
+        )
+    rows = _audit_rows(adapter_with_bridge.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "INVALID_CONTEXT_TOKEN"
+
+
+def test_validate_unmapped_caller_denies(adapter_with_bridge: WallacAdapter) -> None:
+    """Unmapped caller denies before bridge call."""
+    with pytest.raises(UnmappedCaller):
+        adapter_with_bridge.validate_generated_protocol(
+            context_token=_token(),
+            mapped_identity=None,
+            job_item_id=99,
+        )
+    rows = _audit_rows(adapter_with_bridge.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "UNMAPPED_CALLER"
+
+
+def test_validate_kill_switch_denies(
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+) -> None:
+    """Kill switch denies wallac.validate_generated_protocol."""
+    p = PolicyEngine(kill_switches=("wallac.validate_*",))
+    adapter = WallacAdapter(
+        policy_engine=p,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+    )
+    with pytest.raises(PolicyDenied):
+        adapter.validate_generated_protocol(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            job_item_id=99,
+        )
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert "kill_switch" in rows[0]["error"]["reason"]
+
+
+def test_validate_audit_hash_persisted(adapter_with_bridge: WallacAdapter) -> None:
+    """Audit records carry tool_args_hash on success path."""
+    adapter_with_bridge.validate_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        job_item_id=42,
+    )
+    rows = _audit_rows(adapter_with_bridge.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["tool_args_hash"] is not None
+    assert len(rows[0]["tool_args_hash"]) == 64
+    assert rows[0]["tool_name"] == "wallac.validate_generated_protocol"
+    assert rows[0]["policy_decision"] == "allow"
+
+
+def test_validate_bridge_called_with_correct_job_id(
+    adapter_with_bridge: WallacAdapter, stub_bridge_client: StubWallacBridgeClient
+) -> None:
+    """Bridge client receives the correct job_item_id."""
+    adapter_with_bridge.validate_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        job_item_id=123,
+    )
+    assert len(stub_bridge_client.calls) == 1
+    assert stub_bridge_client.calls[0]["job_item_id"] == 123
+
+
+def test_validate_invalid_report_propagates(
+    policy: PolicyEngine, audit: AuditStore, stub_client: StubWallacClient
+) -> None:
+    """Bridge returns invalid validation report — it propagates as a result."""
+    bridge = StubWallacBridgeClient(
+        validation_response={"valid": False, "errors": ["hash mismatch"]}
+    )
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=bridge,
+    )
+    result = adapter.validate_generated_protocol(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        job_item_id=99,
+    )
+    assert result.result["valid"] is False
+    assert "hash mismatch" in result.result["errors"]
+
+
+# ============================================================================
+# C19: prepare_submission_package
+# ============================================================================
+
+
+def test_prepare_submission_happy_path(adapter: WallacAdapter) -> None:
+    """Prepare an approval-ready submission package."""
+    spec = {"execution_mode": "generated_protocol", "method": {"name": "absorbance"}}
+    validation = {"valid": True, "checks": [{"name": "signature", "passed": True}]}
+    result = adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+        validation_report=validation,
+    )
+    assert result.tool_name == "wallac.prepare_submission_package"
+    pkg = result.result["submission_package"]
+    assert pkg["spec"] == spec
+    assert pkg["validation"] == validation
+    assert pkg["execution_blocked"] is True
+    assert "spec_hash" in pkg
+    assert "v1_notice" in pkg
+
+
+def test_prepare_submission_execution_blocked(adapter: WallacAdapter) -> None:
+    """Submission package explicitly states execution_blocked (acceptance #6)."""
+    result = adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"execution_mode": "generated_protocol"},
+    )
+    assert result.result["submission_package"]["execution_blocked"] is True
+    assert "v1.1" in result.result["submission_package"]["v1_notice"]
+
+
+def test_prepare_submission_without_validation(adapter: WallacAdapter) -> None:
+    """Submission package without validation report marks it not_validated."""
+    result = adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"execution_mode": "generated_protocol"},
+    )
+    pkg = result.result["submission_package"]
+    assert pkg["validation"]["valid"] is False
+    assert pkg["validation"]["reason"] == "not_validated"
+
+
+def test_prepare_submission_unmapped_caller_denies(adapter: WallacAdapter) -> None:
+    """Unmapped caller denies before computation."""
+    with pytest.raises(UnmappedCaller):
+        adapter.prepare_submission_package(
+            context_token=_token(),
+            mapped_identity=None,
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "UNMAPPED_CALLER"
+
+
+def test_prepare_submission_invalid_token_denies(adapter: WallacAdapter) -> None:
+    """Invalid token denies with audit."""
+    with pytest.raises(InvalidContextToken):
+        adapter.prepare_submission_package(
+            context_token="garbage",
+            mapped_identity=_identity(),
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["error"]["code"] == "INVALID_CONTEXT_TOKEN"
+
+
+def test_prepare_submission_kill_switch_denies(
+    policy: PolicyEngine, audit: AuditStore, stub_client: StubWallacClient
+) -> None:
+    """Kill switch denies wallac.prepare_submission_package."""
+    p = PolicyEngine(kill_switches=("wallac.prepare_*",))
+    adapter = WallacAdapter(policy_engine=p, audit_store=audit, client=stub_client)
+    with pytest.raises(PolicyDenied):
+        adapter.prepare_submission_package(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            protocol_spec={"execution_mode": "generated_protocol"},
+        )
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert "kill_switch" in rows[0]["error"]["reason"]
+
+
+def test_prepare_submission_audit_hash_persisted(adapter: WallacAdapter) -> None:
+    """Audit records carry tool_args_hash on success path."""
+    adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec={"execution_mode": "generated_protocol"},
+    )
+    rows = _audit_rows(adapter.audit_store)
+    assert len(rows) == 1
+    assert rows[0]["tool_args_hash"] is not None
+    assert len(rows[0]["tool_args_hash"]) == 64
+    assert rows[0]["tool_name"] == "wallac.prepare_submission_package"
+    assert rows[0]["policy_decision"] == "allow"
+
+
+def test_prepare_submission_spec_hash_deterministic(adapter: WallacAdapter) -> None:
+    """Same spec produces same hash in submission package."""
+    spec = {"execution_mode": "generated_protocol", "method": {"name": "absorbance"}}
+    r1 = adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    r2 = adapter.prepare_submission_package(
+        context_token=_token(),
+        mapped_identity=_identity(),
+        protocol_spec=spec,
+    )
+    assert (
+        r1.result["submission_package"]["spec_hash"]
+        == r2.result["submission_package"]["spec_hash"]
+    )
+
+
+# ============================================================================
+# C19: bridge client construction
+# ============================================================================
+
+
+def test_default_bridge_client_from_env_returns_none_when_unset(monkeypatch) -> None:
+    """No env vars → None (adapter will refuse validation calls)."""
+    monkeypatch.delenv("LAB_COPILOT_WALLAC_BRIDGE_URL", raising=False)
+    assert _default_bridge_client_from_env() is None
+
+
+def test_default_bridge_client_from_env_returns_client_when_set(monkeypatch) -> None:
+    """Env vars set → HttpWallacBridgeClient."""
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.local:8080")
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "bridge-secret")
+    client = _default_bridge_client_from_env()
+    assert client is not None
+    assert isinstance(client, HttpWallacBridgeClient)
+    assert client.base_url == "http://bridge.local:8080"
+    assert client.bearer_token == "bridge-secret"
+
+
+def test_http_bridge_client_requires_base_url() -> None:
+    """HttpWallacBridgeClient rejects empty base_url."""
+    with pytest.raises(ValueError, match="non-empty base_url"):
+        HttpWallacBridgeClient(base_url="")
+
+
+def test_stub_bridge_client_default_response() -> None:
+    """Stub bridge returns default valid response."""
+    stub = StubWallacBridgeClient()
+    result = stub.validate_protocol(job_item_id=1)
+    assert result["valid"] is True
+    assert len(stub.calls) == 1
+    health = stub.get_health()
+    assert health["status"] == "ok"
+
+
+# ============================================================================
+# C19: singleton with bridge client
+# ============================================================================
+
+
+def test_singleton_wires_bridge_client(monkeypatch) -> None:
+    """get_wallac_adapter() wires bridge_client from env."""
+    reset_wallac_adapter()
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.local:8080")
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "tok")
+    try:
+        adapter = get_wallac_adapter()
+        assert adapter.bridge_client is not None
+        assert isinstance(adapter.bridge_client, HttpWallacBridgeClient)
+    finally:
+        reset_wallac_adapter()
+
+
+def test_singleton_bridge_client_none_when_unset(monkeypatch) -> None:
+    """get_wallac_adapter() leaves bridge_client None when env unset."""
+    reset_wallac_adapter()
+    monkeypatch.delenv("LAB_COPILOT_WALLAC_BRIDGE_URL", raising=False)
+    try:
+        adapter = get_wallac_adapter()
+        assert adapter.bridge_client is None
+    finally:
+        reset_wallac_adapter()

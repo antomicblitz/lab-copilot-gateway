@@ -340,6 +340,11 @@ def create_app() -> FastAPI:
             "wallac": (
                 "configured" if wallac_adapter.client is not None else "not_configured"
             ),
+            "wallac_bridge": (
+                "configured"
+                if wallac_adapter.bridge_client is not None
+                else "not_configured"
+            ),
             "bentolab": "not_configured",
         }
         deps.update(_identity_backend_status(identity_mapper))
@@ -960,6 +965,58 @@ def create_app() -> FastAPI:
                     result = adapter.get_status(
                         context_token=body.context_token,
                         mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.propose_generated_protocol":
+                    result = adapter.propose_generated_protocol(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        protocol_spec=body.args.get("protocol_spec", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.validate_generated_protocol":
+                    result = adapter.validate_generated_protocol(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        job_item_id=int(body.args.get("job_item_id", 0)),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.prepare_submission_package":
+                    result = adapter.prepare_submission_package(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        protocol_spec=body.args.get("protocol_spec", {}),
+                        validation_report=body.args.get("validation_report"),
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
                         keycloak_subject=body.keycloak_subject,
