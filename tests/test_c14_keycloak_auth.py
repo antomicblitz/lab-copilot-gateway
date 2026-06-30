@@ -559,27 +559,14 @@ class TestDuplicateKeycloakSubject:
             elabftw_user_id="elab-1",
             elabftw_team_ids=["team-1"],
         )
-        # Same keycloak_subject, different librechat_user_id — should fail
-        # after C14 enforces uniqueness.  For now this test documents the
-        # desired behavior; the enforcement lands in Chunk 6.
-        # TODO(C14-chunk6): uncomment when uniqueness is enforced
-        # with pytest.raises(Exception):
-        #     mapper.upsert(
-        #         keycloak_subject="kc-dup",
-        #         librechat_user_id="lc-2",
-        #         elabftw_user_id="elab-2",
-        #         elabftw_team_ids=["team-2"],
-        #     )
-        # For now, just verify the mapper still works
-        mapper.upsert(
-            keycloak_subject="kc-dup",
-            librechat_user_id="lc-2",
-            elabftw_user_id="elab-2",
-            elabftw_team_ids=["team-2"],
-        )
-        # fetchone() returns the first match — nondeterministic
-        result = mapper.map(keycloak_subject="kc-dup")
-        assert result is not None
+        # Same keycloak_subject, different librechat_user_id — must be rejected.
+        with pytest.raises((ValueError, Exception)):
+            mapper.upsert(
+                keycloak_subject="kc-dup",
+                librechat_user_id="lc-2",
+                elabftw_user_id="elab-2",
+                elabftw_team_ids=["team-2"],
+            )
 
 
 class TestJwksCache:

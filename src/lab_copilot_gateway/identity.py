@@ -180,6 +180,23 @@ class DbIdentityMapper:
             # check_same_thread=False because we guard with our own lock.
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.executescript(_DB_SCHEMA_SQL)
+            # Enforce keycloak_subject uniqueness (C14 Chunk 6).
+            # If the index creation fails because pre-existing duplicate rows
+            # violate the UNIQUE constraint, raise a clear RuntimeError so
+            # the operator can resolve the conflict before the gateway starts.
+            try:
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_keycloak_subject_unique "
+                    "ON identity_mappings(keycloak_subject)"
+                )
+            except sqlite3.IntegrityError:
+                raise RuntimeError(
+                    "Duplicate keycloak_subject rows exist in "
+                    "identity_mappings.  Each keycloak_subject must be "
+                    "mapped to at most one librechat_user_id.  Resolve "
+                    "duplicates before starting the gateway."
+                ) from None
             self._conn.commit()
         return self._conn
 
@@ -191,9 +208,28 @@ class DbIdentityMapper:
         elabftw_user_id: str,
         elabftw_team_ids: list[str],
     ) -> None:
-        """Insert or replace a mapping row.  Used by tests and admin tooling."""
+        """Insert or replace a mapping row.  Used by tests and admin tooling.
+
+        Raises ValueError when *keycloak_subject* is already mapped to a
+        *different* *librechat_user_id* (C14 Chunk 6 — duplicate detection).
+        Upserting the same pair is idempotent (existing behaviour).
+        """
         conn = self._connect()
         with self._lock:
+            # Reject duplicate keycloak_subject with different librechat_user_id
+            # before the INSERT, so the caller gets a clear diagnostic instead
+            # of a generic constraint-violation error from the UNIQUE index.
+            existing = conn.execute(
+                "SELECT librechat_user_id FROM identity_mappings "
+                "WHERE keycloak_subject = ?",
+                (keycloak_subject,),
+            ).fetchone()
+            if existing is not None and existing[0] != librechat_user_id:
+                raise ValueError(
+                    f"duplicate keycloak_subject: {keycloak_subject!r} "
+                    f"is already mapped to librechat_user_id {existing[0]!r}; "
+                    f"cannot map to {librechat_user_id!r}"
+                )
             conn.execute(
                 """
                 INSERT INTO identity_mappings (
