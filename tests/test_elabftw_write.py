@@ -25,6 +25,7 @@ Additional coverage:
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 
 import pytest
 
@@ -43,6 +44,7 @@ from lab_copilot_gateway.elabftw import (
     StubElabftwClient,
     TOOL_NAME_AMEND,
     TOOL_NAME_DRAFT,
+    TOOL_NAME_EDIT_SECTION,
     mint_context_token,
 )
 from lab_copilot_gateway.identity import MappedIdentity
@@ -1053,3 +1055,236 @@ def test_wrap_amendment_on_empty_body_creates_section_only() -> None:
         "<p>only amendment</p>"
         "</section>"
     )
+
+
+# --- C35 direct-edit tests --------------------------------------------------
+
+
+def test_edit_section_replaces_body(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """C35 acceptance: approved edit_section replaces experiment body wholesale."""
+    old_body = "OLD BODY"
+    new_body = "NEW BODY"
+    old_hash = hashlib.sha256(old_body.encode()).hexdigest()
+    # Seed experiment 42 with the old body.
+    stub_client.seeds[42]["body"] = old_body
+
+    approval_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": new_body,
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+    result = write_adapter.edit_experiment_section(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    assert result.operation == "edit_section"
+    assert result.experiment_id == 42
+    assert stub_client.seeds[42]["body"] == new_body
+    assert audit.count() >= 1
+
+
+def test_edit_section_rejects_body_drift(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """C35: if body changed between approval and execution, reject with drift reason."""
+    original = "ORIGINAL"
+    old_hash = hashlib.sha256(original.encode()).hexdigest()
+    stub_client.seeds[42]["body"] = original
+
+    approval_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": "ATTEMPTED EDIT",
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+
+    # Mutate the body after approval was issued — simulates a concurrent edit.
+    stub_client.seeds[42]["body"] = "CHANGED BY SOMEONE ELSE"
+
+    with pytest.raises(ElabftwAdapterError) as exc_info:
+        write_adapter.edit_experiment_section(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert exc_info.value.reason == "body_drift_since_approval"
+    # Body was NOT patched — the concurrent edit is preserved.
+    assert stub_client.seeds[42]["body"] == "CHANGED BY SOMEONE ELSE"
+    # Approval WAS consumed (step 4, BEFORE drift check at step 6).
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.consumed_at is not None
+    # Audit row recorded the deny.
+    assert audit.count() >= 1
+
+
+def test_edit_section_rejects_locked_experiment(
+    write_adapter: ElabftwWriteAdapter,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """C35: direct-edit to a locked experiment raises AppendOnlyViolation."""
+    approval_args = {
+        "experiment_id": 99,
+        "old_body_hash": "dummy",
+        "new_body": "X",
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:99",
+    )
+    token = _token(_claims(experiment_id=99))
+
+    with pytest.raises(AppendOnlyViolation) as exc_info:
+        write_adapter.edit_experiment_section(
+            context_token=token,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert exc_info.value.experiment_id == 99
+    assert exc_info.value.locked is True
+    # Approval NOT consumed (deny-before-consume invariant).
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.consumed_at is None
+    assert audit.count() >= 1
+
+
+def test_edit_section_consumes_approval_first_call_then_replay_rejected(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """C35: first edit_section consumes approval; replay with same args raises already_consumed."""
+    old_body = "BODY"
+    new_body = "AFTER EDIT"
+    old_hash = hashlib.sha256(old_body.encode()).hexdigest()
+    stub_client.seeds[42]["body"] = old_body
+
+    approval_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": new_body,
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+
+    # First call — succeeds.
+    write_adapter.edit_experiment_section(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+    assert stub_client.seeds[42]["body"] == new_body
+
+    # Replay with the SAME approval_args — the approval is already consumed,
+    # so the consume step rejects before the drift check runs.
+    with pytest.raises(ElabftwAdapterError) as exc_info:
+        write_adapter.edit_experiment_section(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert "consum" in exc_info.value.reason
+
+
+def test_edit_section_writes_provenance(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """C35: after successful edit, metadata.extra_fields carries the audit id."""
+    old_body = "ORIG"
+    new_body = "EDITED"
+    old_hash = hashlib.sha256(old_body.encode()).hexdigest()
+    stub_client.seeds[42]["body"] = old_body
+
+    approval_args = {
+        "experiment_id": 42,
+        "old_body_hash": old_hash,
+        "new_body": new_body,
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+    result = write_adapter.edit_experiment_section(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    metadata = stub_client.seeds[42]["metadata"] or {}
+    extra_fields = metadata.get("extra_fields", {})
+    assert "lab_copilot_audit_action_id" in extra_fields
+    provenance_value = extra_fields["lab_copilot_audit_action_id"]["value"]
+    assert result.audit_action_id in provenance_value
+
+
+def test_edit_section_missing_old_body_hash_rejects(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """C35: old_body_hash is REQUIRED — missing/empty raises missing_old_body_hash."""
+    stub_client.seeds[42]["body"] = "WHATEVER"
+
+    approval_args = {
+        "experiment_id": 42,
+        "new_body": "X",
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_EDIT_SECTION,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+
+    with pytest.raises(ElabftwAdapterError) as exc_info:
+        write_adapter.edit_experiment_section(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+    assert exc_info.value.reason == "missing_old_body_hash"
+    # Body was NOT patched — the original seed body is preserved.
+    assert stub_client.seeds[42]["body"] == "WHATEVER"
+    # Audit row recorded the deny.
+    assert audit.count() >= 1

@@ -230,6 +230,14 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="append",
         description="Append an approved AI-generated amendment section and provenance to the user's experiment.",
     ),
+    Tool(
+        name="elabftw.edit_experiment_section",
+        tier=Tier.BOUNDED_WRITES,
+        adapter="elabftw",
+        requires_approval=True,
+        mutability="mutate",
+        description="Replace the body of the user's experiment with approved content (direct edit). Rollback via eLabFTW revision history; approval binds old_body_hash + new_body to prevent stale-edit clobbering.",
+    ),
     # --- OpenCloning computational design (no hardware) ------------------
     Tool(
         name="opencloning.parse_sequence_file",
