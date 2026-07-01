@@ -543,6 +543,9 @@ def fixture_opencloning() -> Plan:
     Example: "Design a cloning strategy for this insert."
     Risk tier: COMPUTATIONAL (formal change-set, artifact writeback).
     """
+    artifact_bytes = b"LOCUS       construct               5421 bp    DNA     circular SYN 01-JUL-2026\n//\n"
+    artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+
     return Plan(
         plan_id="plan-fixture-opencloning",
         intent="Design a cloning strategy for this insert",
@@ -573,9 +576,65 @@ def fixture_opencloning() -> Plan:
         ],
         artifacts=[
             {
+                "artifact_id": "oc-artifact-1",
+                "plan_id": "plan-fixture-opencloning",
                 "kind": "genbank",
+                "role": "final_product",
                 "filename": "construct.gb",
+                "mime_type": "chemical/x-genbank",
+                "size_bytes": len(artifact_bytes),
+                "sha256": artifact_sha256,
                 "description": "Gibson assembly product",
+                "sequence_summary": {
+                    "name": "construct",
+                    "length_bp": 5421,
+                    "circular": True,
+                    "feature_count": 12,
+                },
+                "warnings": [
+                    {
+                        "severity": "warning",
+                        "code": "missing_feature_annotation",
+                        "message": "Final product lacks a CDS annotation for the insert.",
+                    }
+                ],
+                "provenance": {
+                    "source_inputs": ["insert.gb", "vector.gb"],
+                    "opencloning_steps": [
+                        "Parsed 2 GenBank inputs",
+                        "Simulated Gibson assembly",
+                        "Produced 1 circular final construct",
+                    ],
+                    "source_count": 2,
+                    "sequence_count": 1,
+                },
+                "exports": [
+                    {
+                        "kind": "genbank",
+                        "artifact_id": "oc-artifact-1",
+                        "filename": "construct.gb",
+                    },
+                    {
+                        "kind": "fasta",
+                        "artifact_id": "oc-artifact-2",
+                        "filename": "construct.fasta",
+                    },
+                    {
+                        "kind": "opencloning_history_json",
+                        "artifact_id": "oc-artifact-3",
+                        "filename": "opencloning-history.json",
+                    },
+                ],
+                "opencloning_handoff": {
+                    "mode": "manual_import",
+                    "url": "/opencloning",
+                    "instructions": (
+                        "Open OpenCloning and load the cloning-history JSON "
+                        "from File > Load cloning history from file."
+                    ),
+                },
+                "download_url": "/__copilot/api/v1/artifacts/oc-artifact-1/download",
+                "writeback_eligible": True,
             },
         ],
         approval_required=True,

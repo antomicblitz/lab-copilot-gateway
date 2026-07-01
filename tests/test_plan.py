@@ -184,6 +184,33 @@ def test_fixture_opencloning_validates() -> None:
     assert validate_plan(fixture_opencloning()) == []
 
 
+def test_fixture_opencloning_has_v0_artifact_manifest() -> None:
+    """OpenCloning fixture exposes a compact v0 artifact manifest."""
+    plan = fixture_opencloning()
+
+    assert len(plan.artifacts) == 1
+    artifact = plan.artifacts[0]
+    assert artifact["artifact_id"] == "oc-artifact-1"
+    assert artifact["plan_id"] == plan.plan_id
+    assert artifact["role"] == "final_product"
+    assert artifact["kind"] == "genbank"
+    assert artifact["filename"] == "construct.gb"
+    assert artifact["mime_type"] == "chemical/x-genbank"
+    assert artifact["size_bytes"] > 0
+    assert len(artifact["sha256"]) == 64
+    assert artifact["sequence_summary"] == {
+        "name": "construct",
+        "length_bp": 5421,
+        "circular": True,
+        "feature_count": 12,
+    }
+    assert artifact["warnings"][0]["severity"] == "warning"
+    assert artifact["provenance"]["source_count"] == 2
+    assert artifact["opencloning_handoff"]["url"] == "/opencloning"
+    assert artifact["writeback_eligible"] is True
+    assert "artifact_content" not in artifact
+
+
 def test_fixture_hardware_validates() -> None:
     """fixture_hardware passes validation."""
     assert validate_plan(fixture_hardware()) == []
@@ -210,6 +237,34 @@ def test_all_fixtures_have_distinct_hashes() -> None:
         fixture_bentolab().hash(),
     }
     assert len(hashes) == 6
+
+
+def test_opencloning_fixture_artifact_manifest_changes_plan_hash() -> None:
+    """Artifact identity fields are approval-bound through the plan hash."""
+    plan = fixture_opencloning()
+    artifact = dict(plan.artifacts[0])
+
+    for field, value in (
+        ("filename", "construct-v2.gb"),
+        ("size_bytes", artifact["size_bytes"] + 1),
+        ("sha256", "0" * 64),
+    ):
+        modified_artifact = dict(artifact)
+        modified_artifact[field] = value
+        modified = Plan(
+            plan_id=plan.plan_id,
+            intent=plan.intent,
+            anchor=plan.anchor,
+            risk_tier=plan.risk_tier,
+            summary=plan.summary,
+            reads=plan.reads,
+            writes=plan.writes,
+            artifacts=[modified_artifact],
+            approval_required=plan.approval_required,
+            rollback=plan.rollback,
+        )
+
+        assert modified.hash() != plan.hash()
 
 
 # =============================================================================

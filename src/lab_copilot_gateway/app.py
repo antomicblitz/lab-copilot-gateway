@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import os
 import uuid as _uuid
+import hashlib
 from typing import Any
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from lab_copilot_gateway import __version__
@@ -25,15 +26,25 @@ from lab_copilot_gateway.auth import (
     verified_principal,
 )
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
+from lab_copilot_gateway.artifact_bundle import (
+    ArtifactContextMismatch,
+    ArtifactExpired,
+    ArtifactHashMismatch,
+    ArtifactMissing,
+    ArtifactSizeMismatch,
+    get_artifact_bundle_store,
+)
 from lab_copilot_gateway.config import (
     KILL_SWITCH_CATEGORY_NAMES,
     get_public_config,
 )
 from lab_copilot_gateway.elabftw import (
     ElabftwAdapterError,
+    InvalidContextToken,
     mint_token_for_identity,
     get_elabftw_read_adapter,
     get_elabftw_write_adapter,
+    verify_context_token,
 )
 from lab_copilot_gateway.bentolab import (
     BentoLabAdapterError,
@@ -41,8 +52,10 @@ from lab_copilot_gateway.bentolab import (
 )
 from lab_copilot_gateway.opencloning import (
     OpenCloningAdapterError,
+    OpenCloningResult,
     get_opencloning_adapter,
 )
+from lab_copilot_gateway.opencloning_artifacts import normalize_opencloning_artifacts
 from lab_copilot_gateway.wallac import (
     WallacAdapterError,
     get_wallac_adapter,
@@ -357,6 +370,45 @@ def _approval_backend_status(store: ApprovalStore) -> dict[str, str]:
     }
 
 
+def _download_filename(filename: str) -> str:
+    """Return a conservative Content-Disposition filename."""
+    safe = filename.replace("/", "_").replace("\\", "_").replace('"', "_")
+    return safe or "artifact.bin"
+
+
+def _redact_opencloning_file_content(value: Any) -> Any:
+    """Replace OpenCloning file_content payloads with hash/size metadata."""
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "file_content" and isinstance(item, str):
+                raw = item.encode("utf-8")
+                redacted[key] = {
+                    "redacted": True,
+                    "size_bytes": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            else:
+                redacted[key] = _redact_opencloning_file_content(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_opencloning_file_content(item) for item in value]
+    return value
+
+
+_ARTIFACT_MANIFEST_RESERVED_KEYS = {
+    "artifact_id",
+    "plan_id",
+    "plan_hash",
+    "filename",
+    "mime_type",
+    "size_bytes",
+    "sha256",
+    "created_at",
+    "expires_at",
+}
+
+
 def create_app() -> FastAPI:
     """Create the ASGI application."""
     service_name = "lab-copilot-gateway"
@@ -376,6 +428,7 @@ def create_app() -> FastAPI:
     get_elabftw_write_adapter()
     opencloning_adapter = get_opencloning_adapter()
     wallac_adapter = get_wallac_adapter()
+    artifact_store = get_artifact_bundle_store()
 
     # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
     # origins when browser-based calls are introduced.
@@ -444,6 +497,165 @@ def create_app() -> FastAPI:
     @api.get("/tools")
     def tools() -> dict[str, list[dict[str, object]]]:
         return {"tools": list_tools()}
+
+    @api.get("/v1/artifacts/{artifact_id}/download")
+    def download_artifact(
+        artifact_id: str,
+        plan_id: str,
+        plan_hash: str,
+        artifact_sha256: str | None = None,
+        artifact_size_bytes: int | None = None,
+        context_token: str = Header("", alias="X-Lab-Copilot-Context-Token"),
+        principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
+    ) -> Response:
+        """Download an approved-preview OpenCloning artifact by manifest identity.
+
+        The browser must call this route through the same-origin copilot proxy
+        and include the short-lived context token header.  Artifact bytes remain
+        process-local and are resolved by ``plan_id`` + ``plan_hash`` +
+        ``artifact_id`` so stale chat cards fail closed.
+        """
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            raise HTTPException(
+                status_code=401,
+                detail={"reason": "invalid_context_token", "message": exc.detail},
+            ) from exc
+
+        binding = {
+            "record_type": claims.record_type,
+            "record_id": str(claims.experiment_id),
+            "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
+        }
+        if not artifact_sha256 or artifact_size_bytes is None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "reason": "missing_artifact_identity",
+                    "message": "artifact_sha256 and artifact_size_bytes are required",
+                },
+            )
+        try:
+            artifact = artifact_store.get(
+                plan_id=plan_id,
+                plan_hash=plan_hash,
+                artifact_id=artifact_id,
+                expected_sha256=artifact_sha256,
+                expected_size_bytes=artifact_size_bytes,
+                binding=binding,
+            )
+        except ArtifactExpired as exc:
+            raise HTTPException(
+                status_code=410,
+                detail={"reason": "artifact_expired", "message": str(exc)},
+            ) from exc
+        except ArtifactMissing as exc:
+            raise HTTPException(
+                status_code=404,
+                detail={"reason": "artifact_missing", "message": str(exc)},
+            ) from exc
+        except ArtifactContextMismatch as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={"reason": "artifact_context_mismatch", "message": str(exc)},
+            ) from exc
+        except (ArtifactHashMismatch, ArtifactSizeMismatch) as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "artifact_identity_mismatch", "message": str(exc)},
+            ) from exc
+
+        filename = _download_filename(artifact.filename)
+        return Response(
+            content=artifact.bytes_data,
+            media_type=artifact.mime_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+                "X-Lab-Copilot-Artifact-Sha256": artifact.sha256,
+            },
+        )
+
+    def _opencloning_invoke_success(
+        *,
+        tool_name: str,
+        result: OpenCloningResult,
+        context_token: str,
+        request_id: str | None,
+    ) -> dict[str, object]:
+        """Return OpenCloning /invoke output without raw sequence bytes."""
+        raw = result.to_dict()
+        raw_result = (
+            raw.get("result", {}) if isinstance(raw.get("result"), dict) else {}
+        )
+        plan_id = f"invoke-{request_id or result.audit_action_id}"
+        plan_hash = compute_args_hash(
+            {"tool_name": tool_name, "audit_action_id": result.audit_action_id}
+        )
+        normalized = normalize_opencloning_artifacts(
+            raw_result,
+            plan_id=plan_id,
+            plan_hash=plan_hash,
+            operation_label=tool_name,
+        )
+
+        binding: dict[str, object] = {}
+        try:
+            claims = verify_context_token(context_token)
+            binding = {
+                "record_type": claims.record_type,
+                "record_id": str(claims.experiment_id),
+                "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
+            }
+        except InvalidContextToken:
+            # The adapter already verified the token before returning success.
+            # If this defensive re-verify fails, keep manifests but skip storing
+            # downloadable bytes rather than creating an unbound artifact.
+            binding = {}
+
+        manifests: list[dict[str, object]] = []
+        for artifact in normalized.artifacts:
+            artifact_id = str(artifact.get("artifact_id") or "")
+            data = normalized.artifact_bytes.get(artifact_id)
+            if not artifact_id or data is None or not binding:
+                manifests.append(artifact)
+                continue
+            extra = {
+                key: value
+                for key, value in artifact.items()
+                if key not in _ARTIFACT_MANIFEST_RESERVED_KEYS
+            }
+            manifests.append(
+                artifact_store.put(
+                    plan_id=plan_id,
+                    plan_hash=plan_hash,
+                    artifact_id=artifact_id,
+                    filename=str(artifact.get("filename") or "artifact.bin"),
+                    mime_type=str(
+                        artifact.get("mime_type") or "application/octet-stream"
+                    ),
+                    data=data,
+                    binding=binding,
+                    manifest_extra=extra,
+                )
+            )
+
+        artifact_payload = normalized.to_event_payload()
+        artifact_payload.update(
+            {
+                "type": "lab_copilot_opencloning_artifacts",
+                "plan_id": plan_id,
+                "plan_hash": plan_hash,
+                "artifacts": manifests,
+            }
+        )
+        return {
+            "ok": True,
+            "tool_name": tool_name,
+            "result": _redact_opencloning_file_content(raw),
+            "opencloning_artifacts": artifact_payload,
+        }
 
     @api.post("/audit")
     def append_audit(
@@ -1064,11 +1276,12 @@ def create_app() -> FastAPI:
                         provider=body.provider,
                         model_id=body.model_id,
                     )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
+                    return _opencloning_invoke_success(
+                        tool_name=tool.name,
+                        result=result,
+                        context_token=body.context_token,
+                        request_id=body.request_id,
+                    )
                 elif tool.name == "opencloning.manual_sequence":
                     result = adapter.manual_sequence(
                         context_token=body.context_token,
@@ -1082,11 +1295,12 @@ def create_app() -> FastAPI:
                         provider=body.provider,
                         model_id=body.model_id,
                     )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
+                    return _opencloning_invoke_success(
+                        tool_name=tool.name,
+                        result=result,
+                        context_token=body.context_token,
+                        request_id=body.request_id,
+                    )
                 elif tool.name == "opencloning.oligo_hybridization":
                     result = adapter.oligo_hybridization(
                         context_token=body.context_token,
@@ -1101,11 +1315,12 @@ def create_app() -> FastAPI:
                         provider=body.provider,
                         model_id=body.model_id,
                     )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
+                    return _opencloning_invoke_success(
+                        tool_name=tool.name,
+                        result=result,
+                        context_token=body.context_token,
+                        request_id=body.request_id,
+                    )
                 elif tool.name == "opencloning.simulate_assembly":
                     result = adapter.simulate_assembly(
                         context_token=body.context_token,
@@ -1121,11 +1336,12 @@ def create_app() -> FastAPI:
                         provider=body.provider,
                         model_id=body.model_id,
                     )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
+                    return _opencloning_invoke_success(
+                        tool_name=tool.name,
+                        result=result,
+                        context_token=body.context_token,
+                        request_id=body.request_id,
+                    )
                 elif tool.name == "opencloning.writeback_artifact":
                     result = adapter.writeback_artifact(
                         context_token=body.context_token,
