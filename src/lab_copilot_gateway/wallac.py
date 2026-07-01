@@ -116,6 +116,18 @@ class WallacClient(Protocol):
         """
         ...
 
+    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Generic vm-agent API call.
+
+        Covers all vm-agent REST endpoints: /health, /status, /instrument,
+        /protocols, /runs, /runs/{id}, /runs/{id}/results, /runs/{id}/export,
+        /jobs, /jobs/{id}, /jobs/{id}/results, /jobs/{id}/export, /admin/reconnect.
+
+        For POST /runs with dry_run=true, the gateway forces dry_run=true
+        to prevent unapproved hardware execution.
+        """
+        ...
+
 
 @dataclass
 class StubWallacClient:
@@ -141,12 +153,22 @@ class StubWallacClient:
     )
     error: Exception | None = None
     calls: list[dict[str, Any]] = field(default_factory=list)
+    call_responses: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def get_status(self) -> dict[str, Any]:
         self.calls.append({"method": "get_status"})
         if self.error is not None:
             raise self.error
         return dict(self.status_response)
+
+    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        key = f"{method.upper()} {endpoint}"
+        self.calls.append({"method": "call", "args": {"method": method, "endpoint": endpoint, "body": body}})
+        if self.error is not None:
+            raise self.error
+        if key in self.call_responses:
+            return dict(self.call_responses[key])
+        return {"ok": True, "method": method, "endpoint": endpoint, "stub": True}
 
 
 @dataclass
@@ -184,6 +206,32 @@ class HttpWallacClient:
         resp = s.get(url, timeout=self.timeout_seconds)
         resp.raise_for_status()
         return resp.json()
+
+    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Generic vm-agent API call.
+
+        ``method`` is GET or POST.  ``endpoint`` is a path like
+        ``/protocols`` or ``/runs/r-abc123/results``.  ``body`` is the
+        JSON body for POST requests.
+
+        For POST /runs, the gateway adapter forces ``dry_run=true`` to
+        prevent unapproved hardware execution (the ``wallac.call`` tool
+        is tier VALIDATION_DRY_RUN).
+        """
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        s = self._connect()
+        if method.upper() == "GET":
+            resp = s.get(url, timeout=self.timeout_seconds)
+        elif method.upper() == "POST":
+            resp = s.post(url, json=body or {}, timeout=self.timeout_seconds)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+        resp.raise_for_status()
+        # Some endpoints return CSV (text/csv), not JSON.
+        content_type = resp.headers.get("content-type", "")
+        if "json" in content_type:
+            return resp.json()
+        return {"content": resp.text, "content_type": content_type}
 
 
 # --- C19: Wallac bridge client (designer/validation) -----------------------
@@ -383,6 +431,7 @@ class WallacResult:
 
 # Tool name from the C06 registry.
 TOOL_GET_STATUS = "wallac.get_status"
+TOOL_CALL = "wallac.call"
 TOOL_PROPOSE = "wallac.propose_generated_protocol"
 TOOL_VALIDATE = "wallac.validate_generated_protocol"
 TOOL_PREPARE_SUBMISSION = "wallac.prepare_submission_package"
@@ -455,6 +504,64 @@ class WallacAdapter:
             args_for_hash={"tool": "get_status"},
             api_call_summary={"method": "GET", "path": "/status"},
             exec_fn=lambda _client: _client.get_status(),
+        )
+
+    # --- generic vm-agent API call (like opencloning.call) ----------------
+
+    def call(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        method: str,
+        endpoint: str,
+        body: dict[str, Any] | None = None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Generic vm-agent API call.
+
+        Covers all vm-agent REST endpoints: /health, /status, /instrument,
+        /protocols, /runs, /runs/{id}, /runs/{id}/results, /jobs, /jobs/{id},
+        /jobs/{id}/results, etc.
+
+        For POST /runs, the adapter forces ``dry_run=true`` to prevent
+        unapproved hardware execution (this tool is tier VALIDATION_DRY_RUN).
+        Real hardware execution requires ``wallac.submit_generated_protocol``
+        (tier HARDWARE_EXECUTION, requires approval).
+        """
+        method_upper = method.upper()
+        endpoint_clean = endpoint.lstrip("/")
+
+        # Safety: force dry_run=true for POST /runs to prevent unapproved
+        # hardware execution through this read-only tool.
+        effective_body = dict(body) if body else {}
+        if method_upper == "POST" and endpoint_clean.startswith("runs"):
+            effective_body["dry_run"] = True
+
+        return self._execute(
+            tool_name=TOOL_CALL,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={
+                "tool": "call",
+                "method": method_upper,
+                "endpoint": endpoint_clean,
+                "body": effective_body,
+            },
+            api_call_summary={"method": method_upper, "path": f"/{endpoint_clean}"},
+            exec_fn=lambda _client: _client.call(method_upper, endpoint_clean, effective_body),
+            tier_override=TOOL_TIER_C19,
         )
 
     # --- C19 tools: proposal / validation / submission package -----------

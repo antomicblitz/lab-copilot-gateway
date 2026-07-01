@@ -305,6 +305,23 @@ _CATALOG: tuple[Tool, ...] = (
         description="Read Wallac Victor2 service and current job status.",
     ),
     Tool(
+        name="wallac.call",
+        tier=Tier.VALIDATION_DRY_RUN,
+        adapter="wallac",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Call any Wallac Victor2 vm-agent API endpoint. Covers: "
+            "GET /health, /status, /instrument, /protocols, /runs/{id}, "
+            "/runs/{id}/results, /jobs, /jobs/{id}, /jobs/{id}/results, "
+            "/jobs/{id}/export. "
+            "POST /runs (forces dry_run=true — use "
+            "wallac.submit_generated_protocol for real hardware execution). "
+            "Args: method (GET or POST), endpoint (e.g. '/protocols'), "
+            "body (dict, for POST only)."
+        ),
+    ),
+    Tool(
         name="wallac.propose_generated_protocol",
         tier=Tier.VALIDATION_DRY_RUN,
         adapter="wallac",

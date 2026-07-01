@@ -1415,6 +1415,25 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": result.to_dict(),
                     }
+                elif tool.name == "wallac.call":
+                    result = adapter.call(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        method=body.args.get("method", "GET"),
+                        endpoint=body.args.get("endpoint", "/status"),
+                        body=body.args.get("body"),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
                 elif tool.name == "wallac.propose_generated_protocol":
                     result = adapter.propose_generated_protocol(
                         context_token=body.context_token,

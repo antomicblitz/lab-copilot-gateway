@@ -59,6 +59,7 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "opencloning.writeback_artifact",
         "opencloning.call",
         "wallac.get_status",
+        "wallac.call",
         "wallac.propose_generated_protocol",
         "wallac.validate_generated_protocol",
         "wallac.prepare_submission_package",
@@ -68,7 +69,7 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "bentolab.dry_run_pcr_profile",
         "bentolab.submit_pcr_run",
     }
-    assert len(catalog) == 21  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(catalog) == 22  # noqa: PLR2004 — V1 catalog size is a contract
     assert names == expected
 
 
@@ -489,5 +490,5 @@ def test_default_registry_is_the_v1_catalog() -> None:
     """The default registry is built from the curated _CATALOG tuple (13 tools)."""
     reset_tool_registry()
     reg = get_tool_registry()
-    assert len(reg.list()) == 21  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(reg.list()) == 22  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()
