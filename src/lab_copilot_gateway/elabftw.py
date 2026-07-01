@@ -169,6 +169,7 @@ class ContextTokenClaims:
     librechat_user_id: str | None
     issued_at: str  # ISO8601 UTC
     expires_at: str  # ISO8601 UTC
+    record_type: str = "experiment"  # "experiment" or "resource" (database item)
 
 
 def _canonical_claims(claims: ContextTokenClaims) -> bytes:
@@ -180,6 +181,7 @@ def _canonical_claims(claims: ContextTokenClaims) -> bytes:
         "librechat_user_id": claims.librechat_user_id,
         "issued_at": claims.issued_at,
         "expires_at": claims.expires_at,
+        "record_type": claims.record_type,
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -207,6 +209,7 @@ def mint_token_for_identity(
     librechat_user_id: str | None,
     ttl_seconds: int | None = None,
     secret: bytes | None = None,
+    record_type: str = "experiment",
 ) -> tuple[str, str]:
     """Mint a context token bound to one experiment + one mapped user.
 
@@ -245,6 +248,7 @@ def mint_token_for_identity(
         librechat_user_id=librechat_user_id,
         issued_at=issued_at,
         expires_at=expires_at,
+        record_type=record_type,
     )
     token = mint_context_token(claims, secret=secret)
     return token, expires_at
@@ -319,6 +323,7 @@ def verify_context_token(
         librechat_user_id=payload.get("librechat_user_id"),
         issued_at=issued_at,
         expires_at=expires_at,
+        record_type=str(payload.get("record_type", "experiment")),
     )
 
 
@@ -403,6 +408,10 @@ class ElabftwClient(Protocol):
         """
         ...
 
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        """Return one database resource item by id, or raise on error."""
+        ...
+
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -473,6 +482,11 @@ class StubElabftwClient:
         if experiment_id not in self.seeds:
             raise KeyError(f"experiment {experiment_id} not found in stub")
         return dict(self.seeds[experiment_id])
+
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        if item_id not in self.seeds:
+            raise KeyError(f"item {item_id} not found in stub")
+        return dict(self.seeds[item_id])
 
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0
@@ -572,6 +586,14 @@ class HttpElabftwClient:
 
     def get_experiment(self, experiment_id: int) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}/api/v2/experiments/{int(experiment_id)}"
+        s = self._connect()
+        resp = s.get(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_item(self, item_id: int) -> dict[str, Any]:
+        """GET /api/v2/items/{id} — read a database resource item."""
+        url = f"{self.base_url.rstrip('/')}/api/v2/items/{int(item_id)}"
         s = self._connect()
         resp = s.get(url, timeout=self.timeout_seconds)
         resp.raise_for_status()
@@ -1012,11 +1034,13 @@ class ElabftwReadAdapter:
                 message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
             )
 
-        # 6. Make the call.  Wrap any downstream failure in an
-        # ElabftwAdapterError after the audit record persists so the HTTP
-        # endpoint returns the documented {ok:false, reason, message} shape.
+        # 6. Make the call.  Dispatch to the right endpoint based on
+        # record_type: "resource" → /api/v2/items/{id}, default → /api/v2/experiments/{id}.
         try:
-            payload = self.client.get_experiment(claims.experiment_id)
+            if claims.record_type == "resource":
+                payload = self.client.get_item(claims.experiment_id)
+            else:
+                payload = self.client.get_experiment(claims.experiment_id)
         except Exception as exc:
             self._audit(
                 policy_decision="allow",

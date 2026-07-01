@@ -193,6 +193,7 @@ class ElabftwMintBody(BaseModel):
     keycloak_subject: str | None = None
     librechat_user_id: str | None = None
     requested_ttl_seconds: int | None = None
+    record_type: str = "experiment"  # "experiment" or "resource" (database item)
 
 
 class ElabftwDraftBody(BaseModel):
@@ -704,6 +705,7 @@ def create_app() -> FastAPI:
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
             ttl_seconds=body.requested_ttl_seconds,
+            record_type=body.record_type,
         )
         return {
             "ok": True,
