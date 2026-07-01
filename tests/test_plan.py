@@ -15,6 +15,7 @@ from lab_copilot_gateway.plan import (
     compute_plan_hash,
     fixture_autonomous,
     fixture_batch_edit,
+    fixture_bentolab,
     fixture_hardware,
     fixture_opencloning,
     fixture_simple_edit,
@@ -193,6 +194,11 @@ def test_fixture_autonomous_validates() -> None:
     assert validate_plan(fixture_autonomous()) == []
 
 
+def test_fixture_bentolab_validates() -> None:
+    """fixture_bentolab passes validation (C43)."""
+    assert validate_plan(fixture_bentolab()) == []
+
+
 def test_all_fixtures_have_distinct_hashes() -> None:
     """No two fixtures share the same hash."""
     hashes = {
@@ -201,8 +207,9 @@ def test_all_fixtures_have_distinct_hashes() -> None:
         fixture_opencloning().hash(),
         fixture_hardware().hash(),
         fixture_autonomous().hash(),
+        fixture_bentolab().hash(),
     }
-    assert len(hashes) == 5
+    assert len(hashes) == 6
 
 
 # =============================================================================

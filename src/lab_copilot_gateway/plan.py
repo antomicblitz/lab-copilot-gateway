@@ -474,7 +474,66 @@ def fixture_batch_edit() -> Plan:
         ],
         artifacts=[],
         approval_required=True,
-        rollback="eLabFTW revision history per record",
+        rollback="eLabFTW revision history",
+    )
+
+
+def fixture_bentolab() -> Plan:
+    """A hardware execution plan for BentoLab PCR (C43).
+
+    Example: "Run this PCR protocol on BentoLab."
+    Risk tier: HARDWARE (preflight + lock + abort + strong approval).
+
+    The plan includes preflight reads (status + validate + dry-run) before
+    the write step (submit_pcr_run).  Execution remains blocked by policy
+    in V1 (tier 5 denied by default).
+    """
+    return Plan(
+        plan_id="plan-fixture-bentolab",
+        intent="Run this PCR protocol on BentoLab",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "400",
+        },
+        risk_tier=PlanRiskTier.HARDWARE,
+        summary="Validate profile, dry-run, submit PCR run on BentoLab.",
+        reads=[
+            PlanStep(
+                tool_name="bentolab.get_status",
+            ),
+            PlanStep(
+                tool_name="bentolab.validate_pcr_profile",
+                args={
+                    "profile": {
+                        "initial_denaturation": {"temperature": 95, "duration": 30}
+                    }
+                },
+            ),
+            PlanStep(
+                tool_name="bentolab.dry_run_pcr_profile",
+                args={
+                    "profile": {
+                        "initial_denaturation": {"temperature": 95, "duration": 30}
+                    }
+                },
+            ),
+        ],
+        writes=[
+            PlanStep(
+                tool_name="bentolab.submit_pcr_run",
+                record_id="elabftw:experiment:400",
+                args={
+                    "profile": {
+                        "initial_denaturation": {"temperature": 95, "duration": 30}
+                    }
+                },
+                preview_type="summary",
+            ),
+        ],
+        artifacts=[],
+        approval_required=True,
+        rollback="Abort via BentoLab HTTP API kill switch; results are non-reversible",
     )
 
 
