@@ -48,6 +48,32 @@ def get_kill_switch_categories() -> dict[str, bool]:
     }
 
 
+def is_autonomy_enabled() -> bool:
+    """Whether autonomous execution is enabled (admin-controlled, C29).
+
+    When True, the policy engine allows tier-6 (CLOSED_LOOP_AUTONOMY)
+    requests for mapped callers without per-action approval, subject to
+    kill switches and budget limits.
+    """
+    return os.getenv("LAB_COPILOT_AUTONOMY_ENABLED", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def get_autonomy_max_steps() -> int:
+    """Maximum total steps (reads + writes) in an autonomous plan (C29).
+
+    Budget enforcement prevents runaway autonomous plans from executing
+    unbounded work.  Default is 10 steps.
+    """
+    try:
+        return max(1, int(os.getenv("LAB_COPILOT_AUTONOMY_MAX_STEPS", "10")))
+    except ValueError:
+        return 10
+
+
 def get_public_config(*, service_name: str, version: str) -> dict[str, object]:
     """Return config safe to expose to authenticated clients."""
     return {
@@ -56,5 +82,5 @@ def get_public_config(*, service_name: str, version: str) -> dict[str, object]:
         "environment": os.getenv("LAB_COPILOT_ENV", "local"),
         "approvals_required_for_mutations": True,
         "hardware_execution_enabled": False,
-        "autonomous_execution_enabled": False,
+        "autonomous_execution_enabled": is_autonomy_enabled(),
     }

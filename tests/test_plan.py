@@ -13,6 +13,7 @@ from lab_copilot_gateway.plan import (
     PlanValidationError,
     USER_VISIBLE_FIELDS,
     compute_plan_hash,
+    fixture_autonomous,
     fixture_batch_edit,
     fixture_hardware,
     fixture_opencloning,
@@ -187,6 +188,11 @@ def test_fixture_hardware_validates() -> None:
     assert validate_plan(fixture_hardware()) == []
 
 
+def test_fixture_autonomous_validates() -> None:
+    """fixture_autonomous passes validation (C29)."""
+    assert validate_plan(fixture_autonomous()) == []
+
+
 def test_all_fixtures_have_distinct_hashes() -> None:
     """No two fixtures share the same hash."""
     hashes = {
@@ -194,8 +200,9 @@ def test_all_fixtures_have_distinct_hashes() -> None:
         fixture_batch_edit().hash(),
         fixture_opencloning().hash(),
         fixture_hardware().hash(),
+        fixture_autonomous().hash(),
     }
-    assert len(hashes) == 4
+    assert len(hashes) == 5
 
 
 # =============================================================================

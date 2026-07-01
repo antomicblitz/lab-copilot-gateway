@@ -564,3 +564,43 @@ def fixture_hardware() -> Plan:
         approval_required=True,
         rollback="Abort via hardware kill switch; results are non-reversible",
     )
+
+
+def fixture_autonomous() -> Plan:
+    """An autonomous execution plan (C29).
+
+    Example: "Monitor cell growth — read instrument status and log to eLabFTW."
+    Risk tier: AUTONOMOUS (strong execution, bounded by budget + kill switches).
+
+    When autonomy is enabled (``LAB_COPILOT_AUTONOMY_ENABLED=1``), the plan
+    executor skips the plan-level approval consume for this tier.  All other
+    safety checks (body drift, append-only, audit) remain enforced.
+    """
+
+    return Plan(
+        plan_id="plan-fixture-autonomous",
+        intent="Monitor cell growth — read instrument status and log to eLabFTW",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "500",
+        },
+        risk_tier=PlanRiskTier.AUTONOMOUS,
+        summary="Read Wallac status and append reading to experiment body.",
+        reads=[
+            PlanStep(
+                tool_name="wallac.get_status",
+            ),
+        ],
+        writes=[
+            PlanStep(
+                tool_name="elabftw.edit_experiment_section",
+                record_id="elabftw:experiment:500",
+                args={"old_body_hash": "hash500", "new_body": "<p>reading logged</p>"},
+                preview_type="diff",
+            ),
+        ],
+        artifacts=[],
+        approval_required=True,
+        rollback="eLabFTW revision history",
+    )

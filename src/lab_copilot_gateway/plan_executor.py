@@ -52,6 +52,7 @@ from lab_copilot_gateway.opencloning import (
 )
 from lab_copilot_gateway.plan import (
     Plan,
+    PlanRiskTier,
     PlanStep,
     PlanValidationError,
     compute_plan_hash,
@@ -183,7 +184,7 @@ class PlanExecutor:
         self,
         plan: Plan,
         *,
-        approval_id: str,
+        approval_id: str | None = None,
         context_token: str,
         mapped_identity: MappedIdentity | None,
         conversation_id: str | None = None,
@@ -197,6 +198,13 @@ class PlanExecutor:
 
         Returns a ``PlanExecutionResult`` — never raises (all errors are
         captured as step results or in the result status).
+
+        C29: When the plan's risk tier is AUTONOMOUS and autonomy is
+        enabled (``LAB_COPILOT_AUTONOMY_ENABLED=1``), the plan-level
+        approval consume is skipped and a synthetic ``plan_approval_id``
+        (``"autonomous:{plan_id}"``) is used for write-step audit records.
+        Budget enforcement (``LAB_COPILOT_AUTONOMY_MAX_STEPS``) limits
+        the total number of steps.
         """
         plan_hash = compute_plan_hash(plan)
 
@@ -212,22 +220,65 @@ class PlanExecutor:
                 summary=f"Plan validation failed: {'; '.join(exc.errors)}",
             )
 
+        # C29: Determine whether autonomy bypass applies.
+        from lab_copilot_gateway.config import (
+            get_autonomy_max_steps,
+            is_autonomy_enabled,
+        )
+
+        autonomy_active = (
+            plan.risk_tier == PlanRiskTier.AUTONOMOUS and is_autonomy_enabled()
+        )
+
+        # C29: Budget check for autonomous plans.
+        if autonomy_active:
+            max_steps = get_autonomy_max_steps()
+            total_steps = len(plan.reads) + len(plan.writes)
+            if total_steps > max_steps:
+                return PlanExecutionResult(
+                    plan_id=plan.plan_id,
+                    plan_hash=plan_hash,
+                    status="rejected",
+                    step_results=[],
+                    summary=(
+                        f"Autonomous plan exceeds budget: {total_steps} steps "
+                        f"> {max_steps} max (LAB_COPILOT_AUTONOMY_MAX_STEPS)"
+                    ),
+                )
+
+        # C29: Determine the effective plan_approval_id for write steps.
+        # When autonomy is active, use a synthetic ID and skip approval consume.
+        if autonomy_active:
+            effective_approval_id = f"autonomous:{plan.plan_id}"
+        else:
+            effective_approval_id = approval_id
+
         # 2. Consume the plan-level approval (bound to plan hash).
-        try:
-            self.approval_store.consume(
-                approval_id,
-                tool_name="plan.execute",
-                args_hash=plan_hash,
-                target_record=f"plan:{plan.plan_id}",
-            )
-        except Exception as exc:
-            return PlanExecutionResult(
-                plan_id=plan.plan_id,
-                plan_hash=plan_hash,
-                status="rejected",
-                step_results=[],
-                summary=f"Approval consume failed: {exc}",
-            )
+        # C29: Skip when autonomy bypass is active.
+        if not autonomy_active:
+            if not effective_approval_id:
+                return PlanExecutionResult(
+                    plan_id=plan.plan_id,
+                    plan_hash=plan_hash,
+                    status="rejected",
+                    step_results=[],
+                    summary="Approval required but no approval_id provided",
+                )
+            try:
+                self.approval_store.consume(
+                    effective_approval_id,
+                    tool_name="plan.execute",
+                    args_hash=plan_hash,
+                    target_record=f"plan:{plan.plan_id}",
+                )
+            except Exception as exc:
+                return PlanExecutionResult(
+                    plan_id=plan.plan_id,
+                    plan_hash=plan_hash,
+                    status="rejected",
+                    step_results=[],
+                    summary=f"Approval consume failed: {exc}",
+                )
 
         # 3. Execute steps.
         step_results: list[StepResult] = []
@@ -267,7 +318,7 @@ class PlanExecutor:
                     result = self._execute_write(
                         step=step,
                         context_token=context_token,
-                        plan_approval_id=approval_id,
+                        plan_approval_id=effective_approval_id,
                         mapped_identity=mapped_identity,
                         conversation_id=conversation_id,
                         request_id=request_id,
