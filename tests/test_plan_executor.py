@@ -21,6 +21,10 @@ from lab_copilot_gateway.elabftw import (
     StubElabftwClient,
     mint_context_token,
 )
+from lab_copilot_gateway.bentolab import (
+    BentoLabAdapter,
+    StubBentoLabClient,
+)
 from lab_copilot_gateway.opencloning import (
     OpenCloningAdapter,
     StubOpenCloningClient,
@@ -1466,4 +1470,202 @@ def test_wallac_plan_reads_only() -> None:
 
     assert result.status == "completed"
     assert len(result.step_results) == 2
+    assert all(r.status == "success" for r in result.step_results)
+
+
+# =============================================================================
+# C43 — BentoLab plan/readiness integration
+# =============================================================================
+
+
+def _bentolab_plan() -> Plan:
+    """A hardware-tier BentoLab plan for C43 tests."""
+    profile = {"initial_denaturation": {"temperature": 95, "duration": 30}}
+    return Plan(
+        plan_id="plan-test-bentolab",
+        intent="Run PCR protocol on BentoLab with preflight",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "400",
+        },
+        risk_tier=PlanRiskTier.HARDWARE,
+        summary="Check status, validate profile, dry-run, submit PCR run.",
+        reads=[
+            PlanStep(tool_name="bentolab.get_status"),
+            PlanStep(
+                tool_name="bentolab.validate_pcr_profile",
+                args={"profile": profile},
+            ),
+            PlanStep(
+                tool_name="bentolab.dry_run_pcr_profile",
+                args={"profile": profile},
+            ),
+        ],
+        writes=[
+            PlanStep(
+                tool_name="bentolab.submit_pcr_run",
+                record_id="elabftw:experiment:400",
+                args={"profile": profile},
+                preview_type="summary",
+            ),
+        ],
+        artifacts=[],
+        approval_required=True,
+        rollback="Abort via BentoLab HTTP API kill switch; results are non-reversible",
+    )
+
+
+def _build_bentolab_executor(
+    *,
+    approval_store: ApprovalStore | None = None,
+) -> tuple[PlanExecutor, ApprovalStore]:
+    """Build a PlanExecutor with a BentoLab adapter."""
+    audit = AuditStore(db_path=":memory:")
+    approval_store = approval_store or ApprovalStore(db_path=":memory:")
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+    stub = StubElabftwClient(seeds={})
+    bentolab_stub = StubBentoLabClient()
+    read = ElabftwReadAdapter(policy_engine=policy, audit_store=audit, client=stub)
+    write = ElabftwWriteAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        approval_store=approval_store,
+        client=stub,
+    )
+    bentolab_adapter = BentoLabAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=bentolab_stub,
+        approval_store=approval_store,
+    )
+    executor = PlanExecutor(
+        approval_store=approval_store,
+        read_adapter=read,
+        write_adapter=write,
+        bentolab_adapter=bentolab_adapter,
+    )
+    return executor, approval_store
+
+
+def test_bentolab_plan_all_steps_succeed() -> None:
+    """C43: BentoLab plan with status + validate + dry-run + submit executes."""
+    executor, approval_store = _build_bentolab_executor()
+    plan = _bentolab_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=400),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    assert len(result.step_results) == 4  # 3 reads + 1 write
+    assert result.step_results[0].tool_name == "bentolab.get_status"
+    assert result.step_results[1].tool_name == "bentolab.validate_pcr_profile"
+    assert result.step_results[2].tool_name == "bentolab.dry_run_pcr_profile"
+    assert result.step_results[3].tool_name == "bentolab.submit_pcr_run"
+    assert result.step_results[3].audit_action_id is not None
+
+
+def test_bentolab_plan_skips_per_step_approval_consume() -> None:
+    """C43: plan-level approval covers the submit step (no double-consume)."""
+    executor, approval_store = _build_bentolab_executor()
+    plan = _bentolab_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=400),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.is_consumed()
+    assert approval_store.count() == 1
+
+
+def test_bentolab_plan_without_adapter_fails() -> None:
+    """C43: BentoLab plan steps fail when adapter is not configured."""
+    audit = AuditStore(db_path=":memory:")
+    approval_store = ApprovalStore(db_path=":memory:")
+    policy = PolicyEngine()
+    stub = StubElabftwClient(seeds={})
+    read = ElabftwReadAdapter(policy_engine=policy, audit_store=audit, client=stub)
+    write = ElabftwWriteAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        approval_store=approval_store,
+        client=stub,
+    )
+    executor = PlanExecutor(
+        approval_store=approval_store,
+        read_adapter=read,
+        write_adapter=write,
+        # bentolab_adapter=None
+    )
+    plan = _bentolab_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=400),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "partial_failure"
+    assert result.step_results[0].status == "failed"
+    assert "bentolab_not_configured" in result.step_results[0].error
+
+
+def test_bentolab_plan_reads_only() -> None:
+    """C43: BentoLab plan with only read steps (preflight without submit)."""
+    executor, approval_store = _build_bentolab_executor()
+    profile = {"initial_denaturation": {"temperature": 95, "duration": 30}}
+    plan = Plan(
+        plan_id="plan-test-bentolab-reads",
+        intent="Check BentoLab status and validate profile",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "400",
+        },
+        risk_tier=PlanRiskTier.HARDWARE,
+        summary="Preflight: check status, validate, dry-run.",
+        reads=[
+            PlanStep(tool_name="bentolab.get_status"),
+            PlanStep(
+                tool_name="bentolab.validate_pcr_profile",
+                args={"profile": profile},
+            ),
+            PlanStep(
+                tool_name="bentolab.dry_run_pcr_profile",
+                args={"profile": profile},
+            ),
+        ],
+        writes=[],
+        artifacts=[],
+        approval_required=True,
+        rollback="No writes — nothing to roll back",
+    )
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=400),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    assert len(result.step_results) == 3
     assert all(r.status == "success" for r in result.step_results)

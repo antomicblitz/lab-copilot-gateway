@@ -41,6 +41,14 @@ from lab_copilot_gateway.elabftw import (
     TOOL_NAME_READ_BY_ID,
     TOOL_NAME_SEARCH,
 )
+from lab_copilot_gateway.bentolab import (
+    BentoLabAdapter,
+    BentoLabAdapterError,
+    TOOL_DRY_RUN as TOOL_BENTOLAB_DRY_RUN,
+    TOOL_GET_STATUS as TOOL_BENTOLAB_STATUS,
+    TOOL_SUBMIT as TOOL_BENTOLAB_SUBMIT,
+    TOOL_VALIDATE as TOOL_BENTOLAB_VALIDATE,
+)
 from lab_copilot_gateway.opencloning import (
     OpenCloningAdapter,
     OpenCloningAdapterError,
@@ -182,12 +190,14 @@ class PlanExecutor:
         write_adapter: ElabftwWriteAdapter,
         opencloning_adapter: OpenCloningAdapter | None = None,
         wallac_adapter: WallacAdapter | None = None,
+        bentolab_adapter: BentoLabAdapter | None = None,
     ) -> None:
         self.approval_store = approval_store
         self.read_adapter = read_adapter
         self.write_adapter = write_adapter
         self.opencloning_adapter = opencloning_adapter
         self.wallac_adapter = wallac_adapter
+        self.bentolab_adapter = bentolab_adapter
 
     def execute(
         self,
@@ -355,6 +365,7 @@ class PlanExecutor:
                 ElabftwAdapterError,
                 OpenCloningAdapterError,
                 WallacAdapterError,
+                BentoLabAdapterError,
             ) as exc:
                 error_str = f"{exc.reason}: {exc.message}"
                 step_results.append(
@@ -553,6 +564,59 @@ class PlanExecutor:
                 )
                 return result.to_dict()
 
+        # --- BentoLab reads (C43) ---
+        bentolab_read_tools = {
+            TOOL_BENTOLAB_STATUS,
+            TOOL_BENTOLAB_VALIDATE,
+            TOOL_BENTOLAB_DRY_RUN,
+        }
+        if step.tool_name in bentolab_read_tools:
+            if self.bentolab_adapter is None:
+                raise BentoLabAdapterError(
+                    reason="bentolab_not_configured",
+                    message=(
+                        "BentoLab adapter not configured for plan execution "
+                        "(set LAB_COPILOT_BENTOLAB_BASE_URL)"
+                    ),
+                )
+            profile = step.args.get("profile", {})
+            if step.tool_name == TOOL_BENTOLAB_STATUS:
+                result = self.bentolab_adapter.get_status(
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            elif step.tool_name == TOOL_BENTOLAB_VALIDATE:
+                result = self.bentolab_adapter.validate_pcr_profile(
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    profile=profile,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            else:  # TOOL_BENTOLAB_DRY_RUN
+                result = self.bentolab_adapter.dry_run_pcr_profile(
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    profile=profile,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            return result.to_dict()
+
         raise ElabftwAdapterError(
             reason="unsupported_read_tool",
             message=f"plan read step tool {step.tool_name!r} not supported by plan executor",
@@ -639,6 +703,32 @@ class PlanExecutor:
                 plan_approval_id=plan_approval_id,
             )
             return result.to_dict()
+        elif step.tool_name == TOOL_BENTOLAB_SUBMIT:
+            # C43: BentoLab submit — uses the BentoLab adapter with
+            # plan_approval_id to skip per-step approval consume.
+            if self.bentolab_adapter is None:
+                raise BentoLabAdapterError(
+                    reason="bentolab_not_configured",
+                    message=(
+                        "BentoLab adapter not configured for plan execution "
+                        "(set LAB_COPILOT_BENTOLAB_BASE_URL)"
+                    ),
+                )
+            result = self.bentolab_adapter.submit_pcr_run(
+                context_token=context_token,
+                approval_id=plan_approval_id,
+                approval_args=step.args,
+                profile=step.args.get("profile", {}),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                plan_approval_id=plan_approval_id,
+            )
+            return result.to_dict()
         else:
             raise ElabftwAdapterError(
                 reason="unsupported_write_tool",
@@ -660,6 +750,7 @@ def get_plan_executor() -> PlanExecutor:
             get_elabftw_read_adapter,
             get_elabftw_write_adapter,
         )
+        from lab_copilot_gateway.bentolab import get_bentolab_adapter
         from lab_copilot_gateway.opencloning import get_opencloning_adapter
         from lab_copilot_gateway.wallac import get_wallac_adapter
 
@@ -669,6 +760,7 @@ def get_plan_executor() -> PlanExecutor:
             write_adapter=get_elabftw_write_adapter(),
             opencloning_adapter=get_opencloning_adapter(),
             wallac_adapter=get_wallac_adapter(),
+            bentolab_adapter=get_bentolab_adapter(),
         )
     return _default_executor
 

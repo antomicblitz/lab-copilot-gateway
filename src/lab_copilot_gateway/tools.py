@@ -354,6 +354,22 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="read",
         description="Validate a PCR temperature/cycle profile against the device contract without hardware side effects.",
     ),
+    Tool(
+        name="bentolab.dry_run_pcr_profile",
+        tier=Tier.VALIDATION_DRY_RUN,
+        adapter="bentolab",
+        requires_approval=False,
+        mutability="read",
+        description="Simulate a PCR run on BentoLab without hardware side effects; returns step breakdown and timing.",
+    ),
+    Tool(
+        name="bentolab.submit_pcr_run",
+        tier=Tier.HARDWARE_EXECUTION,
+        adapter="bentolab",
+        requires_approval=True,
+        mutability="mutate",
+        description="Submit an approved PCR profile for hardware execution on BentoLab; requires explicit user approval (blocked in v1 by default).",
+    ),
 )
 
 
