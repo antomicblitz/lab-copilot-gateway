@@ -179,6 +179,14 @@ class OpenCloningClient(Protocol):
         """
         ...
 
+    def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST to any OpenCloning endpoint — generic escape hatch.
+
+        For endpoints without a dedicated method (PCR, restriction digest,
+        repository import, primer design, CRISPR, etc.).
+        """
+        ...
+
 
 @dataclass
 class StubOpenCloningClient:
@@ -231,6 +239,9 @@ class StubOpenCloningClient:
             sequence_count=len(sequences),
             source=source,
         )
+
+    def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        return self._record("call_endpoint", path=path, body_keys=list(body.keys()))
 
 
 @dataclass
@@ -357,6 +368,22 @@ class HttpOpenCloningClient:
             {"sequences": sequences, "source": source},
         )
 
+    def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        """POST to any OpenCloning endpoint — generic escape hatch.
+
+        Use this for endpoints that don't have a dedicated method.
+        The path should start with '/' (e.g. '/pcr', '/repository_id/addgene').
+        """
+        return self._post_json(path, body)
+
+    def get(self, path: str) -> dict[str, Any]:
+        """GET any OpenCloning endpoint (e.g. /version, /restriction_enzyme_list)."""
+        url = f"{self.base_url.rstrip('/')}{path}"
+        s = self._connect()
+        resp = s.get(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.json()
+
 
 def _format_to_filename(file_format: str) -> str:
     """Map a file_format identifier to a dummy filename with the right
@@ -417,6 +444,7 @@ TOOL_MANUAL = "opencloning.manual_sequence"
 TOOL_OLIGO = "opencloning.oligo_hybridization"
 TOOL_ASSEMBLY = "opencloning.simulate_assembly"
 TOOL_WRITEBACK = "opencloning.writeback_artifact"
+TOOL_CALL = "opencloning.call"
 TOOL_TIER = Tier.VALIDATION_DRY_RUN
 TOOL_TIER_WRITE = Tier.BOUNDED_WRITES
 
@@ -642,6 +670,58 @@ class OpenCloningAdapter:
             },
             api_call_summary={"method": "POST", "path": f"/{source_type}"},
             exec_fn=lambda _client: _client.simulate_assembly(sequences, source),
+        )
+
+    # --- Generic endpoint call (covers all OpenCloning API operations) -----
+
+    def call_endpoint(
+        self,
+        *,
+        context_token: str,
+        endpoint: str,
+        body: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> OpenCloningResult:
+        """Call any OpenCloning API endpoint — generic escape hatch.
+
+        This covers all operations without dedicated methods:
+        - Repository imports: /repository_id/addgene, /repository_id/genbank, etc.
+        - PCR: /pcr
+        - Restriction digest: /restriction
+        - Restriction/Ligation (Golden Gate): /restriction_and_ligation
+        - CRISPR: /crispr
+        - Homologous recombination: /homologous_recombination
+        - Cre/Lox: /cre_lox_recombination
+        - Gateway: /gateway
+        - Recombinase: /recombinase
+        - Polymerase extension: /polymerase_extension
+        - Reverse complement: /reverse_complement
+        - Primer design: /primer_design/gibson_assembly, etc.
+        - Primer details: /primer_details
+        - Validate: /validate, /validate_syntax
+        - Sanger alignment: /align_sanger
+        - Rename: /rename_sequence
+        - Batch cloning: /batch_cloning/*
+        """
+        return self._execute(
+            tool_name=TOOL_CALL,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            args_for_hash={"endpoint": endpoint, "body_keys": sorted(body.keys())},
+            api_call_summary={"method": "POST", "path": endpoint},
+            exec_fn=lambda _client: _client.call_endpoint(endpoint, body),
         )
 
     # --- C17: writeback artifact to eLabFTW -------------------------------

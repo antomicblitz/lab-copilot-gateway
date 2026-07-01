@@ -370,6 +370,22 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="mutate",
         description="Submit an approved PCR profile for hardware execution on BentoLab; requires explicit user approval (blocked in v1 by default).",
     ),
+    # --- OpenCloning generic endpoint (covers all API operations) ---------
+    Tool(
+        name="opencloning.call",
+        tier=Tier.VALIDATION_DRY_RUN,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Call any OpenCloning API endpoint. Covers repository imports "
+            "(Addgene, GenBank, Benchling, SnapGene, Euroscarf, iGEM, SEVA), "
+            "PCR, restriction digest, Golden Gate, CRISPR, homologous "
+            "recombination, Cre/Lox, Gateway, primer design, validation, "
+            "Sanger alignment, and more. "
+            "Args: endpoint (e.g. '/repository_id/addgene'), body (request dict)."
+        ),
+    ),
 )
 
 

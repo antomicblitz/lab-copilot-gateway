@@ -53,6 +53,7 @@ from lab_copilot_gateway.opencloning import (
     OpenCloningAdapter,
     OpenCloningAdapterError,
     TOOL_ASSEMBLY,
+    TOOL_CALL,
     TOOL_MANUAL,
     TOOL_OLIGO,
     TOOL_PARSE,
@@ -462,7 +463,13 @@ class PlanExecutor:
             return result.to_dict()
 
         # --- OpenCloning reads (C41) ---
-        opencloning_tools = {TOOL_PARSE, TOOL_MANUAL, TOOL_OLIGO, TOOL_ASSEMBLY}
+        opencloning_tools = {
+            TOOL_PARSE,
+            TOOL_MANUAL,
+            TOOL_OLIGO,
+            TOOL_ASSEMBLY,
+            TOOL_CALL,
+        }
         if step.tool_name in opencloning_tools:
             if self.opencloning_adapter is None:
                 raise OpenCloningAdapterError(
@@ -527,6 +534,30 @@ class PlanExecutor:
                     provider=provider,
                     model_id=model_id,
                 )
+            return result.to_dict()
+
+        # --- OpenCloning generic call (covers all API endpoints) ---
+        if step.tool_name == TOOL_CALL:
+            if self.opencloning_adapter is None:
+                raise OpenCloningAdapterError(
+                    reason="opencloning_not_configured",
+                    message=(
+                        "OpenCloning adapter not configured for plan execution "
+                        "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+                    ),
+                )
+            result = self.opencloning_adapter.call_endpoint(
+                context_token=context_token,
+                endpoint=step.args.get("endpoint", "/"),
+                body=step.args.get("body", {}),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
             return result.to_dict()
 
         # --- Wallac reads (C42) ---
