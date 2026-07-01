@@ -835,6 +835,41 @@ class WallacAdapter:
         try:
             result = self.client.call("POST", "runs", body)
         except Exception as exc:
+            err_str = str(exc)
+            if "409" in err_str and "Conflict" in err_str:
+                # A run is already in progress. Do NOT auto-abort —
+                # return a clear error so the LLM can inform the user
+                # and ask for approval to abort the existing run.
+                self._audit(
+                    tool_name=TOOL_RUN,
+                    policy_decision="allow",
+                    reason="run_in_progress",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    api_call_summary={"method": "POST", "path": "/runs"},
+                    approval_id=effective_approval_id,
+                    error={
+                        "code": "RUN_IN_PROGRESS",
+                        "message": "A measurement run is already in progress on the Wallac Victor2.",
+                    },
+                )
+                raise WallacAdapterError(
+                    reason="run_in_progress",
+                    message=(
+                        "A measurement run is already in progress on the "
+                        "Wallac Victor2. Inform the user that a run is active "
+                        "and ask if they want to abort it before starting a "
+                        "new one. To abort: GET /runs to find the running "
+                        "run_id, then POST /runs/{run_id}/abort."
+                    ),
+                )
             self._audit(
                 tool_name=TOOL_RUN,
                 policy_decision="allow",
