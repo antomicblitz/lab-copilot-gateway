@@ -210,9 +210,9 @@ class HttpWallacClient:
     def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         """Generic vm-agent API call.
 
-        ``method`` is GET or POST.  ``endpoint`` is a path like
+        ``method`` is GET, POST, or PATCH. ``endpoint`` is a path like
         ``/protocols`` or ``/runs/r-abc123/results``.  ``body`` is the
-        JSON body for POST requests.
+        JSON body for POST/PATCH requests.
 
         For POST /runs, the gateway adapter forces ``dry_run=true`` to
         prevent unapproved hardware execution (the ``wallac.call`` tool
@@ -220,10 +220,13 @@ class HttpWallacClient:
         """
         url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
         s = self._connect()
-        if method.upper() == "GET":
+        m = method.upper()
+        if m == "GET":
             resp = s.get(url, timeout=self.timeout_seconds)
-        elif method.upper() == "POST":
+        elif m == "POST":
             resp = s.post(url, json=body or {}, timeout=self.timeout_seconds)
+        elif m == "PATCH":
+            resp = s.patch(url, json=body or {}, timeout=self.timeout_seconds)
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
         resp.raise_for_status()
