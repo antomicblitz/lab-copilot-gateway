@@ -515,8 +515,10 @@ class PlanExecutor:
             else:  # TOOL_ASSEMBLY
                 result = self.opencloning_adapter.simulate_assembly(
                     context_token=context_token,
-                    fragments=step.args.get("fragments", []),
-                    assembly_config=step.args.get("assembly_config", {}),
+                    sequences=step.args.get("sequences", []),
+                    source=step.args.get(
+                        "source", {"id": 0, "type": "GibsonAssemblySource"}
+                    ),
                     mapped_identity=mapped_identity,
                     conversation_id=conversation_id,
                     request_id=request_id,

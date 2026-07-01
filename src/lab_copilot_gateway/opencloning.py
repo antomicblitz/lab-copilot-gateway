@@ -132,21 +132,26 @@ class OpenCloningClient(Protocol):
 
     Implementations: ``StubOpenCloningClient`` for tests;
     ``HttpOpenCloningClient`` for live calls.
+
+    The OpenCloning API (https://github.com/manulera/OpenCloning) uses a
+    {sources, sequences} response shape for all endpoints. Request bodies
+    follow the pattern {"source": <SourceObject>, ...payload} where the
+    source object carries the type and metadata.
     """
 
     def parse_sequence_file(
         self, file_content: bytes, file_format: str
     ) -> dict[str, Any]:
-        """POST /read_from_file — parse an uploaded sequence file.
+        """POST /read_from_file — parse an uploaded sequence file (multipart).
 
-        Returns the parsed sequence description as a dict.
+        Returns {sources: [...], sequences: [...]}.
         """
         ...
 
     def manual_sequence(self, sequence: str, circular: bool = False) -> dict[str, Any]:
         """POST /manually_typed — validate a manually typed sequence.
 
-        Returns the validated sequence description as a dict.
+        Returns {sources: [...], sequences: [...]}.
         """
         ...
 
@@ -155,16 +160,22 @@ class OpenCloningClient(Protocol):
     ) -> dict[str, Any]:
         """POST /oligonucleotide_hybridization — compute hybridization product.
 
-        Returns the product sequence description as a dict.
+        Returns {sources: [...], sequences: [...]}.
         """
         ...
 
     def simulate_assembly(
-        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+        self,
+        sequences: list[dict[str, Any]],
+        source: dict[str, Any],
     ) -> dict[str, Any]:
-        """POST /ligation (or other assembly endpoint) — simulate assembly.
+        """POST /gibson_assembly (or /ligation, etc.) — simulate assembly.
 
-        Returns the predicted construct as a dict.
+        ``sequences`` is the array of TextFileSequence objects from prior
+        parse/PCR steps. ``source`` is the assembly source object (e.g.
+        {"id": 0, "type": "GibsonAssemblySource", "input": [...]}).
+
+        Returns {sources: [...], sequences: [...]}.
         """
         ...
 
@@ -211,12 +222,14 @@ class StubOpenCloningClient:
         )
 
     def simulate_assembly(
-        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+        self,
+        sequences: list[dict[str, Any]],
+        source: dict[str, Any],
     ) -> dict[str, Any]:
         return self._record(
             "simulate_assembly",
-            fragment_count=len(fragments),
-            assembly_config=assembly_config,
+            sequence_count=len(sequences),
+            source=source,
         )
 
 
@@ -272,33 +285,76 @@ class HttpOpenCloningClient:
         return self._post_multipart("/read_from_file", files=files)
 
     def manual_sequence(self, sequence: str, circular: bool = False) -> dict[str, Any]:
+        # OpenCloning API expects {"source": ManuallyTypedSource, "sequence": ManuallyTypedSequence}
         return self._post_json(
             "/manually_typed",
-            {"sequence": sequence, "circular": circular},
+            {
+                "source": {
+                    "id": 0,
+                    "type": "ManuallyTypedSource",
+                },
+                "sequence": {
+                    "id": 0,
+                    "type": "ManuallyTypedSequence",
+                    "sequence": sequence,
+                    "circular": circular,
+                },
+            },
         )
 
     def oligo_hybridization(
         self, forward_oligo: str, reverse_oligo: str, minimal_annealing: int = 20
     ) -> dict[str, Any]:
+        # OpenCloning API expects {"source": OligoHybridizationSource, "primers": [forward, reverse]}
         return self._post_json(
             "/oligonucleotide_hybridization",
             {
-                "forward_oligo": forward_oligo,
-                "reverse_oligo": reverse_oligo,
-                "minimal_annealing": minimal_annealing,
+                "source": {
+                    "id": 0,
+                    "type": "OligoHybridizationSource",
+                },
+                "primers": [
+                    {
+                        "id": 0,
+                        "type": "Primer",
+                        "sequence": forward_oligo,
+                        "name": "forward",
+                    },
+                    {
+                        "id": 1,
+                        "type": "Primer",
+                        "sequence": reverse_oligo,
+                        "name": "reverse",
+                    },
+                ],
             },
         )
 
     def simulate_assembly(
-        self, fragments: list[dict[str, Any]], assembly_config: dict[str, Any]
+        self,
+        sequences: list[dict[str, Any]],
+        source: dict[str, Any],
     ) -> dict[str, Any]:
-        # The assembly endpoint is determined by assembly_config["type"].
-        # V1 supports ligation; other types (gibson, restriction_and_ligation,
-        # etc.) can be added as the tool surface grows.
-        assembly_type = assembly_config.get("type", "ligation")
+        # The assembly endpoint is determined by source["type"].
+        # Map source type → endpoint path.
+        source_type = source.get("type", "")
+        type_to_path = {
+            "GibsonAssemblySource": "/gibson_assembly",
+            "LigationSource": "/ligation",
+            "RestrictionAndLigationSource": "/restriction_and_ligation",
+            "OverlapExtensionPCRLigationSource": "/gibson_assembly",
+            "InFusionSource": "/gibson_assembly",
+            "InVivoAssemblySource": "/gibson_assembly",
+            "HomologousRecombinationSource": "/homologous_recombination",
+            "CRISPRSource": "/crispr",
+            "CreLoxRecombinationSource": "/cre_lox_recombination",
+            "GatewaySource": "/gateway",
+            "RecombinaseSource": "/recombinase",
+        }
+        path = type_to_path.get(source_type, "/gibson_assembly")
         return self._post_json(
-            f"/{assembly_type}",
-            {"fragments": fragments, **assembly_config},
+            path,
+            {"sequences": sequences, "source": source},
         )
 
 
@@ -553,8 +609,8 @@ class OpenCloningAdapter:
         self,
         *,
         context_token: str,
-        fragments: list[dict[str, Any]],
-        assembly_config: dict[str, Any],
+        sequences: list[dict[str, Any]],
+        source: dict[str, Any],
         mapped_identity: MappedIdentity | None,
         conversation_id: str | None = None,
         request_id: str | None = None,
@@ -563,8 +619,13 @@ class OpenCloningAdapter:
         provider: str | None = None,
         model_id: str | None = None,
     ) -> OpenCloningResult:
-        """Simulate a cloning assembly via OpenCloning."""
-        assembly_type = assembly_config.get("type", "ligation")
+        """Simulate a cloning assembly via OpenCloning.
+
+        ``sequences`` is the array of TextFileSequence objects from prior
+        parse/PCR steps. ``source`` is the assembly source object (e.g.
+        {"id": 0, "type": "GibsonAssemblySource", "input": [...]}).
+        """
+        source_type = source.get("type", "GibsonAssemblySource")
         return self._execute(
             tool_name=TOOL_ASSEMBLY,
             context_token=context_token,
@@ -576,13 +637,11 @@ class OpenCloningAdapter:
             provider=provider,
             model_id=model_id,
             args_for_hash={
-                "fragment_count": len(fragments),
-                "assembly_type": assembly_type,
+                "sequence_count": len(sequences),
+                "source_type": source_type,
             },
-            api_call_summary={"method": "POST", "path": f"/{assembly_type}"},
-            exec_fn=lambda _client: _client.simulate_assembly(
-                fragments, assembly_config
-            ),
+            api_call_summary={"method": "POST", "path": f"/{source_type}"},
+            exec_fn=lambda _client: _client.simulate_assembly(sequences, source),
         )
 
     # --- C17: writeback artifact to eLabFTW -------------------------------

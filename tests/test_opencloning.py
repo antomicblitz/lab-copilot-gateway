@@ -359,22 +359,22 @@ def test_simulate_assembly_succeeds(
     stub_client: StubOpenCloningClient,
 ) -> None:
     """simulate_assembly tool returns predicted construct."""
-    fragments = [
-        {"id": "frag1", "sequence": "ATCG"},
-        {"id": "frag2", "sequence": "GCTA"},
+    sequences = [
+        {"id": 0, "type": "TextFileSequence", "sequence_file_format": "genbank"},
+        {"id": 1, "type": "TextFileSequence", "sequence_file_format": "genbank"},
     ]
-    assembly_config = {"type": "ligation"}
+    source = {"id": 0, "type": "GibsonAssemblySource"}
     result = adapter.simulate_assembly(
         context_token=_token(),
-        fragments=fragments,
-        assembly_config=assembly_config,
+        sequences=sequences,
+        source=source,
         mapped_identity=_identity(),
     )
     assert result.tool_name == "opencloning.simulate_assembly"
     assert "construct" in result.result
     assert len(stub_client.calls) == 1
     assert stub_client.calls[0]["method"] == "simulate_assembly"
-    assert stub_client.calls[0]["fragment_count"] == 2
+    assert stub_client.calls[0]["sequence_count"] == 2
 
 
 # --- unmapped caller --------------------------------------------------------
@@ -717,7 +717,7 @@ def test_stub_client_records_calls() -> None:
     stub.parse_sequence_file(b"ATCG", "fasta")
     stub.manual_sequence("ATCG", circular=True)
     stub.oligo_hybridization("forward", "reverse", 15)
-    stub.simulate_assembly([{"id": "f1"}], {"type": "ligation"})
+    stub.simulate_assembly([{"id": 0}], {"id": 0, "type": "GibsonAssemblySource"})
     assert len(stub.calls) == 4
     assert stub.calls[0]["method"] == "parse_sequence_file"
     assert stub.calls[1]["method"] == "manual_sequence"

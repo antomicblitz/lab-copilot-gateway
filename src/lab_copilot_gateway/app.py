@@ -1109,8 +1109,10 @@ def create_app() -> FastAPI:
                 elif tool.name == "opencloning.simulate_assembly":
                     result = adapter.simulate_assembly(
                         context_token=body.context_token,
-                        fragments=body.args.get("fragments", []),
-                        assembly_config=body.args.get("assembly_config", {}),
+                        sequences=body.args.get("sequences", []),
+                        source=body.args.get(
+                            "source", {"id": 0, "type": "GibsonAssemblySource"}
+                        ),
                         mapped_identity=mapped_identity,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,

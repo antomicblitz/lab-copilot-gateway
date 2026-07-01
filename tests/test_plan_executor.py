@@ -729,8 +729,8 @@ def _opencloning_plan(
             PlanStep(
                 tool_name="opencloning.simulate_assembly",
                 args={
-                    "fragments": [{"id": "frag1"}],
-                    "assembly_config": {"type": "ligation"},
+                    "sequences": [{"id": 0, "type": "TextFileSequence"}],
+                    "source": {"id": 0, "type": "GibsonAssemblySource"},
                 },
             ),
         ],
@@ -972,8 +972,8 @@ def test_opencloning_plan_mixed_eLabFTW_and_opencloning() -> None:
             PlanStep(
                 tool_name="opencloning.simulate_assembly",
                 args={
-                    "fragments": [{"id": "frag1"}],
-                    "assembly_config": {"type": "ligation"},
+                    "sequences": [{"id": 0, "type": "TextFileSequence"}],
+                    "source": {"id": 0, "type": "GibsonAssemblySource"},
                 },
             ),
         ],
