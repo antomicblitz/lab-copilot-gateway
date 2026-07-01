@@ -135,7 +135,17 @@ class PolicyEngine:
                 tier=int(req.tier),
             )
 
-        # 4. Hardware / above-block threshold denies by default.
+        # 4. C29: Autonomy-enabled callers bypass the hardware block and
+        # approval requirement for the autonomous tier (6) only.
+        # Kill switches (steps 0-1) and unmapped caller (step 2) still deny.
+        if req.autonomy_enabled and req.tier == Tier.CLOSED_LOOP_AUTONOMY:
+            return Decision(
+                decision="allow",
+                reason="autonomy_enabled",
+                tier=int(req.tier),
+            )
+
+        # 5. Hardware / above-block threshold denies by default.
         if req.tier >= int(self.block_hardware_above):
             return Decision(
                 decision="deny",
@@ -143,7 +153,7 @@ class PolicyEngine:
                 tier=int(req.tier),
             )
 
-        # 5. Bounded writes & higher require approval.
+        # 6. Bounded writes & higher require approval.
         if req.tier >= int(self.approvals_required_for) and not req.has_approval:
             return Decision(
                 decision="deny",
@@ -152,7 +162,7 @@ class PolicyEngine:
                 requires_approval=True,
             )
 
-        # 6. Read / status / validate (tiers 0-3 with approval if required) allow.
+        # 7. Read / status / validate (tiers 0-3 with approval if required) allow.
         return Decision(decision="allow", reason="default_allow", tier=int(req.tier))
 
     def _matched_kill_categories(self, req: PolicyRequest) -> list[str]:

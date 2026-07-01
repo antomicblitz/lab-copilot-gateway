@@ -310,7 +310,7 @@ class PlanExecuteBody(BaseModel):
     """Request body for POST /plan/execute (C39)."""
 
     plan: dict[str, Any]
-    approval_id: str
+    approval_id: str | None = None  # C29: optional for autonomous plans
     context_token: str = ""
     keycloak_subject: str | None = None
     librechat_user_id: str | None = None

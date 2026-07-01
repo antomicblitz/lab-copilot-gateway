@@ -445,3 +445,131 @@ class TestKillSwitchCategories:
             )
         )
         assert d.decision == "allow"
+
+
+# --- C29: Autonomous execution policy tier ----------------------------------
+
+
+class TestAutonomyBypass:
+    """C29: autonomy_enabled allows tier 6 for mapped callers."""
+
+    def test_autonomy_enabled_allows_tier6(self) -> None:
+        """When autonomy_enabled=True, tier 6 is allowed for mapped users."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "allow"
+        assert d.reason == "autonomy_enabled"
+        assert d.tier == 6
+
+    def test_autonomy_disabled_denies_tier6(self) -> None:
+        """When autonomy_enabled=False (default), tier 6 is still denied."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=False,
+            )
+        )
+        assert d.decision == "deny"
+        assert d.reason == "hardware_blocked"
+
+    def test_autonomy_enabled_does_not_allow_tier5_hardware(self) -> None:
+        """Autonomy does NOT bypass the hardware block for tier 5."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.HARDWARE_EXECUTION,
+                tool_name="wallac.submit",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert d.reason == "hardware_blocked"
+
+    def test_autonomy_enabled_still_denied_by_kill_switch(self) -> None:
+        """Kill switch denies even when autonomy is enabled."""
+        eng = PolicyEngine(kill_categories={"autonomy": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert d.reason == "kill_switch_match"
+        assert "autonomy" in d.matched_kill_switches
+
+    def test_autonomy_enabled_still_denied_for_unmapped_caller(self) -> None:
+        """Unmapped callers cannot use autonomy."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+                user_id=None,
+            )
+        )
+        assert d.decision == "deny"
+        assert d.reason == "unmapped_caller"
+
+    def test_autonomy_enabled_still_denied_by_kill_all(self) -> None:
+        """'all' kill switch denies even with autonomy."""
+        eng = PolicyEngine(kill_categories={"all": True})
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert "all" in d.matched_kill_switches
+
+    def test_autonomy_enabled_still_denied_by_fnmatch(self) -> None:
+        """fnmatch kill switch denies even with autonomy."""
+        eng = PolicyEngine(kill_switches=("autonomous.*",))
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert "autonomous.*" in d.matched_kill_switches
+
+    def test_autonomy_enabled_allows_without_approval(self) -> None:
+        """Autonomy bypass does not require has_approval=True."""
+        eng = PolicyEngine()
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+                has_approval=False,
+            )
+        )
+        assert d.decision == "allow"
+        assert d.reason == "autonomy_enabled"
+
+    def test_autonomy_enabled_tier_exceeds_max_still_denied(self) -> None:
+        """If max_tier is below 6, autonomy cannot bypass it."""
+        eng = PolicyEngine(max_tier=Tier.HARDWARE_EXECUTION)
+        d = eng.decide(
+            _req(
+                tier=Tier.CLOSED_LOOP_AUTONOMY,
+                tool_name="autonomous.monitor",
+                autonomy_enabled=True,
+            )
+        )
+        assert d.decision == "deny"
+        assert d.reason == "tier_exceeds_max"
