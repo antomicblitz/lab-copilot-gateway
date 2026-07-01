@@ -600,6 +600,7 @@ class OpenCloningAdapter:
         librechat_user_id: str | None = None,
         provider: str | None = None,
         model_id: str | None = None,
+        plan_approval_id: str | None = None,
     ) -> OpenCloningResult:
         """Attach an approved OpenCloning design artifact to the user's experiment.
 
@@ -680,6 +681,7 @@ class OpenCloningAdapter:
             artifact_filename=artifact_filename,
             artifact_bytes=artifact_bytes,
             artifact_comment=artifact_comment,
+            plan_approval_id=plan_approval_id,
         )
 
     def _execute_writeback(
@@ -698,8 +700,15 @@ class OpenCloningAdapter:
         artifact_filename: str,
         artifact_bytes: bytes,
         artifact_comment: str,
+        plan_approval_id: str | None = None,
     ) -> OpenCloningResult:
-        """Writeback orchestration: token → identity → policy → approval → upload → provenance → audit."""
+        """Writeback orchestration: token → identity → policy → approval → upload → provenance → audit.
+
+        When ``plan_approval_id`` is set (C41), the plan executor has already
+        consumed the plan-level approval (bound to the plan hash, which covers
+        all step args).  The per-step approval consume is skipped; the plan
+        approval_id is used in audit records.
+        """
         early_hash = compute_args_hash(
             {
                 "artifact_filename": artifact_filename,
@@ -877,7 +886,13 @@ class OpenCloningAdapter:
             raise PolicyDenied(decision)
 
         # 5. Approval token consume (single-use, args-hash-bound).
-        if self.approval_store is not None and approval_id:
+        # C41: when ``plan_approval_id`` is set, the plan executor has
+        # already consumed the plan-level approval (bound to the plan hash,
+        # which covers all step args).  Skip the per-step consume and use
+        # the plan approval_id in audit records.
+        if plan_approval_id:
+            effective_approval_id = plan_approval_id
+        elif self.approval_store is not None and approval_id:
             try:
                 self.approval_store.consume(
                     approval_id,
@@ -885,6 +900,7 @@ class OpenCloningAdapter:
                     args_hash=compute_args_hash(approval_args),
                     target_record=str(claims.experiment_id),
                 )
+                effective_approval_id = approval_id
             except Exception as exc:
                 self._audit(
                     tool_name=TOOL_WRITEBACK,
@@ -910,6 +926,8 @@ class OpenCloningAdapter:
                     reason="approval_consume_failed",
                     message=f"approval token consume failed: {exc}",
                 ) from exc
+        else:
+            effective_approval_id = approval_id
 
         # 6. eLabFTW client must be configured for writeback.
         if self.elabftw_client is None:
@@ -926,7 +944,7 @@ class OpenCloningAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 error={"code": "ELABFTW_NOT_CONFIGURED"},
             )
             raise OpenCloningAdapterError(
@@ -959,7 +977,7 @@ class OpenCloningAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 api_call_summary={
                     "method": "POST",
                     "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",
@@ -1011,7 +1029,7 @@ class OpenCloningAdapter:
             provider=provider,
             model_id=model_id,
             tool_args_hash=tool_args_hash,
-            approval_id=approval_id,
+            approval_id=effective_approval_id,
             api_call_summary={
                 "method": "POST",
                 "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",

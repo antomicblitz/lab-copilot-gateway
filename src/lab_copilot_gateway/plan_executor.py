@@ -41,6 +41,15 @@ from lab_copilot_gateway.elabftw import (
     TOOL_NAME_READ_BY_ID,
     TOOL_NAME_SEARCH,
 )
+from lab_copilot_gateway.opencloning import (
+    OpenCloningAdapter,
+    OpenCloningAdapterError,
+    TOOL_ASSEMBLY,
+    TOOL_MANUAL,
+    TOOL_OLIGO,
+    TOOL_PARSE,
+    TOOL_WRITEBACK,
+)
 from lab_copilot_gateway.plan import (
     Plan,
     PlanStep,
@@ -152,6 +161,9 @@ class PlanExecutor:
 
     Dependencies are injected for testability.  In production,
     ``get_plan_executor()`` wires the singletons.
+
+    The ``opencloning_adapter`` is optional — plans without OpenCloning
+    steps do not require it (C41).
     """
 
     def __init__(
@@ -160,10 +172,12 @@ class PlanExecutor:
         approval_store: ApprovalStore,
         read_adapter: ElabftwReadAdapter,
         write_adapter: ElabftwWriteAdapter,
+        opencloning_adapter: OpenCloningAdapter | None = None,
     ) -> None:
         self.approval_store = approval_store
         self.read_adapter = read_adapter
         self.write_adapter = write_adapter
+        self.opencloning_adapter = opencloning_adapter
 
     def execute(
         self,
@@ -277,7 +291,7 @@ class PlanExecutor:
                         ),
                     )
                 )
-            except ElabftwAdapterError as exc:
+            except (ElabftwAdapterError, OpenCloningAdapterError) as exc:
                 error_str = f"{exc.reason}: {exc.message}"
                 step_results.append(
                     StepResult(
@@ -342,7 +356,8 @@ class PlanExecutor:
         provider: str | None,
         model_id: str | None,
     ) -> dict[str, Any]:
-        """Execute a read step using the read adapter."""
+        """Execute a read step using the appropriate adapter."""
+        # --- eLabFTW reads ---
         if step.tool_name == TOOL_NAME_SEARCH:
             result = self.read_adapter.search_my_experiments(
                 query=step.args.get("query", ""),
@@ -370,11 +385,77 @@ class PlanExecutor:
                 model_id=model_id,
             )
             return result.to_dict()
-        else:
-            raise ElabftwAdapterError(
-                reason="unsupported_read_tool",
-                message=f"plan read step tool {step.tool_name!r} not supported by plan executor",
-            )
+
+        # --- OpenCloning reads (C41) ---
+        opencloning_tools = {TOOL_PARSE, TOOL_MANUAL, TOOL_OLIGO, TOOL_ASSEMBLY}
+        if step.tool_name in opencloning_tools:
+            if self.opencloning_adapter is None:
+                raise OpenCloningAdapterError(
+                    reason="opencloning_not_configured",
+                    message=(
+                        "OpenCloning adapter not configured for plan execution "
+                        "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+                    ),
+                )
+            if step.tool_name == TOOL_PARSE:
+                result = self.opencloning_adapter.parse_sequence_file(
+                    context_token=context_token,
+                    file_content=step.args.get("file_content", ""),
+                    file_format=step.args.get("file_format", "genbank"),
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            elif step.tool_name == TOOL_MANUAL:
+                result = self.opencloning_adapter.manual_sequence(
+                    context_token=context_token,
+                    sequence=step.args.get("sequence", ""),
+                    circular=step.args.get("circular", False),
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            elif step.tool_name == TOOL_OLIGO:
+                result = self.opencloning_adapter.oligo_hybridization(
+                    context_token=context_token,
+                    forward_oligo=step.args.get("forward_oligo", ""),
+                    reverse_oligo=step.args.get("reverse_oligo", ""),
+                    minimal_annealing=step.args.get("minimal_annealing", 20),
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            else:  # TOOL_ASSEMBLY
+                result = self.opencloning_adapter.simulate_assembly(
+                    context_token=context_token,
+                    fragments=step.args.get("fragments", []),
+                    assembly_config=step.args.get("assembly_config", {}),
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            return result.to_dict()
+
+        raise ElabftwAdapterError(
+            reason="unsupported_read_tool",
+            message=f"plan read step tool {step.tool_name!r} not supported by plan executor",
+        )
 
     def _execute_write(
         self,
@@ -390,9 +471,34 @@ class PlanExecutor:
         provider: str | None,
         model_id: str | None,
     ) -> dict[str, Any]:
-        """Execute a write step using the write adapter with plan-level approval."""
+        """Execute a write step using the appropriate adapter with plan-level approval."""
         if step.tool_name == "elabftw.edit_experiment_section":
             result = self.write_adapter.edit_experiment_section(
+                context_token=context_token,
+                approval_id=plan_approval_id,
+                approval_args=step.args,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                plan_approval_id=plan_approval_id,
+            )
+            return result.to_dict()
+        elif step.tool_name == TOOL_WRITEBACK:
+            # C41: OpenCloning writeback artifact — uses the OpenCloning
+            # adapter with plan_approval_id to skip per-step approval consume.
+            if self.opencloning_adapter is None:
+                raise OpenCloningAdapterError(
+                    reason="opencloning_not_configured",
+                    message=(
+                        "OpenCloning adapter not configured for plan execution "
+                        "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+                    ),
+                )
+            result = self.opencloning_adapter.writeback_artifact(
                 context_token=context_token,
                 approval_id=plan_approval_id,
                 approval_args=step.args,
@@ -427,11 +533,13 @@ def get_plan_executor() -> PlanExecutor:
             get_elabftw_read_adapter,
             get_elabftw_write_adapter,
         )
+        from lab_copilot_gateway.opencloning import get_opencloning_adapter
 
         _default_executor = PlanExecutor(
             approval_store=get_approval_store(),
             read_adapter=get_elabftw_read_adapter(),
             write_adapter=get_elabftw_write_adapter(),
+            opencloning_adapter=get_opencloning_adapter(),
         )
     return _default_executor
 
