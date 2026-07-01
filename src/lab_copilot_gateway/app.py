@@ -35,6 +35,10 @@ from lab_copilot_gateway.elabftw import (
     get_elabftw_read_adapter,
     get_elabftw_write_adapter,
 )
+from lab_copilot_gateway.bentolab import (
+    BentoLabAdapterError,
+    get_bentolab_adapter,
+)
 from lab_copilot_gateway.opencloning import (
     OpenCloningAdapterError,
     get_opencloning_adapter,
@@ -401,7 +405,11 @@ def create_app() -> FastAPI:
                 if wallac_adapter.bridge_client is not None
                 else "not_configured"
             ),
-            "bentolab": "not_configured",
+            "bentolab": (
+                "configured"
+                if get_bentolab_adapter().client is not None
+                else "not_configured"
+            ),
         }
         deps.update(_identity_backend_status(identity_mapper))
         deps.update(_approval_backend_status(approval_store))
@@ -1256,6 +1264,93 @@ def create_app() -> FastAPI:
                 # Wallac adapter reuses eLabFTW's InvalidContextToken and
                 # UnmappedCaller, so those errors surface as ElabftwAdapterError
                 # subclasses. Map them to the same {ok:false, reason, message} shape.
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+        if tool.adapter == "bentolab":
+            try:
+                adapter = get_bentolab_adapter()
+                if tool.name == "bentolab.get_status":
+                    result = adapter.get_status(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "bentolab.validate_pcr_profile":
+                    result = adapter.validate_pcr_profile(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        profile=body.args.get("profile", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "bentolab.dry_run_pcr_profile":
+                    result = adapter.dry_run_pcr_profile(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        profile=body.args.get("profile", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "bentolab.submit_pcr_run":
+                    result = adapter.submit_pcr_run(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        profile=body.args.get("profile", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "tool_name": tool.name,
+                        "reason": "tool_not_dispatched",
+                        "message": (
+                            f"tool {tool.name!r} is in the bentolab adapter "
+                            "but has no /invoke dispatch path"
+                        ),
+                    }
+            except BentoLabAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+            except ElabftwAdapterError as exc:
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
         # Adapters that don't exist yet (C19+).  Return a structured

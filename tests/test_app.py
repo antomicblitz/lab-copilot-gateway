@@ -1281,11 +1281,10 @@ def test_invoke_propagates_unmapped_caller() -> None:
     assert out["reason"] == "unmapped_caller"
 
 
-def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
-    """Tools whose adapter is not yet implemented (bentolab.* — C19+)
-    must return ok:false with reason adapter_not_implemented, not 404
-    or a stack trace.  LibreChat can surface this to the user as 'this
-    tool is not wired up yet'."""
+def test_invoke_bentolab_adapter_wired() -> None:
+    """BentoLab tools are now wired through the adapter (C43).
+    With no context token, the adapter returns invalid_context_token
+    (not adapter_not_implemented — the adapter IS implemented)."""
     client = make_client()
     r = client.post(
         "/invoke",
@@ -1299,7 +1298,8 @@ def test_invoke_returns_adapter_not_implemented_for_future_tools() -> None:
     out = r.json()
     assert out["ok"] is False
     assert out["tool_name"] == "bentolab.get_status"
-    assert out["reason"] == "adapter_not_implemented"
+    # The adapter is now wired — it returns a real error, not adapter_not_implemented.
+    assert out["reason"] != "adapter_not_implemented"
 
 
 def test_invoke_does_not_modify_registry() -> None:
