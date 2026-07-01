@@ -30,6 +30,7 @@ from lab_copilot_gateway.approval import (
     ApprovalStore,
     compute_args_hash,
 )
+from lab_copilot_gateway.artifact_bundle import ArtifactBundleStore
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
@@ -849,6 +850,116 @@ def test_writeback_attaches_artifact_to_experiment(
     assert rows[0]["tool_name"] == "opencloning.writeback_artifact"
     assert rows[0]["approval_id"] == approval_id
     assert rows[0]["tool_args_hash"] is not None
+
+
+def test_writeback_resolves_artifact_bundle_reference(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """C56: approved writeback uploads exact bytes from bundle custody."""
+    data = b"LOCUS bundled 100 bp DNA\nORIGIN\nATCG\n//"
+    store = ArtifactBundleStore()
+    manifest = store.put(
+        plan_id="plan-oc-1",
+        plan_hash="hash-oc-1",
+        artifact_id="oc-artifact-1",
+        filename="construct.gb",
+        mime_type="chemical/x-genbank",
+        data=data,
+        binding={
+            "record_type": "experiment",
+            "record_id": "42",
+            "mapped_elabftw_user_id": "elab-human-1",
+        },
+    )
+    writeback_adapter.artifact_store = store
+    approval_args = {
+        "artifact_id": "oc-artifact-1",
+        "plan_id": "plan-oc-1",
+        "plan_hash": "hash-oc-1",
+        "artifact_filename": "construct.gb",
+        "artifact_sha256": manifest["sha256"],
+        "artifact_size_bytes": manifest["size_bytes"],
+        "artifact_comment": "OpenCloning bundled artifact",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    assert result.result["artifact_filename"] == "construct.gb"
+    uploads = elabftw_stub.seeds[42]["uploads"]
+    assert len(uploads) == 1
+    assert uploads[0]["real_name"] == "construct.gb"
+    assert uploads[0]["size"] == len(data)
+    assert uploads[0]["comment"] == "OpenCloning bundled artifact"
+
+
+def test_writeback_bundle_hash_mismatch_fails_before_upload(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """C56: expected hash mismatch fails closed before eLabFTW upload."""
+    store = ArtifactBundleStore()
+    manifest = store.put(
+        plan_id="plan-oc-1",
+        plan_hash="hash-oc-1",
+        artifact_id="oc-artifact-1",
+        filename="construct.gb",
+        mime_type="chemical/x-genbank",
+        data=b"LOCUS bundled\n//",
+        binding={
+            "record_type": "experiment",
+            "record_id": "42",
+            "mapped_elabftw_user_id": "elab-human-1",
+        },
+    )
+    writeback_adapter.artifact_store = store
+    approval_args = {
+        "artifact_id": "oc-artifact-1",
+        "plan_id": "plan-oc-1",
+        "plan_hash": "hash-oc-1",
+        "artifact_filename": "construct.gb",
+        "artifact_sha256": "0" * 64,
+        "artifact_size_bytes": manifest["size_bytes"],
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    with pytest.raises(OpenCloningAdapterError) as exc_info:
+        writeback_adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=approval_args,
+            mapped_identity=_identity(),
+        )
+
+    assert exc_info.value.reason == "artifact_bundle_error"
+    assert elabftw_stub.seeds[42]["uploads"] == []
+    rows = _audit_rows(audit)
+    assert rows[0]["policy_decision"] == "deny"
+    assert rows[0]["error"]["code"] == "ARTIFACT_BUNDLE_ERROR"
+
+
+def test_writeback_missing_payload_fails_closed(
+    writeback_adapter: OpenCloningAdapter,
+) -> None:
+    """C56: filename-only writeback must not upload an empty artifact."""
+    with pytest.raises(OpenCloningAdapterError) as exc_info:
+        writeback_adapter.writeback_artifact(
+            context_token=_token(),
+            approval_id="approval-id",
+            approval_args={"artifact_filename": "construct.gb"},
+            mapped_identity=_identity(),
+        )
+
+    assert exc_info.value.reason == "missing_artifact_payload"
 
 
 # --- writeback: approval consumed ------------------------------------------

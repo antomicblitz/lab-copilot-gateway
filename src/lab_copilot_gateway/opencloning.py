@@ -40,6 +40,11 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from lab_copilot_gateway.approval import ApprovalStore, compute_args_hash
+from lab_copilot_gateway.artifact_bundle import (
+    ArtifactBundleError,
+    ArtifactBundleStore,
+    get_artifact_bundle_store,
+)
 from lab_copilot_gateway.audit import AuditRecord, AuditStore
 from lab_copilot_gateway.elabftw import (
     ElabftwClient,
@@ -463,6 +468,7 @@ class OpenCloningAdapter:
     client: OpenCloningClient | None
     elabftw_client: ElabftwClient | None = None
     approval_store: ApprovalStore | None = None
+    artifact_store: ArtifactBundleStore | None = None
     action_id_prefix: str = "opencloning"
 
     # --- public API: four C16 tool entrypoints --------------------------
@@ -759,25 +765,62 @@ class OpenCloningAdapter:
             6. Records an audit row.
 
         The eLabFTW client must be configured (``elabftw_client`` field).
-        The OpenCloning client is NOT needed for this tool — the artifact
-        content is provided by the caller (from a prior OpenCloning call).
+        The OpenCloning client is NOT needed for this tool.  V1 accepts either
+        legacy inline ``artifact_content`` or a bundle reference
+        (``artifact_id`` + ``plan_id`` + ``plan_hash`` + expected hash/size).
         """
         artifact_filename = approval_args.get("artifact_filename", "construct.gb")
-        artifact_content = approval_args.get("artifact_content", "")
+        artifact_content = approval_args.get("artifact_content")
         artifact_comment = approval_args.get(
             "artifact_comment", "OpenCloning design artifact"
         )
+        artifact_reference = None
+        if artifact_content is None and approval_args.get("artifact_id"):
+            artifact_reference = {
+                "artifact_id": approval_args.get("artifact_id"),
+                "plan_id": approval_args.get("plan_id"),
+                "plan_hash": approval_args.get("plan_hash"),
+                "expected_sha256": approval_args.get("artifact_sha256"),
+                "expected_size_bytes": approval_args.get("artifact_size_bytes"),
+            }
+            missing = [
+                key
+                for key, value in artifact_reference.items()
+                if key
+                in {
+                    "artifact_id",
+                    "plan_id",
+                    "plan_hash",
+                    "expected_sha256",
+                    "expected_size_bytes",
+                }
+                and (value is None or value == "")
+            ]
+            if missing:
+                raise OpenCloningAdapterError(
+                    reason="missing_artifact_reference",
+                    message=f"artifact bundle reference missing required fields: {missing}",
+                )
+        elif artifact_content is None:
+            raise OpenCloningAdapterError(
+                reason="missing_artifact_payload",
+                message="writeback requires artifact_content or a complete artifact bundle reference",
+            )
 
         # The artifact content is the hash-bound payload.  Convert to bytes
         # for the eLabFTW upload_attachment call.
         artifact_bytes = (
-            artifact_content.encode("utf-8")
-            if isinstance(artifact_content, str)
-            else artifact_content
+            b""
+            if artifact_reference
+            else (
+                artifact_content.encode("utf-8")
+                if isinstance(artifact_content, str)
+                else artifact_content or b""
+            )
         )
 
         # Enforce file-size limit on the artifact too (defense in depth).
-        if len(artifact_bytes) > MAX_FILE_SIZE_BYTES:
+        if not artifact_reference and len(artifact_bytes) > MAX_FILE_SIZE_BYTES:
             self._audit(
                 tool_name=TOOL_WRITEBACK,
                 policy_decision="deny",
@@ -820,6 +863,7 @@ class OpenCloningAdapter:
             artifact_filename=artifact_filename,
             artifact_bytes=artifact_bytes,
             artifact_comment=artifact_comment,
+            artifact_reference=artifact_reference,
             plan_approval_id=plan_approval_id,
         )
 
@@ -839,6 +883,7 @@ class OpenCloningAdapter:
         artifact_filename: str,
         artifact_bytes: bytes,
         artifact_comment: str,
+        artifact_reference: dict[str, Any] | None = None,
         plan_approval_id: str | None = None,
     ) -> OpenCloningResult:
         """Writeback orchestration: token → identity → policy → approval → upload → provenance → audit.
@@ -851,7 +896,11 @@ class OpenCloningAdapter:
         early_hash = compute_args_hash(
             {
                 "artifact_filename": artifact_filename,
-                "artifact_size": len(artifact_bytes),
+                "artifact_size": (
+                    artifact_reference.get("expected_size_bytes")
+                    if artifact_reference
+                    else len(artifact_bytes)
+                ),
                 "token_present": bool(context_token),
             }
         )
@@ -894,6 +943,52 @@ class OpenCloningAdapter:
                 error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
             )
             raise
+
+        if artifact_reference:
+            try:
+                stored = (self.artifact_store or get_artifact_bundle_store()).get(
+                    plan_id=str(artifact_reference.get("plan_id") or ""),
+                    plan_hash=str(artifact_reference.get("plan_hash") or ""),
+                    artifact_id=str(artifact_reference.get("artifact_id") or ""),
+                    expected_sha256=artifact_reference.get("expected_sha256"),
+                    expected_size_bytes=artifact_reference.get("expected_size_bytes"),
+                    binding={
+                        "record_type": claims.record_type,
+                        "record_id": str(claims.experiment_id),
+                        "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
+                    },
+                )
+            except ArtifactBundleError as exc:
+                self._audit(
+                    tool_name=TOOL_WRITEBACK,
+                    policy_decision="deny",
+                    reason=f"artifact_bundle_error:{type(exc).__name__}",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=early_hash,
+                    error={
+                        "code": "ARTIFACT_BUNDLE_ERROR",
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                raise OpenCloningAdapterError(
+                    reason="artifact_bundle_error",
+                    message=f"artifact bundle lookup failed: {exc}",
+                ) from exc
+            artifact_filename = str(
+                artifact_filename or stored.filename or "construct.gb"
+            )
+            artifact_bytes = stored.bytes_data
+
+            if len(artifact_bytes) > MAX_FILE_SIZE_BYTES:
+                raise FileTooLarge(len(artifact_bytes), MAX_FILE_SIZE_BYTES)
 
         tool_args_hash = compute_args_hash(
             {

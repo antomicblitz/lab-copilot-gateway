@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from lab_copilot_gateway import __version__
 from lab_copilot_gateway.app import create_app
 from lab_copilot_gateway.approval import ApprovalRequest, ApprovalStore
+from lab_copilot_gateway.artifact_bundle import ArtifactBundleStore
 from lab_copilot_gateway.audit import AuditStore
 from lab_copilot_gateway.elabftw import (
     ContextTokenClaims,
@@ -20,6 +21,7 @@ from lab_copilot_gateway.elabftw import (
     mint_context_token,
 )
 from lab_copilot_gateway.identity import DbIdentityMapper
+from lab_copilot_gateway.opencloning import OpenCloningAdapter, StubOpenCloningClient
 from lab_copilot_gateway.plan import Plan, PlanRiskTier, PlanStep
 from lab_copilot_gateway.policy import PolicyEngine
 
@@ -29,9 +31,11 @@ def _reset_audit_store(monkeypatch) -> None:
     """Use in-memory audit store per test to avoid cross-test bleed."""
     import lab_copilot_gateway.app as appmod
     import lab_copilot_gateway.approval as approvalmod
+    import lab_copilot_gateway.artifact_bundle as artifactmod
     import lab_copilot_gateway.audit as auditmod
     import lab_copilot_gateway.elabftw as elabmod
     import lab_copilot_gateway.identity as identitymod
+    import lab_copilot_gateway.opencloning as opencloningmod
     import lab_copilot_gateway.policy as policymod
     import lab_copilot_gateway.plan_executor as pemod
     import lab_copilot_gateway.tools as toolsmod
@@ -54,6 +58,7 @@ def _reset_audit_store(monkeypatch) -> None:
     policymod._default_engine = PolicyEngine()  # clean default, no kill switches
     # Inject into the module-level singleton before create_app runs.
     auditmod._default_store = store
+    artifactmod._default_store = ArtifactBundleStore()
     identitymod._default_mapper = DbIdentityMapper(db_path=":memory:")
     approvalmod._default_store = approval_store
     # Wire the eLabFTW adapter with a stub client so the HTTP path is testable
@@ -92,11 +97,13 @@ def _reset_audit_store(monkeypatch) -> None:
     store.close()
     approval_store.close()
     auditmod._default_store = original_audit
+    artifactmod._default_store = None
     policymod._default_engine = original_policy
     identitymod._default_mapper = None
     approvalmod._default_store = None
     elabmod._default_adapter = None
     elabmod._default_write_adapter = None
+    opencloningmod.reset_opencloning_adapter(None)
     toolsmod._default_registry = original_tools
     pemod.reset_plan_executor(None)
     authmod.reset_auth_config()  # clear auth singleton for next test
@@ -551,6 +558,203 @@ def _http_claims(experiment_id: int = 42) -> ContextTokenClaims:
 
 def _http_token(claims: ContextTokenClaims | None = None) -> str:
     return mint_context_token(claims or _http_claims())
+
+
+def test_artifact_download_returns_hash_matched_bytes() -> None:
+    """GET /v1/artifacts downloads same bytes advertised by the manifest."""
+    import lab_copilot_gateway.artifact_bundle as artifactmod
+
+    data = b"LOCUS test\n//\n"
+    assert artifactmod._default_store is not None
+    manifest = artifactmod._default_store.put(
+        plan_id="plan-1",
+        plan_hash="hash-1",
+        artifact_id="oc-artifact-1",
+        filename="construct.gb",
+        mime_type="chemical/x-genbank",
+        data=data,
+        binding={
+            "record_type": "experiment",
+            "record_id": "42",
+            "mapped_elabftw_user_id": "elab-http-1",
+        },
+    )
+
+    r = make_client().get(
+        "/v1/artifacts/oc-artifact-1/download",
+        params={
+            "plan_id": "plan-1",
+            "plan_hash": "hash-1",
+            "artifact_sha256": manifest["sha256"],
+            "artifact_size_bytes": manifest["size_bytes"],
+        },
+        headers={"X-Lab-Copilot-Context-Token": _http_token()},
+    )
+
+    assert r.status_code == 200
+    assert r.content == data
+    assert r.headers["content-type"] == "chemical/x-genbank"
+    assert "construct.gb" in r.headers["content-disposition"]
+    assert r.headers["x-lab-copilot-artifact-sha256"] == manifest["sha256"]
+    assert hashlib.sha256(r.content).hexdigest() == manifest["sha256"]
+
+
+def test_artifact_download_rejects_wrong_context() -> None:
+    """Artifact binding prevents cross-record download from stale cards."""
+    import lab_copilot_gateway.artifact_bundle as artifactmod
+
+    assert artifactmod._default_store is not None
+    manifest = artifactmod._default_store.put(
+        plan_id="plan-1",
+        plan_hash="hash-1",
+        artifact_id="oc-artifact-1",
+        filename="construct.gb",
+        mime_type="chemical/x-genbank",
+        data=b"LOCUS test\n//\n",
+        binding={
+            "record_type": "experiment",
+            "record_id": "42",
+            "mapped_elabftw_user_id": "elab-http-1",
+        },
+    )
+
+    r = make_client().get(
+        "/v1/artifacts/oc-artifact-1/download",
+        params={
+            "plan_id": "plan-1",
+            "plan_hash": "hash-1",
+            "artifact_sha256": manifest["sha256"],
+            "artifact_size_bytes": manifest["size_bytes"],
+        },
+        headers={"X-Lab-Copilot-Context-Token": _http_token(_http_claims(43))},
+    )
+
+    assert r.status_code == 403
+    assert r.json()["detail"]["reason"] == "artifact_context_mismatch"
+
+
+def test_artifact_download_rejects_stale_plan_hash() -> None:
+    """Plan hash is part of artifact lookup identity."""
+    import lab_copilot_gateway.artifact_bundle as artifactmod
+
+    assert artifactmod._default_store is not None
+    manifest = artifactmod._default_store.put(
+        plan_id="plan-1",
+        plan_hash="hash-1",
+        artifact_id="oc-artifact-1",
+        filename="construct.gb",
+        mime_type="chemical/x-genbank",
+        data=b"LOCUS test\n//\n",
+    )
+
+    r = make_client().get(
+        "/v1/artifacts/oc-artifact-1/download",
+        params={
+            "plan_id": "plan-1",
+            "plan_hash": "hash-2",
+            "artifact_sha256": manifest["sha256"],
+            "artifact_size_bytes": manifest["size_bytes"],
+        },
+        headers={"X-Lab-Copilot-Context-Token": _http_token()},
+    )
+
+    assert r.status_code == 404
+    assert r.json()["detail"]["reason"] == "artifact_missing"
+
+
+def test_artifact_download_rejects_invalid_context_token() -> None:
+    """Downloads require the launcher context token header."""
+    r = make_client().get(
+        "/v1/artifacts/oc-artifact-1/download",
+        params={
+            "plan_id": "plan-1",
+            "plan_hash": "hash-1",
+            "artifact_sha256": "0" * 64,
+            "artifact_size_bytes": 1,
+        },
+        headers={"X-Lab-Copilot-Context-Token": "garbage.payload"},
+    )
+
+    assert r.status_code == 401
+    assert r.json()["detail"]["reason"] == "invalid_context_token"
+
+
+def test_opencloning_invoke_redacts_file_content_and_stores_artifact() -> None:
+    """OpenCloning /invoke returns manifests, not raw GenBank bytes."""
+    import lab_copilot_gateway.artifact_bundle as artifactmod
+    import lab_copilot_gateway.audit as auditmod
+    import lab_copilot_gateway.identity as identitymod
+    import lab_copilot_gateway.opencloning as opencloningmod
+    import lab_copilot_gateway.policy as policymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+    genbank = "LOCUS       pDemo 4 bp DNA circular SYN 01-JUL-2026\nORIGIN\n1 atgc\n//"
+    stub = StubOpenCloningClient(
+        responses={
+            "manual_sequence": {
+                "sources": [{"id": 0, "type": "ManuallyTypedSource"}],
+                "sequences": [
+                    {
+                        "id": 0,
+                        "type": "TextFileSequence",
+                        "sequence_file_format": "genbank",
+                        "file_content": genbank,
+                    }
+                ],
+            }
+        }
+    )
+    opencloningmod.reset_opencloning_adapter(
+        OpenCloningAdapter(
+            policy_engine=policymod._default_engine,
+            audit_store=auditmod._default_store,
+            client=stub,
+            artifact_store=artifactmod._default_store,
+        )
+    )
+
+    r = make_client().post(
+        "/invoke",
+        json={
+            "tool_name": "opencloning.manual_sequence",
+            "context_token": _http_token(),
+            "args": {"sequence": "ATGC", "circular": True},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+            "request_id": "req-oc-1",
+        },
+    )
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    sequence = body["result"]["result"]["sequences"][0]
+    assert sequence["file_content"]["redacted"] is True
+    assert "LOCUS" not in str(body)
+    artifact = body["opencloning_artifacts"]["artifacts"][0]
+    assert artifact["filename"] == "pDemo.gb"
+    assert artifact["sha256"] == hashlib.sha256(genbank.encode()).hexdigest()
+
+    downloaded = artifactmod._default_store.get(
+        plan_id=body["opencloning_artifacts"]["plan_id"],
+        plan_hash=body["opencloning_artifacts"]["plan_hash"],
+        artifact_id=artifact["artifact_id"],
+        expected_sha256=artifact["sha256"],
+        expected_size_bytes=artifact["size_bytes"],
+        binding={
+            "record_type": "experiment",
+            "record_id": "42",
+            "mapped_elabftw_user_id": "elab-http-1",
+        },
+    )
+    assert downloaded.bytes_data == genbank.encode()
 
 
 def test_elabftw_read_current_experiment_succeeds() -> None:
