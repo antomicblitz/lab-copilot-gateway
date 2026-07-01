@@ -33,7 +33,12 @@ from lab_copilot_gateway.plan import (
 from lab_copilot_gateway.plan_executor import (
     PlanExecutor,
 )
-from lab_copilot_gateway.policy import PolicyEngine
+from lab_copilot_gateway.policy import PolicyEngine, Tier
+from lab_copilot_gateway.wallac import (
+    StubWallacBridgeClient,
+    StubWallacClient,
+    WallacAdapter,
+)
 
 SECRET = b"test-secret-plan-executor"
 
@@ -1263,3 +1268,202 @@ def test_non_autonomous_plan_still_requires_approval_with_autonomy(
 
     assert result.status == "rejected"
     assert "Approval required" in result.summary
+
+
+# =============================================================================
+# C42 — Wallac plan/preflight integration
+# =============================================================================
+
+
+def _wallac_plan() -> Plan:
+    """A hardware-tier Wallac plan for C42 tests."""
+    return Plan(
+        plan_id="plan-test-wallac",
+        intent="Run Wallac generated protocol with preflight",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "300",
+        },
+        risk_tier=PlanRiskTier.HARDWARE,
+        summary="Check status, validate protocol, submit for execution.",
+        reads=[
+            PlanStep(
+                tool_name="wallac.get_status",
+            ),
+            PlanStep(
+                tool_name="wallac.validate_generated_protocol",
+                args={"job_item_id": 99},
+            ),
+        ],
+        writes=[
+            PlanStep(
+                tool_name="wallac.submit_generated_protocol",
+                record_id="elabftw:experiment:300",
+                args={"job_item_id": 99},
+                preview_type="summary",
+            ),
+        ],
+        artifacts=[],
+        approval_required=True,
+        rollback="Abort via hardware kill switch; results are non-reversible",
+    )
+
+
+def _build_wallac_executor(
+    *,
+    approval_store: ApprovalStore | None = None,
+) -> tuple[PlanExecutor, ApprovalStore]:
+    """Build a PlanExecutor with a Wallac adapter (bridge + stub client)."""
+    audit = AuditStore(db_path=":memory:")
+    approval_store = approval_store or ApprovalStore(db_path=":memory:")
+    # Policy must allow tier 5 for the submit step.
+    policy = PolicyEngine(
+        max_tier=Tier.CLOSED_LOOP_AUTONOMY,
+        block_hardware_above=Tier.CLOSED_LOOP_AUTONOMY,
+    )
+    stub = StubElabftwClient(seeds={})
+    wallac_stub = StubWallacClient()
+    bridge_stub = StubWallacBridgeClient()
+    read = ElabftwReadAdapter(policy_engine=policy, audit_store=audit, client=stub)
+    write = ElabftwWriteAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        approval_store=approval_store,
+        client=stub,
+    )
+    wallac_adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=wallac_stub,
+        bridge_client=bridge_stub,
+        approval_store=approval_store,
+    )
+    executor = PlanExecutor(
+        approval_store=approval_store,
+        read_adapter=read,
+        write_adapter=write,
+        wallac_adapter=wallac_adapter,
+    )
+    return executor, approval_store
+
+
+def test_wallac_plan_all_steps_succeed() -> None:
+    """C42: Wallac plan with status + validate + submit executes successfully."""
+    executor, approval_store = _build_wallac_executor()
+    plan = _wallac_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=300),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    assert len(result.step_results) == 3  # 2 reads + 1 write
+    assert result.step_results[0].tool_name == "wallac.get_status"
+    assert result.step_results[0].status == "success"
+    assert result.step_results[1].tool_name == "wallac.validate_generated_protocol"
+    assert result.step_results[1].status == "success"
+    assert result.step_results[2].tool_name == "wallac.submit_generated_protocol"
+    assert result.step_results[2].status == "success"
+    assert result.step_results[2].audit_action_id is not None
+
+
+def test_wallac_plan_skips_per_step_approval_consume() -> None:
+    """C42: plan-level approval covers the submit step (no double-consume)."""
+    executor, approval_store = _build_wallac_executor()
+    plan = _wallac_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=300),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    # The plan-level approval was consumed once.
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.is_consumed()
+    # No additional approval tokens were created or consumed.
+    assert approval_store.count() == 1
+
+
+def test_wallac_plan_without_adapter_fails() -> None:
+    """C42: Wallac plan steps fail when adapter is not configured."""
+    # Build executor without wallac_adapter.
+    audit = AuditStore(db_path=":memory:")
+    approval_store = ApprovalStore(db_path=":memory:")
+    policy = PolicyEngine()
+    stub = StubElabftwClient(seeds={})
+    read = ElabftwReadAdapter(policy_engine=policy, audit_store=audit, client=stub)
+    write = ElabftwWriteAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        approval_store=approval_store,
+        client=stub,
+    )
+    executor = PlanExecutor(
+        approval_store=approval_store,
+        read_adapter=read,
+        write_adapter=write,
+        # wallac_adapter=None
+    )
+    plan = _wallac_plan()
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=300),
+        mapped_identity=_identity(),
+    )
+
+    # The read step (wallac.get_status) should fail with wallac_not_configured.
+    assert result.status == "partial_failure"
+    assert result.step_results[0].status == "failed"
+    assert "wallac_not_configured" in result.step_results[0].error
+
+
+def test_wallac_plan_reads_only() -> None:
+    """C42: Wallac plan with only read steps (status + validate)."""
+    executor, approval_store = _build_wallac_executor()
+    plan = Plan(
+        plan_id="plan-test-wallac-reads",
+        intent="Check Wallac status and validate protocol",
+        anchor={
+            "system": "elabftw",
+            "record_type": "experiment",
+            "record_id": "300",
+        },
+        risk_tier=PlanRiskTier.HARDWARE,
+        summary="Preflight: check status and validate protocol.",
+        reads=[
+            PlanStep(tool_name="wallac.get_status"),
+            PlanStep(
+                tool_name="wallac.validate_generated_protocol",
+                args={"job_item_id": 99},
+            ),
+        ],
+        writes=[],
+        artifacts=[],
+        approval_required=True,
+        rollback="No writes — nothing to roll back",
+    )
+    approval_id = _create_approval(approval_store, plan)
+
+    result = executor.execute(
+        plan,
+        approval_id=approval_id,
+        context_token=_token(experiment_id=300),
+        mapped_identity=_identity(),
+    )
+
+    assert result.status == "completed"
+    assert len(result.step_results) == 2
+    assert all(r.status == "success" for r in result.step_results)

@@ -627,6 +627,7 @@ class WallacAdapter:
         librechat_user_id: str | None = None,
         provider: str | None = None,
         model_id: str | None = None,
+        plan_approval_id: str | None = None,
     ) -> WallacResult:
         """Submit an approved Wallac generated protocol for hardware execution.
 
@@ -642,6 +643,11 @@ class WallacAdapter:
         prepared by the C19 prepare+validate flow.  ``approval_id`` and
         ``approval_args`` are the single-use approval token and its
         bound args (issued via POST /approval/request).
+
+        C42: when ``plan_approval_id`` is set, the plan executor has
+        already consumed the plan-level approval (bound to the plan hash).
+        Skip the per-step consume and use the plan approval_id in audit
+        records (same pattern as OpenCloning C41).
         """
         return self._execute_submit(
             context_token=context_token,
@@ -655,6 +661,7 @@ class WallacAdapter:
             librechat_user_id=librechat_user_id,
             provider=provider,
             model_id=model_id,
+            plan_approval_id=plan_approval_id,
         )
 
     # --- shared orchestration --------------------------------------------
@@ -707,6 +714,7 @@ class WallacAdapter:
         librechat_user_id: str | None,
         provider: str | None,
         model_id: str | None,
+        plan_approval_id: str | None = None,
     ) -> WallacResult:
         """Submit orchestration: token -> identity -> policy -> approval -> bridge -> provenance -> audit.
 
@@ -714,6 +722,10 @@ class WallacAdapter:
         The approval is consumed AFTER the policy allow but BEFORE the
         bridge call — the token is single-use and NOT refunded on bridge
         failure, preventing replay.
+
+        C42: when ``plan_approval_id`` is set, the plan executor has
+        already consumed the plan-level approval.  Skip the per-step
+        consume and use the plan approval_id in audit records.
 
         Unknown/abort statuses from the bridge are returned as results
         (not exceptions) so the caller sees the actual execution outcome.
@@ -900,7 +912,13 @@ class WallacAdapter:
 
         # 5. Approval token consume (single-use, args-hash-bound).
         #    Happens AFTER policy allow, BEFORE the bridge call.
-        if self.approval_store is not None:
+        # C42: when ``plan_approval_id`` is set, the plan executor has
+        # already consumed the plan-level approval (bound to the plan hash,
+        # which covers all step args).  Skip the per-step consume and use
+        # the plan approval_id in audit records.
+        if plan_approval_id:
+            effective_approval_id = plan_approval_id
+        elif self.approval_store is not None:
             try:
                 self.approval_store.consume(
                     approval_id,
@@ -908,6 +926,7 @@ class WallacAdapter:
                     args_hash=compute_args_hash(approval_args),
                     target_record=f"wallac:job:{job_item_id}",
                 )
+                effective_approval_id = approval_id
             except Exception as exc:
                 from lab_copilot_gateway.approval import ApprovalError
 
@@ -940,6 +959,8 @@ class WallacAdapter:
                     reason=reason_code,
                     message=f"approval token consume failed: {exc}",
                 ) from exc
+        else:
+            effective_approval_id = approval_id
 
         # 6. Bridge client must be configured.
         if self.bridge_client is None:
@@ -956,7 +977,7 @@ class WallacAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 error={"code": "WALLAC_BRIDGE_NOT_CONFIGURED"},
             )
             raise WallacAdapterError(
@@ -984,7 +1005,7 @@ class WallacAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
+                approval_id=effective_approval_id,
                 api_call_summary={
                     "method": "POST",
                     "path": f"/api/jobs/{job_item_id}/submit",
@@ -1040,7 +1061,7 @@ class WallacAdapter:
             provider=provider,
             model_id=model_id,
             tool_args_hash=tool_args_hash,
-            approval_id=approval_id,
+            approval_id=effective_approval_id,
             api_call_summary={
                 "method": "POST",
                 "path": f"/api/jobs/{job_item_id}/submit",

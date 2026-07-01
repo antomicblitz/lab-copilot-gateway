@@ -58,6 +58,13 @@ from lab_copilot_gateway.plan import (
     compute_plan_hash,
     validate_or_raise,
 )
+from lab_copilot_gateway.wallac import (
+    WallacAdapter,
+    WallacAdapterError,
+    TOOL_GET_STATUS as TOOL_WALLAC_STATUS,
+    TOOL_SUBMIT as TOOL_WALLAC_SUBMIT,
+    TOOL_VALIDATE as TOOL_WALLAC_VALIDATE,
+)
 
 
 # --- retry semantics (C40) ---------------------------------------------------
@@ -174,11 +181,13 @@ class PlanExecutor:
         read_adapter: ElabftwReadAdapter,
         write_adapter: ElabftwWriteAdapter,
         opencloning_adapter: OpenCloningAdapter | None = None,
+        wallac_adapter: WallacAdapter | None = None,
     ) -> None:
         self.approval_store = approval_store
         self.read_adapter = read_adapter
         self.write_adapter = write_adapter
         self.opencloning_adapter = opencloning_adapter
+        self.wallac_adapter = wallac_adapter
 
     def execute(
         self,
@@ -342,7 +351,11 @@ class PlanExecutor:
                         ),
                     )
                 )
-            except (ElabftwAdapterError, OpenCloningAdapterError) as exc:
+            except (
+                ElabftwAdapterError,
+                OpenCloningAdapterError,
+                WallacAdapterError,
+            ) as exc:
                 error_str = f"{exc.reason}: {exc.message}"
                 step_results.append(
                     StepResult(
@@ -503,6 +516,43 @@ class PlanExecutor:
                 )
             return result.to_dict()
 
+        # --- Wallac reads (C42) ---
+        wallac_read_tools = {TOOL_WALLAC_STATUS, TOOL_WALLAC_VALIDATE}
+        if step.tool_name in wallac_read_tools:
+            if self.wallac_adapter is None:
+                raise WallacAdapterError(
+                    reason="wallac_not_configured",
+                    message=(
+                        "Wallac adapter not configured for plan execution "
+                        "(set LAB_COPILOT_WALLAC_VM_AGENT_URL)"
+                    ),
+                )
+            if step.tool_name == TOOL_WALLAC_STATUS:
+                result = self.wallac_adapter.get_status(
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+                return result.to_dict()
+            else:  # TOOL_WALLAC_VALIDATE
+                result = self.wallac_adapter.validate_generated_protocol(
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    job_item_id=step.args.get("job_item_id", 0),
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+                return result.to_dict()
+
         raise ElabftwAdapterError(
             reason="unsupported_read_tool",
             message=f"plan read step tool {step.tool_name!r} not supported by plan executor",
@@ -563,6 +613,32 @@ class PlanExecutor:
                 plan_approval_id=plan_approval_id,
             )
             return result.to_dict()
+        elif step.tool_name == TOOL_WALLAC_SUBMIT:
+            # C42: Wallac submit — uses the Wallac adapter with
+            # plan_approval_id to skip per-step approval consume.
+            if self.wallac_adapter is None:
+                raise WallacAdapterError(
+                    reason="wallac_not_configured",
+                    message=(
+                        "Wallac adapter not configured for plan execution "
+                        "(set LAB_COPILOT_WALLAC_VM_AGENT_URL)"
+                    ),
+                )
+            result = self.wallac_adapter.submit_generated_protocol(
+                context_token=context_token,
+                approval_id=plan_approval_id,
+                approval_args=step.args,
+                job_item_id=step.args.get("job_item_id", 0),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                plan_approval_id=plan_approval_id,
+            )
+            return result.to_dict()
         else:
             raise ElabftwAdapterError(
                 reason="unsupported_write_tool",
@@ -585,12 +661,14 @@ def get_plan_executor() -> PlanExecutor:
             get_elabftw_write_adapter,
         )
         from lab_copilot_gateway.opencloning import get_opencloning_adapter
+        from lab_copilot_gateway.wallac import get_wallac_adapter
 
         _default_executor = PlanExecutor(
             approval_store=get_approval_store(),
             read_adapter=get_elabftw_read_adapter(),
             write_adapter=get_elabftw_write_adapter(),
             opencloning_adapter=get_opencloning_adapter(),
+            wallac_adapter=get_wallac_adapter(),
         )
     return _default_executor
 
