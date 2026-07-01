@@ -236,11 +236,13 @@ def _sequence_summary(
     feature_count = _int_or_none(sequence.get("feature_count"))
     if feature_count is None:
         feature_count = _genbank_feature_count(file_content)
+    features = _genbank_features(file_content)
     return {
         "name": name,
         "length_bp": length_bp,
         "circular": circular,
         "feature_count": feature_count,
+        "features": features,
     }
 
 
@@ -356,6 +358,53 @@ def _genbank_feature_count(file_content: str) -> int:
         if in_features and re.match(r"^\s{5}\S", line):
             count += 1
     return count
+
+
+def _genbank_features(file_content: str) -> list[dict[str, str]]:
+    """Extract feature types, locations, and labels from a GenBank file.
+
+    Returns a list of {type, location, label, strand} dicts.  The LLM
+    uses these to decide which regions to PCR-amplify, digest, etc.
+    """
+    features: list[dict[str, str]] = []
+    in_features = False
+    current: dict[str, str] | None = None
+    for line in file_content.splitlines():
+        if line.startswith("FEATURES"):
+            in_features = True
+            continue
+        if in_features and (line.startswith("ORIGIN") or line.startswith("//")):
+            break
+        if not in_features:
+            continue
+        # Feature lines start at column 5 with a type name.
+        feat_match = re.match(r"^\s{5}(\S+)\s+(.+)$", line)
+        if feat_match:
+            if current:
+                features.append(current)
+            ftype = feat_match.group(1)
+            location = feat_match.group(2).strip()
+            strand = "reverse" if "complement" in location else "forward"
+            current = {
+                "type": ftype,
+                "location": location,
+                "strand": strand,
+                "label": "",
+            }
+        elif current and re.match(r"^\s+/", line):
+            qual_match = re.match(r"^\s+/(\w+)=(.*)$", line)
+            if qual_match and qual_match.group(1) == "label":
+                current["label"] = qual_match.group(2).strip().strip('"')
+            elif qual_match and qual_match.group(1) == "gene":
+                if not current["label"]:
+                    current["label"] = qual_match.group(2).strip().strip('"')
+            elif qual_match and qual_match.group(1) == "product":
+                if not current["label"]:
+                    current["label"] = qual_match.group(2).strip().strip('"')
+    if current:
+        features.append(current)
+    # Limit to 50 features to keep the manifest compact.
+    return features[:50]
 
 
 def _int_or_none(value: Any) -> int | None:

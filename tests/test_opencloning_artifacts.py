@@ -52,12 +52,13 @@ def test_normalize_gibson_result_creates_final_product_manifest() -> None:
     assert artifact["mime_type"] == "chemical/x-genbank"
     assert artifact["size_bytes"] == len(GENBANK.encode())
     assert artifact["sha256"] == hashlib.sha256(GENBANK.encode()).hexdigest()
-    assert artifact["sequence_summary"] == {
-        "name": "pDemo",
-        "length_bp": 12,
-        "circular": True,
-        "feature_count": 2,
-    }
+    assert artifact["sequence_summary"]["name"] == "pDemo"
+    assert artifact["sequence_summary"]["length_bp"] == 12
+    assert artifact["sequence_summary"]["circular"] is True
+    assert artifact["sequence_summary"]["feature_count"] == 2
+    assert len(artifact["sequence_summary"]["features"]) == 2
+    assert artifact["sequence_summary"]["features"][0]["type"] == "source"
+    assert artifact["sequence_summary"]["features"][1]["type"] == "CDS"
     assert artifact["provenance"]["source_inputs"] == ["insert.gb", "vector.gb"]
     assert artifact["opencloning_handoff"]["url"] == "/opencloning"
     assert artifact["writeback_eligible"] is True

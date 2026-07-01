@@ -390,6 +390,41 @@ class HttpOpenCloningClient:
         return resp.json()
 
 
+def _inject_file_content_from_store(
+    body: dict[str, Any], store: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Inject file_content from the sequence store into sequence objects.
+
+    When the LLM passes sequences to opencloning.call, it omits
+    file_content (because the gateway redacts it in responses). But
+    OpenCloning needs file_content to process the sequences. This function
+    looks up each sequence by its id in the store and injects the stored
+    file_content if the sequence doesn't already have it.
+
+    Also strips any redacted file_content placeholder the LLM might have
+    included (e.g. {redacted: true, ...}).
+    """
+    sequences = body.get("sequences")
+    if not isinstance(sequences, list):
+        return body
+    for seq in sequences:
+        if not isinstance(seq, dict):
+            continue
+        fc = seq.get("file_content")
+        # If file_content is missing or is a redacted placeholder, inject
+        # the real file_content from the store.
+        if fc is None or (isinstance(fc, dict) and fc.get("redacted")):
+            seq_id = str(seq.get("id", ""))
+            stored = store.get(seq_id)
+            if stored and "file_content" in stored:
+                seq["file_content"] = stored["file_content"]
+            elif fc is not None:
+                # Remove the redacted placeholder so OpenCloning doesn't
+                # choke on it.
+                del seq["file_content"]
+    return body
+
+
 def _format_to_filename(file_format: str) -> str:
     """Map a file_format identifier to a dummy filename with the right
     extension, so OpenCloning's backend can infer the parser to use."""
@@ -470,6 +505,10 @@ class OpenCloningAdapter:
     approval_store: ApprovalStore | None = None
     artifact_store: ArtifactBundleStore | None = None
     action_id_prefix: str = "opencloning"
+    # Process-local store of full sequence objects (with file_content) from
+    # prior OpenCloning responses. Used to inject file_content into
+    # opencloning.call requests when the LLM passes redacted sequences.
+    _sequence_store: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # --- public API: four C16 tool entrypoints --------------------------
 
@@ -715,6 +754,14 @@ class OpenCloningAdapter:
         - Rename: /rename_sequence
         - Batch cloning: /batch_cloning/*
         """
+        # Inject file_content from the sequence store for any sequences
+        # that are missing it. The LLM sees redacted sequences (file_content
+        # is replaced with {redacted: true, ...}) but OpenCloning needs the
+        # raw file_content to process the sequences. The gateway stores the
+        # full sequences from prior OpenCloning responses and injects them
+        # here so the LLM never needs to handle raw sequence bytes.
+        body = _inject_file_content_from_store(body, self._sequence_store)
+
         return self._execute(
             tool_name=TOOL_CALL,
             context_token=context_token,
@@ -1561,6 +1608,18 @@ class OpenCloningAdapter:
             require_persistence=True,
             action_id=action_id,
         )
+
+        # 7b. Store sequences for later injection into opencloning.call.
+        # The LLM sees redacted sequences (file_content replaced with
+        # {redacted: true, ...}) but subsequent OpenCloning calls need the
+        # raw file_content. We store the full sequences here so the gateway
+        # can inject file_content when the LLM passes redacted sequences.
+        if isinstance(result, dict):
+            for seq in result.get("sequences", []):
+                if isinstance(seq, dict) and "file_content" in seq:
+                    seq_id = str(seq.get("id", ""))
+                    if seq_id:
+                        self._sequence_store[seq_id] = seq
 
         return OpenCloningResult(
             tool_name=tool_name,
