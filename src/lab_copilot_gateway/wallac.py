@@ -432,6 +432,7 @@ class WallacResult:
 # Tool name from the C06 registry.
 TOOL_GET_STATUS = "wallac.get_status"
 TOOL_CALL = "wallac.call"
+TOOL_RUN = "wallac.run"
 TOOL_PROPOSE = "wallac.propose_generated_protocol"
 TOOL_VALIDATE = "wallac.validate_generated_protocol"
 TOOL_PREPARE_SUBMISSION = "wallac.prepare_submission_package"
@@ -442,6 +443,10 @@ TOOL_TIER = Tier.OPERATIONAL_READ_ONLY
 
 # C19 proposal/validation is tier 3 (VALIDATION_DRY_RUN).
 TOOL_TIER_C19 = Tier.VALIDATION_DRY_RUN
+
+# Real hardware run is tier 4 (BOUNDED_WRITES) — requires approval but
+# is NOT blocked by the hardware_blocked policy rule (tier 5+).
+TOOL_TIER_RUN = Tier.BOUNDED_WRITES
 
 # C21 hardware execution is tier 5 (HARDWARE_EXECUTION).
 TOOL_TIER_SUBMIT = Tier.HARDWARE_EXECUTION
@@ -562,6 +567,334 @@ class WallacAdapter:
             api_call_summary={"method": method_upper, "path": f"/{endpoint_clean}"},
             exec_fn=lambda _client: _client.call(method_upper, endpoint_clean, effective_body),
             tier_override=TOOL_TIER_C19,
+        )
+
+    # --- real hardware execution (tier 4, requires approval) -------------
+
+    def run(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        approval_id: str,
+        protocol_id: int,
+        plate_id: int | None = None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+        plan_approval_id: str | None = None,
+    ) -> WallacResult:
+        """Start a real measurement run on the Wallac Victor2.
+
+        This is tier 4 (BOUNDED_WRITES) — it requires an approval token.
+        The approval is consumed server-side before the vm-agent call.
+
+        Unlike ``wallac.call`` (which forces dry_run=true for POST /runs),
+        this tool sends the real request to the vm-agent's POST /runs
+        endpoint with dry_run=false (or omitted).
+
+        Args:
+            protocol_id: the vm-agent protocol ID (from GET /protocols).
+            plate_id: optional plate identifier.
+            approval_id: single-use approval token from POST /approval/request.
+        """
+        body: dict[str, Any] = {"protocol_id": protocol_id, "dry_run": False}
+        if plate_id is not None:
+            body["plate_id"] = plate_id
+
+        # The raw args dict is what the approval request hashed — must match
+        # for the approval consume to succeed.
+        raw_args: dict[str, Any] = {"protocol_id": protocol_id}
+        if plate_id is not None:
+            raw_args["plate_id"] = plate_id
+
+        return self._execute_run(
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            approval_id=approval_id,
+            body=body,
+            raw_args=raw_args,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            plan_approval_id=plan_approval_id,
+        )
+
+    def _execute_run(
+        self,
+        *,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        approval_id: str,
+        body: dict[str, Any],
+        raw_args: dict[str, Any],
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        plan_approval_id: str | None = None,
+    ) -> WallacResult:
+        """Shared orchestration for wallac.run (approval-gated POST /runs).
+
+        Follows the same pattern as _execute_submit: token verify →
+        identity → policy (tier 4) → approval consume → downstream call
+        → audit.
+        """
+        # Compute early hash for audit on failure paths.
+        # The hash must match what the approval request computed —
+        # compute_args_hash(raw_args) — so the consume succeeds.
+        early_hash = compute_args_hash(
+            {**raw_args, "token_present": bool(context_token)}
+        )
+
+        # 1. Verify context token.
+        if not context_token:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason="missing_context_token",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "MISSING_CONTEXT_TOKEN"},
+            )
+            raise InvalidContextToken("missing")
+
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
+        tool_args_hash = compute_args_hash(
+            {**raw_args, "experiment_id": claims.experiment_id}
+        )
+
+        # 2. Identity resolution.
+        if mapped_identity is None:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 3. Token-identity binding.
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        # 4. Policy decision (tier 4 BOUNDED_WRITES).
+        policy_req = PolicyRequest(
+            tool_name=TOOL_RUN,
+            tier=TOOL_TIER_RUN,
+            adapter="wallac",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=bool(approval_id),
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+
+        if decision.decision != "allow":
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        # 5. Client-not-configured check.
+        if self.client is None:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="deny",
+                reason="wallac_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "WALLAC_NOT_CONFIGURED"},
+            )
+            raise WallacAdapterError(
+                reason="wallac_not_configured",
+                message="Wallac client not configured (set LAB_COPILOT_WALLAC_BASE_URL)",
+            )
+
+        # 6. Consume approval (single-use token).
+        # The args_hash must match what POST /approval/request computed —
+        # compute_args_hash(raw_args) — not the audit tool_args_hash
+        # (which includes experiment_id for audit correlation).
+        effective_approval_id = approval_id
+        if plan_approval_id:
+            effective_approval_id = plan_approval_id
+        elif self.approval_store is not None and approval_id:
+            try:
+                self.approval_store.consume(
+                    approval_id=approval_id,
+                    tool_name=TOOL_RUN,
+                    args_hash=compute_args_hash(raw_args),
+                )
+            except Exception as exc:
+                self._audit(
+                    tool_name=TOOL_RUN,
+                    policy_decision="allow",
+                    reason="approval_consume_failed",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={
+                        "code": "APPROVAL_CONSUME_FAILED",
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                raise WallacAdapterError(
+                    reason="approval_consume_failed",
+                    message=f"approval consume failed: {exc}",
+                ) from exc
+
+        # 7. Downstream call — POST /runs with dry_run=false.
+        try:
+            result = self.client.call("POST", "runs", body)
+        except Exception as exc:
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                api_call_summary={"method": "POST", "path": "/runs"},
+                approval_id=effective_approval_id,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise WallacAdapterError(
+                reason="client_error",
+                message=f"Wallac client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        # 8. Success — audit + return.
+        import secrets as _secrets
+        import time as _time
+
+        action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        self._audit(
+            tool_name=TOOL_RUN,
+            policy_decision="allow",
+            reason="call_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary={"method": "POST", "path": "/runs"},
+            result_summary={
+                "run_id": result.get("run_id"),
+                "state": result.get("state"),
+                "protocol_id": result.get("protocol_id"),
+            },
+            require_persistence=True,
+            action_id=action_id,
+            approval_id=effective_approval_id,
+        )
+
+        return WallacResult(
+            tool_name=TOOL_RUN,
+            result=result,
+            audit_action_id=action_id,
         )
 
     # --- C19 tools: proposal / validation / submission package -----------

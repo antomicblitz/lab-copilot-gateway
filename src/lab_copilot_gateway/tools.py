@@ -345,6 +345,19 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="read",
         description="Prepare an approval-ready Wallac submission package; execution remains blocked in v1.",
     ),
+    # --- Wallac hardware execution (approval-gated, NOT v1-blocked) -----
+    Tool(
+        name="wallac.run",
+        tier=Tier.BOUNDED_WRITES,
+        adapter="wallac",
+        requires_approval=True,
+        mutability="mutate",
+        description=(
+            "Start a REAL measurement run on the Wallac Victor2. "
+            "Requires explicit user approval. "
+            "Args: protocol_id (int, from GET /protocols), plate_id (int, optional)."
+        ),
+    ),
     # --- Wallac hardware execution (v1.1 — blocked by policy in v1) ------
     Tool(
         name="wallac.submit_generated_protocol",
