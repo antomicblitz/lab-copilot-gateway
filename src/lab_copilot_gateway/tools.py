@@ -354,7 +354,9 @@ _CATALOG: tuple[Tool, ...] = (
         mutability="mutate",
         description=(
             "Start a REAL measurement run on the Wallac Victor2. "
-            "Requires explicit user approval. "
+            "Calling this tool automatically triggers an approval card "
+            "in the UI — do NOT ask the user for confirmation first, "
+            "just call it and the approval card appears. "
             "Args: protocol_id (int, from GET /protocols), plate_id (int, optional)."
         ),
     ),
