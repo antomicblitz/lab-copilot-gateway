@@ -422,25 +422,55 @@ def _inject_file_content_from_store(
 
     Also strips any redacted file_content placeholder the LLM might have
     included (e.g. {redacted: true, ...}).
+
+    Handles sequences in multiple locations in the request body:
+    - body["sequences"] (top-level array, used by /pcr, /gibson_assembly, etc.)
+    - body["pcr_templates"][*]["sequence"] (used by /primer_design/*)
+    - body["pcr_template"]["sequence"] (used by /primer_design/simple_pair)
+    - body["homologous_recombination_target"]["sequence"] (used by /primer_design/hr)
+    - body["sequence"] (used by /align_sanger, /primer_details)
     """
-    sequences = body.get("sequences")
-    if not isinstance(sequences, list):
-        return body
-    for seq in sequences:
+    def _inject_one(seq: Any) -> None:
+        """Inject file_content into a single sequence dict if needed."""
         if not isinstance(seq, dict):
-            continue
+            return
         fc = seq.get("file_content")
-        # If file_content is missing or is a redacted placeholder, inject
-        # the real file_content from the store.
         if fc is None or (isinstance(fc, dict) and fc.get("redacted")):
             seq_id = str(seq.get("id", ""))
             stored = store.get(seq_id)
             if stored and "file_content" in stored:
                 seq["file_content"] = stored["file_content"]
             elif fc is not None:
-                # Remove the redacted placeholder so OpenCloning doesn't
-                # choke on it.
                 del seq["file_content"]
+
+    # Top-level sequences array (used by /pcr, /gibson_assembly, /restriction, etc.)
+    sequences = body.get("sequences")
+    if isinstance(sequences, list):
+        for seq in sequences:
+            _inject_one(seq)
+
+    # Primer design: pcr_templates is a list of {sequence, location, ...}
+    pcr_templates = body.get("pcr_templates")
+    if isinstance(pcr_templates, list):
+        for template in pcr_templates:
+            if isinstance(template, dict):
+                _inject_one(template.get("sequence"))
+
+    # Primer design (single): pcr_template is {sequence, location, ...}
+    pcr_template = body.get("pcr_template")
+    if isinstance(pcr_template, dict):
+        _inject_one(pcr_template.get("sequence"))
+
+    # Homologous recombination primer design: homologous_recombination_target
+    hr_target = body.get("homologous_recombination_target")
+    if isinstance(hr_target, dict):
+        _inject_one(hr_target.get("sequence"))
+
+    # Align sanger: sequence is a single sequence object (not in an array)
+    single_seq = body.get("sequence")
+    if isinstance(single_seq, dict):
+        _inject_one(single_seq)
+
     return body
 
 
