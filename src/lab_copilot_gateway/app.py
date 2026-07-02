@@ -1373,11 +1373,12 @@ def create_app() -> FastAPI:
                         provider=body.provider,
                         model_id=body.model_id,
                     )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
+                    return _opencloning_invoke_success(
+                        tool_name=tool.name,
+                        result=result,
+                        context_token=body.context_token,
+                        request_id=body.request_id,
+                    )
                 else:
                     return {
                         "ok": False,

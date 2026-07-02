@@ -1629,16 +1629,16 @@ class OpenCloningAdapter:
         )
 
         # 7b. Store sequences for later injection into opencloning.call.
-        # The LLM sees redacted sequences (file_content replaced with
-        # {redacted: true, ...}) but subsequent OpenCloning calls need the
-        # raw file_content. We store the full sequences here so the gateway
-        # can inject file_content when the LLM passes redacted sequences.
+        # The full sequences (with file_content) are stored server-side.
+        # Redaction happens in _opencloning_invoke_success (app.py) after
+        # artifact normalization, so the artifact builder can still access
+        # the raw file_content to create downloadable artifacts.
         if isinstance(result, dict):
             for seq in result.get("sequences", []):
                 if isinstance(seq, dict) and "file_content" in seq:
                     seq_id = str(seq.get("id", ""))
                     if seq_id:
-                        self._sequence_store[seq_id] = seq
+                        self._sequence_store[seq_id] = dict(seq)
 
         return OpenCloningResult(
             tool_name=tool_name,
