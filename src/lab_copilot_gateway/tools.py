@@ -420,35 +420,24 @@ _CATALOG: tuple[Tool, ...] = (
             "Args: endpoint (e.g. '/repository_id/addgene'), body (request dict)."
         ),
     ),
-    # --- NCBI sequence search (discover accessions by gene name) ----------
+    # --- SynVectorDB part search (discover sequences by description) ------
     Tool(
-        name="opencloning.search_ncbi",
+        name="opencloning.search_parts",
         tier=Tier.OPERATIONAL_READ_ONLY,
         adapter="opencloning",
         requires_approval=False,
         mutability="read",
         description=(
-            "Search NCBI's nuccore database for sequences by gene name, "
-            "organism, or keyword. Returns accession.version, title, "
-            "organism, and length for each result. Use this to find the "
-            "correct GenBank accession before importing via "
-            "/repository_id/genbank. "
-            "Args: query (str, e.g. 'nptII[Title]'), retmax (int, default 5)."
-        ),
-    ),
-    # --- SnapGene plasmid search (discover plasmids by name) -------------
-    Tool(
-        name="opencloning.search_snapgene",
-        tier=Tier.OPERATIONAL_READ_ONLY,
-        adapter="opencloning",
-        requires_approval=False,
-        mutability="read",
-        description=(
-            "Search the SnapGene plasmid catalog by name. Returns "
-            "repository_id (category/plasmid_name), name, and category. "
-            "Use this to find cloning vectors, expression vectors, and "
-            "other plasmids before importing via /repository_id/snapgene. "
-            "Args: query (str, e.g. 'pUC19'), retmax (int, default 10)."
+            "Search SynVectorDB (19,850 curated synthetic biology parts from "
+            "Addgene, iGEM, SnapGene, and lab collections) using semantic "
+            "search. Returns part name, description, source collection "
+            "(igem/addgene/snapgene), type, and sequence length. Use this "
+            "to find genes, plasmids, promoters, RBS, terminators, "
+            "resistance cassettes, reporters, etc. by natural language "
+            "description. Then import via the appropriate OpenCloning "
+            "endpoint based on source_collection. "
+            "Args: query (str, e.g. 'kanamycin resistance gene'), "
+            "retmax (int, default 5)."
         ),
     ),
 )

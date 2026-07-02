@@ -1379,265 +1379,40 @@ def create_app() -> FastAPI:
                         context_token=body.context_token,
                         request_id=body.request_id,
                     )
-                elif tool.name == "opencloning.search_ncbi":
-                    from urllib.request import urlopen as _urlopen
-                    from urllib.parse import quote as _quote
+                elif tool.name == "opencloning.search_parts":
+                    # SynVectorDB semantic search across Addgene, iGEM,
+                    # SnapGene, and lab collections (19,850 parts).
+                    from urllib.request import urlopen as _urlopen, Request as _Request
                     import json as _json
 
                     query = body.args.get("query", "")
                     retmax = int(body.args.get("retmax", 5))
 
-                    # NCBI E-utilities: esearch + esummary
-                    esearch_url = (
-                        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-                        f"?db=nuccore&term={_quote(query)}"
-                        f"&retmax={retmax}&retmode=json&sort=relevance"
-                    )
-                    with _urlopen(esearch_url, timeout=10) as resp:
-                        esearch = _json.loads(resp.read())
-                    ids = esearch.get("esearchresult", {}).get("idlist", [])
-                    if not ids:
-                        return {
-                            "ok": True,
-                            "tool_name": tool.name,
-                            "result": {"results": [], "count": 0},
-                        }
-
-                    esummary_url = (
-                        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-                        f"?db=nuccore&id={','.join(ids)}&retmode=json"
-                    )
-                    with _urlopen(esummary_url, timeout=10) as resp:
-                        esummary = _json.loads(resp.read())
+                    svdb_url = "https://testsdb.sjtu.bio/tools/semantic_search_cf"
+                    payload = _json.dumps({"query": query, "limit": retmax}).encode()
+                    req = _Request(svdb_url, data=payload, method="POST")
+                    req.add_header("Content-Type", "application/json")
+                    req.add_header("User-Agent", "LabCopilot/1.0")
+                    with _urlopen(req, timeout=15) as resp:
+                        data = _json.loads(resp.read())
 
                     results = []
-                    for uid in esummary.get("result", {}).get("uids", []):
-                        r = esummary["result"][uid]
+                    for match in data.get("matches", []):
+                        m = match.get("metadata", {})
                         results.append({
-                            "accession": r.get("accessionversion", ""),
-                            "title": r.get("title", ""),
-                            "organism": r.get("organism", ""),
-                            "length": int(r.get("slen", 0)),
+                            "uid": match.get("id", ""),
+                            "name": m.get("name", ""),
+                            "source_collection": m.get("source_collection", ""),
+                            "source_name": m.get("source_name", ""),
+                            "type": m.get("type_level_1", ""),
+                            "subtype": m.get("type_level_2", ""),
+                            "score": match.get("score", 0),
                         })
                     return {
                         "ok": True,
                         "tool_name": tool.name,
                         "result": {"results": results, "count": len(results)},
                     }
-                elif tool.name == "opencloning.search_snapgene":
-                    # Search SnapGene plasmid catalog by name
-                    from urllib.request import urlopen as _urlopen
-                    import re as _re
-                    import json as _json
-                    import time as _time
-
-                    query = body.args.get("query", "").lower()
-                    retmax = int(body.args.get("retmax", 10))
-
-                    # Cache the catalog for 1 hour to avoid repeated scraping
-                    cache_key = "_snapgene_catalog_cache"
-                    cache_time_key = "_snapgene_catalog_cache_time"
-                    cache_ttl = 3600  # 1 hour
-
-                    catalog = getattr(invoke, cache_key, None)
-                    cache_age = _time.time() - getattr(invoke, cache_time_key, 0)
-                    if catalog is None or cache_age > cache_ttl:
-                        try:
-                            resp = _urlopen("https://www.snapgene.com/plasmids", timeout=10)
-                            html = resp.read().decode("utf-8")
-                            categories = list(dict.fromkeys(
-                                _re.findall(r'href="/plasmids/([^"]+)"', html)
-                            ))
-                            categories = [c for c in categories if '/' not in c and c]
-
-                            catalog = {}
-                            for cat in categories:
-                                try:
-                                    resp = _urlopen(
-                                        f"https://www.snapgene.com/plasmids/{cat}",
-                                        timeout=10,
-                                    )
-                                    cat_html = resp.read().decode("utf-8")
-                                    pattern = rf'href="/plasmids/{_re.escape(cat)}/([^"]+)"'
-                                    plasmids = list(dict.fromkeys(_re.findall(pattern, cat_html)))
-                                    catalog[cat] = plasmids
-                                except Exception:
-                                    catalog[cat] = []
-                            setattr(invoke, cache_key, catalog)
-                            setattr(invoke, cache_time_key, _time.time())
-                        except Exception as exc:
-                            return {
-                                "ok": False,
-                                "tool_name": tool.name,
-                                "reason": "search_failed",
-                                "message": f"SnapGene catalog fetch failed: {exc}",
-                            }
-
-                    results = []
-                    for cat, plasmids in catalog.items():
-                        for p in plasmids:
-                            if query in p.lower():
-                                results.append({
-                                    "repository_id": f"{cat}/{p}",
-                                    "name": p.replace("_", " "),
-                                    "category": cat.replace("_", " "),
-                                })
-                                if len(results) >= retmax:
-                                    break
-                        if len(results) >= retmax:
-                            break
-
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": {"results": results, "count": len(results)},
-                    }
-                    return {
-                        "ok": False,
-                        "tool_name": tool.name,
-                        "reason": "tool_not_dispatched",
-                        "message": (
-                            f"tool {tool.name!r} is in the opencloning adapter "
-                            "but has no /invoke dispatch path"
-                        ),
-                    }
-            except OpenCloningAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-            except ElabftwAdapterError as exc:
-                # OpenCloning adapter reuses eLabFTW's InvalidContextToken and
-                # UnmappedCaller, so those errors surface as ElabftwAdapterError
-                # subclasses. Map them to the same {ok:false, reason, message} shape.
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-
-        if tool.adapter == "wallac":
-            try:
-                adapter = get_wallac_adapter()
-                if tool.name == "wallac.get_status":
-                    result = adapter.get_status(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.call":
-                    result = adapter.call(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        method=body.args.get("method", "GET"),
-                        endpoint=body.args.get("endpoint", "/status"),
-                        body=body.args.get("body"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.propose_generated_protocol":
-                    result = adapter.propose_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        protocol_spec=body.args.get("protocol_spec", {}),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.validate_generated_protocol":
-                    result = adapter.validate_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        job_item_id=int(body.args.get("job_item_id", 0)),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.prepare_submission_package":
-                    result = adapter.prepare_submission_package(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        protocol_spec=body.args.get("protocol_spec", {}),
-                        validation_report=body.args.get("validation_report"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.run":
-                    result = adapter.run(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        approval_id=body.approval_id or "",
-                        protocol_id=int(body.args.get("protocol_id", 0)),
-                        plate_id=body.args.get("plate_id"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.submit_generated_protocol":
-                    result = adapter.submit_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        job_item_id=int(body.args.get("job_item_id", 0)),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                else:
                     return {
                         "ok": False,
                         "tool_name": tool.name,
