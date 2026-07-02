@@ -1379,6 +1379,51 @@ def create_app() -> FastAPI:
                         context_token=body.context_token,
                         request_id=body.request_id,
                     )
+                elif tool.name == "opencloning.search_ncbi":
+                    from urllib.request import urlopen as _urlopen
+                    from urllib.parse import quote as _quote
+                    import json as _json
+
+                    query = body.args.get("query", "")
+                    retmax = int(body.args.get("retmax", 5))
+
+                    # NCBI E-utilities: esearch + esummary
+                    esearch_url = (
+                        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                        f"?db=nuccore&term={_quote(query)}"
+                        f"&retmax={retmax}&retmode=json&sort=relevance"
+                    )
+                    with _urlopen(esearch_url, timeout=10) as resp:
+                        esearch = _json.loads(resp.read())
+                    ids = esearch.get("esearchresult", {}).get("idlist", [])
+                    if not ids:
+                        return {
+                            "ok": True,
+                            "tool_name": tool.name,
+                            "result": {"results": [], "count": 0},
+                        }
+
+                    esummary_url = (
+                        f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                        f"?db=nuccore&id={','.join(ids)}&retmode=json"
+                    )
+                    with _urlopen(esummary_url, timeout=10) as resp:
+                        esummary = _json.loads(resp.read())
+
+                    results = []
+                    for uid in esummary.get("result", {}).get("uids", []):
+                        r = esummary["result"][uid]
+                        results.append({
+                            "accession": r.get("accessionversion", ""),
+                            "title": r.get("title", ""),
+                            "organism": r.get("organism", ""),
+                            "length": int(r.get("slen", 0)),
+                        })
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": {"results": results, "count": len(results)},
+                    }
                 else:
                     return {
                         "ok": False,

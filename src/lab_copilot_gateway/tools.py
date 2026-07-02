@@ -420,6 +420,22 @@ _CATALOG: tuple[Tool, ...] = (
             "Args: endpoint (e.g. '/repository_id/addgene'), body (request dict)."
         ),
     ),
+    # --- NCBI sequence search (discover accessions by gene name) ----------
+    Tool(
+        name="opencloning.search_ncbi",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Search NCBI's nuccore database for sequences by gene name, "
+            "organism, or keyword. Returns accession.version, title, "
+            "organism, and length for each result. Use this to find the "
+            "correct GenBank accession before importing via "
+            "/repository_id/genbank. "
+            "Args: query (str, e.g. 'nptII[Title]'), retmax (int, default 5)."
+        ),
+    ),
 )
 
 
