@@ -279,7 +279,8 @@ class HttpOpenCloningClient:
         url = f"{self.base_url.rstrip('/')}{path}"
         s = self._connect()
         resp = s.post(url, json=body, timeout=self.timeout_seconds)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise self._http_error(resp, path)
         return resp.json()
 
     def _post_multipart(
@@ -288,8 +289,25 @@ class HttpOpenCloningClient:
         url = f"{self.base_url.rstrip('/')}{path}"
         s = self._connect()
         resp = s.post(url, files=files, data=data or {}, timeout=self.timeout_seconds)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise self._http_error(resp, path)
         return resp.json()
+
+    @staticmethod
+    def _http_error(resp: Any, path: str) -> "requests.HTTPError":
+        """Build an HTTPError that includes the response body so the LLM
+        sees the downstream error message (e.g. 'wrong sequence accession')
+        and can correct its next call."""
+        import requests as _requests
+        try:
+            detail = resp.json()
+            body_text = str(detail.get("detail", detail))
+        except Exception:
+            body_text = resp.text[:200]
+        return _requests.HTTPError(
+            f"{resp.status_code} {resp.reason} for {path}: {body_text}",
+            response=resp,
+        )
 
     def parse_sequence_file(
         self, file_content: bytes, file_format: str
@@ -386,7 +404,8 @@ class HttpOpenCloningClient:
         url = f"{self.base_url.rstrip('/')}{path}"
         s = self._connect()
         resp = s.get(url, timeout=self.timeout_seconds)
-        resp.raise_for_status()
+        if not resp.ok:
+            raise self._http_error(resp, path)
         return resp.json()
 
 
