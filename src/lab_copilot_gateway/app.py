@@ -1424,7 +1424,74 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": {"results": results, "count": len(results)},
                     }
-                else:
+                elif tool.name == "opencloning.search_snapgene":
+                    # Search SnapGene plasmid catalog by name
+                    from urllib.request import urlopen as _urlopen
+                    import re as _re
+                    import json as _json
+                    import time as _time
+
+                    query = body.args.get("query", "").lower()
+                    retmax = int(body.args.get("retmax", 10))
+
+                    # Cache the catalog for 1 hour to avoid repeated scraping
+                    cache_key = "_snapgene_catalog_cache"
+                    cache_time_key = "_snapgene_catalog_cache_time"
+                    cache_ttl = 3600  # 1 hour
+
+                    catalog = getattr(invoke, cache_key, None)
+                    cache_age = _time.time() - getattr(invoke, cache_time_key, 0)
+                    if catalog is None or cache_age > cache_ttl:
+                        try:
+                            resp = _urlopen("https://www.snapgene.com/plasmids", timeout=10)
+                            html = resp.read().decode("utf-8")
+                            categories = list(dict.fromkeys(
+                                _re.findall(r'href="/plasmids/([^"]+)"', html)
+                            ))
+                            categories = [c for c in categories if '/' not in c and c]
+
+                            catalog = {}
+                            for cat in categories:
+                                try:
+                                    resp = _urlopen(
+                                        f"https://www.snapgene.com/plasmids/{cat}",
+                                        timeout=10,
+                                    )
+                                    cat_html = resp.read().decode("utf-8")
+                                    pattern = rf'href="/plasmids/{_re.escape(cat)}/([^"]+)"'
+                                    plasmids = list(dict.fromkeys(_re.findall(pattern, cat_html)))
+                                    catalog[cat] = plasmids
+                                except Exception:
+                                    catalog[cat] = []
+                            setattr(invoke, cache_key, catalog)
+                            setattr(invoke, cache_time_key, _time.time())
+                        except Exception as exc:
+                            return {
+                                "ok": False,
+                                "tool_name": tool.name,
+                                "reason": "search_failed",
+                                "message": f"SnapGene catalog fetch failed: {exc}",
+                            }
+
+                    results = []
+                    for cat, plasmids in catalog.items():
+                        for p in plasmids:
+                            if query in p.lower():
+                                results.append({
+                                    "repository_id": f"{cat}/{p}",
+                                    "name": p.replace("_", " "),
+                                    "category": cat.replace("_", " "),
+                                })
+                                if len(results) >= retmax:
+                                    break
+                        if len(results) >= retmax:
+                            break
+
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": {"results": results, "count": len(results)},
+                    }
                     return {
                         "ok": False,
                         "tool_name": tool.name,

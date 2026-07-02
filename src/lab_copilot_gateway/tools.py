@@ -436,6 +436,21 @@ _CATALOG: tuple[Tool, ...] = (
             "Args: query (str, e.g. 'nptII[Title]'), retmax (int, default 5)."
         ),
     ),
+    # --- SnapGene plasmid search (discover plasmids by name) -------------
+    Tool(
+        name="opencloning.search_snapgene",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Search the SnapGene plasmid catalog by name. Returns "
+            "repository_id (category/plasmid_name), name, and category. "
+            "Use this to find cloning vectors, expression vectors, and "
+            "other plasmids before importing via /repository_id/snapgene. "
+            "Args: query (str, e.g. 'pUC19'), retmax (int, default 10)."
+        ),
+    ),
 )
 
 
