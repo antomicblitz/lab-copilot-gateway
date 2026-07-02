@@ -140,6 +140,7 @@ def normalize_opencloning_artifacts(
             continue
         normalized = _normalize_sequence_artifact(
             sequence,
+            sources=sources,
             index=index,
             plan_id=plan_id,
             plan_hash=plan_hash,
@@ -186,6 +187,7 @@ def normalize_opencloning_artifacts(
 def _normalize_sequence_artifact(
     sequence: dict[str, Any],
     *,
+    sources: list[Any],
     index: int,
     plan_id: str,
     plan_hash: str,
@@ -201,9 +203,8 @@ def _normalize_sequence_artifact(
     file_format = str(sequence.get("sequence_file_format") or "genbank").lower()
     kind = "fasta" if file_format in {"fasta", "fa"} else "genbank"
     mime_type = FASTA_MIME_TYPE if kind == "fasta" else GENBANK_MIME_TYPE
-    summary = _sequence_summary(
-        sequence, file_content, fallback_name=f"construct-{index}"
-    )
+    fallback_name = _source_output_name(sequence, sources) or f"construct-{index}"
+    summary = _sequence_summary(sequence, file_content, fallback_name=fallback_name)
     filename = _filename_for(summary["name"], kind, index)
     data = file_content.encode("utf-8")
     artifact_warnings = list(warnings)
@@ -256,9 +257,8 @@ def _normalize_sequence_artifact(
 def _sequence_summary(
     sequence: dict[str, Any], file_content: str, *, fallback_name: str
 ) -> dict[str, Any]:
-    name = str(
-        sequence.get("name") or _genbank_locus_name(file_content) or fallback_name
-    )
+    raw_name = sequence.get("name") or _genbank_locus_name(file_content)
+    name = str(raw_name if raw_name and not _generic_name(raw_name) else fallback_name)
     length_bp = _int_or_none(sequence.get("length")) or _genbank_length(file_content)
     circular = _bool_or_none(sequence.get("circular"))
     if circular is None:
@@ -273,6 +273,15 @@ def _sequence_summary(
         "circular": circular,
         "feature_count": feature_count,
         "features": features,
+    }
+
+
+def _generic_name(name: Any) -> bool:
+    return str(name or "").strip().lower() in {
+        "name",
+        "sequence",
+        "untitled",
+        "untitled_sequence",
     }
 
 
@@ -337,11 +346,23 @@ def _summary_for_artifacts(
 
 
 def _filename_for(name: str, kind: str, index: int) -> str:
+    if _generic_name(name):
+        name = f"construct-{index}"
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip(".-") or f"construct-{index}"
     extension = ".fasta" if kind == "fasta" else ".gb"
     if safe.lower().endswith(extension):
         return safe
     return f"{safe}{extension}"
+
+
+def _source_output_name(sequence: dict[str, Any], sources: list[Any]) -> str | None:
+    seq_id = sequence.get("id")
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("id") == seq_id and source.get("output_name"):
+            return str(source["output_name"])
+    return None
 
 
 def _genbank_locus_name(file_content: str) -> str | None:

@@ -53,6 +53,7 @@ from lab_copilot_gateway.opencloning import (
     StubOpenCloningClient,
     _default_client_from_env,
     _infer_extension,
+    _rewrite_opencloning_result_ids,
     get_opencloning_adapter,
     reset_opencloning_adapter,
 )
@@ -376,6 +377,31 @@ def test_simulate_assembly_succeeds(
     assert len(stub_client.calls) == 1
     assert stub_client.calls[0]["method"] == "simulate_assembly"
     assert stub_client.calls[0]["sequence_count"] == 2
+
+
+def test_rewrite_opencloning_result_ids_keeps_history_graph_consistent() -> None:
+    """Returned source ids must follow gateway-rewritten output sequence ids."""
+    result = {
+        "sequences": [
+            {"id": 0, "type": "TextFileSequence", "file_content": "LOCUS a\n//"}
+        ],
+        "sources": [
+            {
+                "id": 0,
+                "type": "GibsonAssemblySource",
+                "input": [{"sequence": 0}, {"sequence": 9}],
+            }
+        ],
+    }
+    store: dict[str, dict[str, object]] = {}
+
+    next_id = _rewrite_opencloning_result_ids(result, store, 10)
+
+    assert next_id == 11
+    assert result["sequences"][0]["id"] == 11
+    assert result["sources"][0]["id"] == 11
+    assert result["sources"][0]["input"] == [{"sequence": 11}, {"sequence": 9}]
+    assert store["11"]["original_id"] == "0"
 
 
 # --- unmapped caller --------------------------------------------------------

@@ -479,6 +479,74 @@ def _inject_file_content_from_store(
     return body
 
 
+def _rewrite_opencloning_result_ids(
+    result: dict[str, Any], store: dict[str, dict[str, Any]], next_id: int
+) -> int:
+    """Assign gateway-unique ids to returned sequences and their sources.
+
+    OpenCloning is stateless and many endpoints return sequence/source ids that
+    start back at 0. The chat loop needs stable gateway ids, and the history JSON
+    must keep source ids aligned with their output sequence ids so OpenCloning's
+    frontend can reconstruct the graph.
+    """
+    id_map: dict[str, int] = {}
+
+    for seq in result.get("sequences", []):
+        if not isinstance(seq, dict) or "file_content" not in seq:
+            continue
+        old_id = str(seq.get("id", ""))
+        if not old_id:
+            continue
+        next_id += 1
+        new_id = next_id
+        id_map[old_id] = new_id
+
+        stored = dict(seq)
+        stored["original_id"] = old_id
+        store[str(new_id)] = stored
+        seq["id"] = new_id
+
+    if not id_map:
+        return next_id
+
+    for src in result.get("sources", []):
+        if not isinstance(src, dict):
+            continue
+        src_id = str(src.get("id", ""))
+        if src_id in id_map:
+            src["id"] = id_map[src_id]
+        inputs = src.get("input")
+        if isinstance(inputs, list):
+            for item in inputs:
+                if not isinstance(item, dict):
+                    continue
+                seq_ref = str(item.get("sequence", ""))
+                if seq_ref in id_map:
+                    item["sequence"] = id_map[seq_ref]
+
+    return next_id
+
+
+def _generic_sequence_name(name: Any) -> bool:
+    value = str(name or "").strip().lower()
+    return value in {"", "name", "sequence", "untitled", "untitled_sequence"}
+
+
+def _enrich_strategy_names(result: dict[str, Any]) -> None:
+    """Copy source output_name into generic/missing sequence names."""
+    output_names = {
+        src.get("id"): src.get("output_name")
+        for src in result.get("sources", [])
+        if isinstance(src, dict) and src.get("output_name")
+    }
+    for seq in result.get("sequences", []):
+        if not isinstance(seq, dict) or not _generic_sequence_name(seq.get("name")):
+            continue
+        output_name = output_names.get(seq.get("id"))
+        if output_name:
+            seq["name"] = output_name
+
+
 def _format_to_filename(file_format: str) -> str:
     """Map a file_format identifier to a dummy filename with the right
     extension, so OpenCloning's backend can infer the parser to use."""
@@ -1726,27 +1794,14 @@ class OpenCloningAdapter:
         # the raw file_content to create downloadable artifacts.
         #
         # ID rewriting: OpenCloning is stateless, so each call returns
-        # whatever id was in the request body (often 0). This causes
-        # collisions in the sequence store — two different PCR products
-        # both get id=0, and the second overwrites the first. To fix this,
-        # the gateway assigns its own unique IDs (incrementing counter)
-        # and rewrites the id in the response before returning to the LLM.
-        # The LLM sees unique IDs and passes them back; the gateway looks
-        # them up in the store by the rewritten ID.
+        # whatever id was in the request body (often 0). The gateway assigns
+        # unique ids and rewrites matching source ids so the saved history JSON
+        # remains a valid source→sequence graph.
         if isinstance(result, dict):
-            for seq in result.get("sequences", []):
-                if isinstance(seq, dict) and "file_content" in seq:
-                    old_id = str(seq.get("id", ""))
-                    if old_id:
-                        # Assign a new unique gateway ID
-                        self._seq_counter += 1
-                        new_id = self._seq_counter
-                        # Store under the new ID
-                        stored = dict(seq)
-                        stored["original_id"] = old_id
-                        self._sequence_store[str(new_id)] = stored
-                        # Rewrite the id in the response
-                        seq["id"] = new_id
+            self._seq_counter = _rewrite_opencloning_result_ids(
+                result, self._sequence_store, self._seq_counter
+            )
+            _enrich_strategy_names(result)
 
             # 7c. Accumulate sequences, sources, and primers for the
             # cloning strategy JSON. This matches what the OpenCloning

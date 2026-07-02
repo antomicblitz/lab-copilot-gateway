@@ -466,15 +466,22 @@ class ElabftwClient(Protocol):
         filename: str,
         data: bytes,
         comment: str = "",
+        record_type: str = "experiments",
     ) -> int:
-        """POST an attachment to ``/experiments/{id}/uploads``.  Returns the
-        new upload id."""
+        """POST an attachment to ``/{record_type}/{id}/uploads``.
+
+        ``record_type`` is ``"experiments"`` or ``"items"``.
+        Returns the new upload id.
+        """
         ...
 
     def patch_experiment_metadata(
-        self, experiment_id: int, metadata: dict[str, Any]
+        self,
+        experiment_id: int,
+        metadata: dict[str, Any],
+        record_type: str = "experiments",
     ) -> None:
-        """PATCH the experiment ``metadata`` field (a JSON-encoded string
+        """PATCH the record ``metadata`` field (a JSON-encoded string
         per eLabFTW REST v2).  Used by :meth:`ElabftwWriteAdapter.write_provenance`
         to attach the gateway audit id alongside any existing extra_fields."""
         ...
@@ -554,6 +561,7 @@ class StubElabftwClient:
         filename: str,
         data: bytes,
         comment: str = "",
+        record_type: str = "experiments",
     ) -> int:
         if experiment_id not in self.seeds:
             raise KeyError(f"experiment {experiment_id} not found in stub")
@@ -570,7 +578,10 @@ class StubElabftwClient:
         return upload_id
 
     def patch_experiment_metadata(
-        self, experiment_id: int, metadata: dict[str, Any]
+        self,
+        experiment_id: int,
+        metadata: dict[str, Any],
+        record_type: str = "experiments",
     ) -> None:
         if experiment_id not in self.seeds:
             raise KeyError(f"experiment {experiment_id} not found in stub")

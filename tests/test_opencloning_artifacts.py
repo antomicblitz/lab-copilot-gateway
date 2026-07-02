@@ -67,6 +67,36 @@ def test_normalize_gibson_result_creates_final_product_manifest() -> None:
     assert "artifact_bytes" not in normalized.to_event_payload()
 
 
+def test_generic_locus_name_uses_source_output_name() -> None:
+    """OpenCloning's placeholder LOCUS 'name' should not become name.gb."""
+    generic_genbank = GENBANK.replace("pDemo", "name")
+    normalized = normalize_opencloning_artifacts(
+        {
+            "sources": [
+                {
+                    "id": 5,
+                    "type": "GibsonAssemblySource",
+                    "output_name": "pCambia2300-Pat-EGFP-chlorella",
+                }
+            ],
+            "sequences": [
+                {
+                    "id": 5,
+                    "type": "TextFileSequence",
+                    "sequence_file_format": "genbank",
+                    "file_content": generic_genbank,
+                }
+            ],
+        },
+        plan_id="plan-1",
+        plan_hash="hash-1",
+    )
+
+    artifact = normalized.artifacts[0]
+    assert artifact["filename"] == "pCambia2300-Pat-EGFP-chlorella.gb"
+    assert artifact["sequence_summary"]["name"] == "pCambia2300-Pat-EGFP-chlorella"
+
+
 def test_normalize_multiple_products_returns_manifests_with_warning() -> None:
     """Multiple returned sequences are exposed without guessing intent."""
     result = {
