@@ -412,6 +412,21 @@ class ElabftwClient(Protocol):
         """Return one database resource item by id, or raise on error."""
         ...
 
+    def get_uploads(self, record_type: str, record_id: int) -> list[dict[str, Any]]:
+        """Return the uploads (attached files) for an experiment or item.
+
+        ``record_type`` is ``"experiments"`` or ``"items"``.  Each upload
+        dict includes at least ``id``, ``real_name``, and ``file_extension``.
+        """
+        ...
+
+    def get_upload_content(self, record_type: str, record_id: int, upload_id: int) -> str:
+        """Download the raw content of an attached file.
+
+        Returns the file body as a string (text files: GenBank, FASTA, etc.).
+        """
+        ...
+
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -487,6 +502,16 @@ class StubElabftwClient:
         if item_id not in self.seeds:
             raise KeyError(f"item {item_id} not found in stub")
         return dict(self.seeds[item_id])
+
+    def get_uploads(self, record_type: str, record_id: int) -> list[dict[str, Any]]:
+        record = self.seeds.get(record_id, {})
+        return list(record.get("uploads", []))
+
+    def get_upload_content(self, record_type: str, record_id: int, upload_id: int) -> str:
+        for u in self.get_uploads(record_type, record_id):
+            if u.get("id") == upload_id:
+                return u.get("_content", "")
+        raise KeyError(f"upload {upload_id} not found")
 
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0
@@ -599,6 +624,34 @@ class HttpElabftwClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_uploads(self, record_type: str, record_id: int) -> list[dict[str, Any]]:
+        """GET /api/v2/{record_type}/{id}/uploads — list attached files."""
+        url = (
+            f"{self.base_url.rstrip('/')}/api/v2/{record_type}/{int(record_id)}/uploads"
+        )
+        s = self._connect()
+        resp = s.get(url, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return data["data"]
+        return []
+
+    def get_upload_content(
+        self, record_type: str, record_id: int, upload_id: int
+    ) -> str:
+        """GET /api/v2/{record_type}/{id}/uploads/{uid}?format=binary — raw file content."""
+        url = (
+            f"{self.base_url.rstrip('/')}/api/v2/{record_type}"
+            f"/{int(record_id)}/uploads/{int(upload_id)}"
+        )
+        s = self._connect()
+        resp = s.get(url, params={"format": "binary"}, timeout=self.timeout_seconds)
+        resp.raise_for_status()
+        return resp.text
+
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -669,13 +722,16 @@ class HttpElabftwClient:
         filename: str,
         data: bytes,
         comment: str = "",
+        record_type: str = "experiments",
     ) -> int:
-        """POST /experiments/{id}/uploads with multipart file form.
+        """POST /{record_type}/{id}/uploads with multipart file form.
 
+        ``record_type`` is ``"experiments"`` or ``"items"``.
         Returns the new upload id parsed from the Location header.
         """
+        rt = "items" if record_type == "items" else "experiments"
         url = (
-            f"{self.base_url.rstrip('/')}/api/v2/experiments/{int(experiment_id)}"
+            f"{self.base_url.rstrip('/')}/api/v2/{rt}/{int(experiment_id)}"
             "/uploads"
         )
         s = self._connect()
@@ -692,14 +748,17 @@ class HttpElabftwClient:
             return 0
 
     def patch_experiment_metadata(
-        self, experiment_id: int, metadata: dict[str, Any]
+        self, experiment_id: int, metadata: dict[str, Any],
+        record_type: str = "experiments",
     ) -> None:
-        """PATCH /experiments/{id} with metadata field.
+        """PATCH /{record_type}/{id} with metadata field.
 
+        ``record_type`` is ``"experiments"`` or ``"items"``.
         Per AGENTS.md: metadata must be ``json.dumps()``'d in the body, never
         a raw dict — passing a dict causes HTTP 500.
         """
-        url = f"{self.base_url.rstrip('/')}/api/v2/experiments/{int(experiment_id)}"
+        rt = "items" if record_type == "items" else "experiments"
+        url = f"{self.base_url.rstrip('/')}/api/v2/{rt}/{int(experiment_id)}"
         s = self._connect()
         resp = s.patch(
             url,
@@ -743,6 +802,7 @@ class ReadResult:
     title: str
     body: str
     metadata: dict[str, Any] | None
+    uploads: list[dict[str, Any]]
     raw: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
@@ -751,6 +811,7 @@ class ReadResult:
             "title": self.title,
             "body": self.body,
             "metadata": self.metadata,
+            "uploads": self.uploads,
         }
 
 
@@ -1065,7 +1126,27 @@ class ElabftwReadAdapter:
                 message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
             ) from exc
 
-        # 7. Build the read result + successful audit record.  Normalize
+        # 7. Fetch uploads (attached files) so the LLM can see what
+        # plasmid/sequence files are attached to the experiment.  This is
+        # critical for cloning workflows where the user says "use this
+        # plasmid" — the plasmid is an attached .gb/.fasta file.
+        uploads: list[dict[str, Any]] = []
+        try:
+            record_type = "items" if claims.record_type == "resource" else "experiments"
+            uploads_payload = self.client.get_uploads(record_type, claims.experiment_id)
+            if isinstance(uploads_payload, list):
+                for u in uploads_payload:
+                    uploads.append({
+                        "id": u.get("id"),
+                        "real_name": u.get("real_name", ""),
+                        "type": u.get("type", ""),
+                        "file_extension": u.get("file_extension", ""),
+                        "filesize": u.get("filesize"),
+                    })
+        except Exception:
+            pass  # uploads are best-effort; don't fail the read
+
+        # 8. Build the read result + successful audit record.  Normalize
         # metadata the way the repo's other eLabFTW tools do — the API may
         # return metadata as a JSON-encoded string under the "metadata" key,
         # and that string may itself be a JSON-encoded JSON string.
@@ -1074,6 +1155,7 @@ class ElabftwReadAdapter:
             title=str(payload.get("title", "")),
             body=str(payload.get("body", "")),
             metadata=_normalize_metadata(payload.get("metadata")),
+            uploads=uploads,
             raw=payload,
         )
 
@@ -1424,12 +1506,29 @@ class ElabftwReadAdapter:
                 message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
             ) from exc
 
-        # 5. Build the read result + successful audit record.
+        # 5. Fetch uploads (same pattern as read_current_experiment).
+        uploads: list[dict[str, Any]] = []
+        try:
+            uploads_payload = self.client.get_uploads("experiments", experiment_id)
+            if isinstance(uploads_payload, list):
+                for u in uploads_payload:
+                    uploads.append({
+                        "id": u.get("id"),
+                        "real_name": u.get("real_name", ""),
+                        "type": u.get("type", ""),
+                        "file_extension": u.get("file_extension", ""),
+                        "filesize": u.get("filesize"),
+                    })
+        except Exception:
+            pass
+
+        # 6. Build the read result + successful audit record.
         result = ReadResult(
             experiment_id=experiment_id,
             title=str(payload.get("title", "")),
             body=str(payload.get("body", "")),
             metadata=_normalize_metadata(payload.get("metadata")),
+            uploads=uploads,
             raw=payload,
         )
 

@@ -228,7 +228,15 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=False,
         mutability="read",
-        description="Read the full title, body, and metadata of a specific experiment by its numeric id. Per-record permissions enforced server-side by eLabFTW.",
+        description="Read the full title, body, metadata, and uploads of a specific experiment by its numeric id. Per-record permissions enforced server-side by eLabFTW.",
+    ),
+    Tool(
+        name="elabftw.download_upload",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="Download the raw content of a file attached to an experiment or resource. Use after read_current_experiment or read_experiment_by_id to get the file content of an attached .gb, .fasta, or other sequence file. Returns the file text directly.",
     ),
     Tool(
         name="elabftw.draft_experiment_update",

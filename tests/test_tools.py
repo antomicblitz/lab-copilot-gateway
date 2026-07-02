@@ -49,6 +49,7 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "elabftw.read_current_experiment",
         "elabftw.search_my_experiments",
         "elabftw.read_experiment_by_id",
+        "elabftw.download_upload",
         "elabftw.draft_experiment_update",
         "elabftw.amend_my_experiment_after_approval",
         "elabftw.edit_experiment_section",
@@ -71,7 +72,7 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "bentolab.dry_run_pcr_profile",
         "bentolab.submit_pcr_run",
     }
-    assert len(catalog) == 24  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(catalog) == 25  # noqa: PLR2004 — V1 catalog size is a contract
     assert names == expected
 
 
@@ -492,5 +493,5 @@ def test_default_registry_is_the_v1_catalog() -> None:
     """The default registry is built from the curated _CATALOG tuple (13 tools)."""
     reset_tool_registry()
     reg = get_tool_registry()
-    assert len(reg.list()) == 24  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(reg.list()) == 25  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()

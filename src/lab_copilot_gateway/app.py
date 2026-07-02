@@ -1154,7 +1154,7 @@ def create_app() -> FastAPI:
                 elif tool.name == "elabftw.read_experiment_by_id":
                     adapter = get_elabftw_read_adapter()
                     result = adapter.read_experiment_by_id(
-                        experiment_id=int(body.args.get("experiment_id", 0)),
+                        experiment_id=int(body.args.get("experiment_id", body.args.get("id", 0))),
                         mapped_identity=mapped_identity,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
@@ -1167,6 +1167,70 @@ def create_app() -> FastAPI:
                         "ok": True,
                         "tool_name": tool.name,
                         "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.download_upload":
+                    # Download the raw content of an attached file.
+                    # The LLM calls this after seeing the uploads list
+                    # from read_current_experiment / read_experiment_by_id.
+                    upload_id = int(body.args.get("upload_id", 0))
+                    record_type = body.args.get("record_type", "experiments")
+                    record_id = int(body.args.get("record_id", body.args.get("experiment_id", 0)))
+                    if record_id == 0:
+                        # Fall back to the context token's experiment
+                        if not body.context_token:
+                            return {
+                                "ok": False,
+                                "tool_name": tool.name,
+                                "reason": "missing_record_id",
+                                "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
+                            }
+                        from .elabftw import verify_context_token
+                        try:
+                            claims = verify_context_token(body.context_token)
+                            record_id = claims.experiment_id
+                            record_type = "items" if claims.record_type == "resource" else "experiments"
+                        except Exception:
+                            return {
+                                "ok": False,
+                                "tool_name": tool.name,
+                                "reason": "invalid_context_token",
+                                "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
+                            }
+                    adapter = get_elabftw_read_adapter()
+                    # If the LLM didn't specify record_type, try both.
+                    # The LLM often doesn't know if a record is an experiment
+                    # or a database resource — it just has an ID from uploads.
+                    try_record_types = [record_type]
+                    if record_type not in ("items",):
+                        try_record_types.append("items")
+                    if record_type not in ("experiments",):
+                        try_record_types.append("experiments")
+
+                    content: str | None = None
+                    last_exc: Exception | None = None
+                    for rt in try_record_types:
+                        try:
+                            content = adapter.client.get_upload_content(
+                                rt, record_id, upload_id
+                            )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                    if content is None:
+                        return {
+                            "ok": False,
+                            "tool_name": tool.name,
+                            "reason": "download_failed",
+                            "message": str(last_exc) if last_exc else "upload not found",
+                        }
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": {
+                            "upload_id": upload_id,
+                            "content": content,
+                            "length": len(content),
+                        },
                     }
                 elif tool.name == "elabftw.draft_experiment_update":
                     adapter = get_elabftw_write_adapter()
