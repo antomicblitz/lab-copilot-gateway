@@ -558,6 +558,7 @@ class OpenCloningAdapter:
     # prior OpenCloning responses. Used to inject file_content into
     # opencloning.call requests when the LLM passes redacted sequences.
     _sequence_store: dict[str, dict[str, Any]] = field(default_factory=dict)
+    _seq_counter: int = 0
 
     # --- public API: four C16 tool entrypoints --------------------------
 
@@ -1663,12 +1664,29 @@ class OpenCloningAdapter:
         # Redaction happens in _opencloning_invoke_success (app.py) after
         # artifact normalization, so the artifact builder can still access
         # the raw file_content to create downloadable artifacts.
+        #
+        # ID rewriting: OpenCloning is stateless, so each call returns
+        # whatever id was in the request body (often 0). This causes
+        # collisions in the sequence store — two different PCR products
+        # both get id=0, and the second overwrites the first. To fix this,
+        # the gateway assigns its own unique IDs (incrementing counter)
+        # and rewrites the id in the response before returning to the LLM.
+        # The LLM sees unique IDs and passes them back; the gateway looks
+        # them up in the store by the rewritten ID.
         if isinstance(result, dict):
             for seq in result.get("sequences", []):
                 if isinstance(seq, dict) and "file_content" in seq:
-                    seq_id = str(seq.get("id", ""))
-                    if seq_id:
-                        self._sequence_store[seq_id] = dict(seq)
+                    old_id = str(seq.get("id", ""))
+                    if old_id:
+                        # Assign a new unique gateway ID
+                        self._seq_counter += 1
+                        new_id = self._seq_counter
+                        # Store under the new ID
+                        stored = dict(seq)
+                        stored["original_id"] = old_id
+                        self._sequence_store[str(new_id)] = stored
+                        # Rewrite the id in the response
+                        seq["id"] = new_id
 
         return OpenCloningResult(
             tool_name=tool_name,
