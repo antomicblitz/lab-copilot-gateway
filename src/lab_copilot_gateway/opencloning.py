@@ -471,6 +471,11 @@ def _inject_file_content_from_store(
     if isinstance(single_seq, dict):
         _inject_one(single_seq)
 
+    # Rename: the body IS the sequence object itself (no wrapper key).
+    # If the body has type=TextFileSequence and no file_content, inject it.
+    if isinstance(body, dict) and body.get("type") == "TextFileSequence":
+        _inject_one(body)
+
     return body
 
 

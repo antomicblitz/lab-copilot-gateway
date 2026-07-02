@@ -86,6 +86,27 @@ def normalize_opencloning_artifacts(
                 blocking_errors=blocking_errors,
                 provenance=provenance,
             )
+        # Analysis endpoints (primer_details, primer_heterodimer) return
+        # analysis results, not sequences. Don't treat as a failure.
+        if any(k in result for k in ("melting_temperature", "tm", "gc_content",
+                                      "heterodimer", "self_dimer", "hairpin")):
+            return NormalizedOpenCloningArtifacts(
+                summary="Analysis completed.",
+                warnings=warnings,
+                blocking_errors=blocking_errors,
+                provenance=provenance,
+            )
+        # Rename returns sources but no new sequences — not a failure.
+        if result.get("sources") and any(
+            s.get("type") == "RenameSequenceSource" for s in result.get("sources", [])
+            if isinstance(s, dict)
+        ):
+            return NormalizedOpenCloningArtifacts(
+                summary="Sequence renamed.",
+                warnings=warnings,
+                blocking_errors=blocking_errors,
+                provenance=provenance,
+            )
         blocking_errors.append(
             {
                 "severity": "blocking_error",
