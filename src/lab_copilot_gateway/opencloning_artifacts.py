@@ -77,6 +77,15 @@ def normalize_opencloning_artifacts(
     }
 
     if not sequences:
+        # Primer design endpoints return {primers: [...]} with no sequences.
+        # This is an intermediate step, not a failure — don't block.
+        if result.get("primers"):
+            return NormalizedOpenCloningArtifacts(
+                summary=f"Designed {len(result['primers'])} primers.",
+                warnings=warnings,
+                blocking_errors=blocking_errors,
+                provenance=provenance,
+            )
         blocking_errors.append(
             {
                 "severity": "blocking_error",
