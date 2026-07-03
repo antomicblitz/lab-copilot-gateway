@@ -231,6 +231,22 @@ _CATALOG: tuple[Tool, ...] = (
         description="Read the full title, body, metadata, and uploads of a specific experiment by its numeric id. Per-record permissions enforced server-side by eLabFTW.",
     ),
     Tool(
+        name="elabftw.search_items",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="Search the user's accessible database resources (items) by free-text query. Use this to find plasmids, primers, antibodies, etc. stored as items. Returns compact summaries (id, title, dates).",
+    ),
+    Tool(
+        name="elabftw.read_item_by_id",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="Read the full title, body, metadata, and uploads of a specific database resource (item) by its numeric id. Use after search_items to get full content including attached .gb/.fasta files.",
+    ),
+    Tool(
         name="elabftw.download_upload",
         tier=Tier.PERMISSIONED_ELABFTW_READ,
         adapter="elabftw",

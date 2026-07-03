@@ -532,6 +532,13 @@ class StubElabftwClient:
         ]
         return matches[offset : offset + limit]
 
+    def search_items(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        # Stub: search the same seeds (items and experiments share the
+        # same shape in tests).
+        return self.search_experiments(query, limit, offset)
+
     def create_experiment(self, title: str | None = None) -> int:
         new_id = self._next_id
         self._next_id += 1
@@ -683,6 +690,30 @@ class HttpElabftwClient:
         data = resp.json()
         # Reason: eLabFTW may return a dict with a "data" key or a bare
         # list depending on version; normalise to list[dict].
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            return data["data"]
+        return []
+
+    def search_items(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """GET /api/v2/items?q=...&limit=...&offset=...
+
+        Free-text search across database resources (items).  Same ``q``
+        parameter as ``search_experiments`` but hits the items endpoint.
+        Used to find plasmids, primers, antibodies, etc. stored as items.
+        """
+        url = f"{self.base_url.rstrip('/')}/api/v2/items"
+        s = self._connect()
+        resp = s.get(
+            url,
+            params={"q": query, "limit": limit, "offset": offset},
+            timeout=self.timeout_seconds,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         if isinstance(data, list):
             return data
         if isinstance(data, dict) and isinstance(data.get("data"), list):
@@ -875,6 +906,8 @@ TOOL_TIER = Tier.PERMISSIONED_ELABFTW_READ
 # C36 — multi-record retrieval tool names (same tier, no approval).
 TOOL_NAME_SEARCH = "elabftw.search_my_experiments"
 TOOL_NAME_READ_BY_ID = "elabftw.read_experiment_by_id"
+TOOL_NAME_SEARCH_ITEMS = "elabftw.search_items"
+TOOL_NAME_READ_ITEM = "elabftw.read_item_by_id"
 
 # Maximum results returned by search_my_experiments.  Keeps context window
 # manageable and bounds the audit record size.
@@ -1559,6 +1592,349 @@ class ElabftwReadAdapter:
             api_call_summary={
                 "method": "GET",
                 "path": f"/api/v2/experiments/{experiment_id}",
+            },
+            result_summary={
+                "title_length": len(result.title),
+                "body_length": len(result.body),
+            },
+            require_persistence=True,
+        )
+        return result
+
+    # --- C36b: item (resource) search + read -----------------------------
+
+    def search_items(
+        self,
+        *,
+        query: str,
+        limit: int = 20,
+        offset: int = 0,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> SearchResult:
+        """Search the caller's accessible items (resources) by free-text query.
+
+        Same orchestration as ``search_my_experiments`` but hits the items
+        endpoint.  Used to find plasmids, primers, antibodies, etc. stored
+        as database resources.
+        """
+        clamped_limit = min(max(1, limit), _MAX_SEARCH_RESULTS)
+        clamped_offset = max(0, offset)
+
+        tool_args_hash = compute_args_hash(
+            {"query": query, "limit": clamped_limit, "offset": clamped_offset}
+        )
+
+        if mapped_identity is None:
+            self._audit(
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH_ITEMS,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        policy_req = PolicyRequest(
+            tool_name=TOOL_NAME_SEARCH_ITEMS,
+            tier=TOOL_TIER,
+            adapter="elabftw",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=False,
+            approval_id=None,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision != "allow":
+            self._audit(
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH_ITEMS,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        if self.client is None:
+            self._audit(
+                policy_decision="deny",
+                reason="elabftw_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH_ITEMS,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "ELABFTW_NOT_CONFIGURED"},
+            )
+            raise ElabftwAdapterError(
+                reason="elabftw_not_configured",
+                message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
+            )
+
+        try:
+            payloads = self.client.search_items(
+                query, limit=clamped_limit, offset=clamped_offset
+            )
+        except Exception as exc:
+            self._audit(
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                tool_name=TOOL_NAME_SEARCH_ITEMS,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise ElabftwAdapterError(
+                reason="client_error",
+                message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        summaries = [
+            ExperimentSummary(
+                experiment_id=int(p.get("id", 0)),
+                title=str(p.get("title", "")),
+                created_at=p.get("created_at") or p.get("createdat"),
+                updated_at=p.get("updated_at") or p.get("updatedat"),
+            )
+            for p in payloads
+        ]
+        result = SearchResult(
+            query=query,
+            total_returned=len(summaries),
+            experiments=summaries,
+        )
+
+        record_ids = [s.experiment_id for s in summaries]
+        self._audit(
+            policy_decision="allow",
+            reason="search_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=None,
+            tool_name=TOOL_NAME_SEARCH_ITEMS,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary={
+                "method": "GET",
+                "path": "/api/v2/items",
+                "query": query,
+                "limit": clamped_limit,
+                "offset": clamped_offset,
+            },
+            result_summary={
+                "record_count": result.total_returned,
+                "record_ids": record_ids,
+            },
+            extra_context_refs=[
+                {"kind": "item", "id": rid} for rid in record_ids
+            ],
+            require_persistence=True,
+        )
+        return result
+
+    def read_item_by_id(
+        self,
+        *,
+        item_id: int,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> ReadResult:
+        """Read a specific item (resource) by id.
+
+        Same orchestration as ``read_experiment_by_id`` but hits the items
+        endpoint.  Used to read plasmids, primers, etc. stored as database
+        resources.
+        """
+        tool_args_hash = compute_args_hash({"item_id": item_id})
+
+        if mapped_identity is None:
+            self._audit(
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=item_id,
+                tool_name=TOOL_NAME_READ_ITEM,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        policy_req = PolicyRequest(
+            tool_name=TOOL_NAME_READ_ITEM,
+            tier=TOOL_TIER,
+            adapter="elabftw",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=False,
+            approval_id=None,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision != "allow":
+            self._audit(
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=item_id,
+                tool_name=TOOL_NAME_READ_ITEM,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
+        if self.client is None:
+            self._audit(
+                policy_decision="deny",
+                reason="elabftw_not_configured",
+                mapped_identity=mapped_identity,
+                experiment_id=item_id,
+                tool_name=TOOL_NAME_READ_ITEM,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "ELABFTW_NOT_CONFIGURED"},
+            )
+            raise ElabftwAdapterError(
+                reason="elabftw_not_configured",
+                message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
+            )
+
+        try:
+            payload = self.client.get_item(item_id)
+        except Exception as exc:
+            self._audit(
+                policy_decision="allow",
+                reason="client_error",
+                mapped_identity=mapped_identity,
+                experiment_id=item_id,
+                tool_name=TOOL_NAME_READ_ITEM,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "CLIENT_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise ElabftwAdapterError(
+                reason="client_error",
+                message=f"eLabFTW client raised {type(exc).__name__}: {exc}",
+            ) from exc
+
+        uploads: list[dict[str, Any]] = []
+        try:
+            uploads_payload = self.client.get_uploads("items", item_id)
+            if isinstance(uploads_payload, list):
+                for u in uploads_payload:
+                    uploads.append({
+                        "id": u.get("id"),
+                        "real_name": u.get("real_name", ""),
+                        "type": u.get("type", ""),
+                        "file_extension": u.get("file_extension", ""),
+                        "filesize": u.get("filesize"),
+                    })
+        except Exception:
+            pass
+
+        result = ReadResult(
+            experiment_id=item_id,
+            title=str(payload.get("title", "")),
+            body=str(payload.get("body", "")),
+            metadata=_normalize_metadata(payload.get("metadata")),
+            uploads=uploads,
+            raw=payload,
+        )
+
+        self._audit(
+            policy_decision="allow",
+            reason="read_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=item_id,
+            tool_name=TOOL_NAME_READ_ITEM,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            api_call_summary={
+                "method": "GET",
+                "path": f"/api/v2/items/{item_id}",
             },
             result_summary={
                 "title_length": len(result.title),

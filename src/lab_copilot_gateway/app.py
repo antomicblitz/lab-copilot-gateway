@@ -1168,6 +1168,42 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": result.to_dict(),
                     }
+                elif tool.name == "elabftw.search_items":
+                    adapter = get_elabftw_read_adapter()
+                    result = adapter.search_items(
+                        query=body.args.get("query", ""),
+                        limit=body.args.get("limit", 20),
+                        offset=body.args.get("offset", 0),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "elabftw.read_item_by_id":
+                    adapter = get_elabftw_read_adapter()
+                    result = adapter.read_item_by_id(
+                        item_id=int(body.args.get("item_id", body.args.get("id", 0))),
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
                 elif tool.name == "elabftw.download_upload":
                     # Download the raw content of an attached file.
                     # The LLM calls this after seeing the uploads list
