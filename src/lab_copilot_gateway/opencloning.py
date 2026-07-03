@@ -827,7 +827,16 @@ class OpenCloningAdapter:
         ``sequences`` is the array of TextFileSequence objects from prior
         parse/PCR steps. ``source`` is the assembly source object (e.g.
         {"id": 0, "type": "GibsonAssemblySource", "input": [...]}).
+
+        Injects stored file_content into any sequences that are missing it
+        (same as ``call_endpoint``), so the OpenCloning backend receives
+        complete GenBank bytes instead of redacted stubs.
         """
+        body = _inject_file_content_from_store(
+            {"sequences": sequences, "source": source}, self._sequence_store
+        )
+        sequences = body.get("sequences", sequences)
+        source = body.get("source", source)
         source_type = source.get("type", "GibsonAssemblySource")
         return self._execute(
             tool_name=TOOL_ASSEMBLY,
