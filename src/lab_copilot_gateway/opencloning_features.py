@@ -407,3 +407,76 @@ def _insert_features(genbank: str, new_features: list[dict[str, Any]]) -> str:
     feature_text = "\n".join(feature_lines) + "\n"
 
     return genbank[:insert_pos] + feature_text + genbank[insert_pos:]
+
+
+# ---------------------------------------------------------------------------
+# PCR feature-loss detection (C53 companion)
+# ---------------------------------------------------------------------------
+
+
+def detect_feature_loss(
+    endpoint: str,
+    request_body: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Detect feature loss in PCR operations.
+
+    For /pcr calls, compares feature count in the input template vs output
+    products.  Returns a warning dict if features were lost, None otherwise.
+    Only applies to single-template operations (PCR), NOT multi-fragment
+    assembly where feature count changes are expected.
+    """
+    if endpoint != "/pcr":
+        return None
+
+    input_seqs = request_body.get("sequences", [])
+    if not input_seqs or not isinstance(input_seqs[0], dict):
+        return None
+    template = input_seqs[0]
+    template_fc = template.get("file_content", "")
+    if not isinstance(template_fc, str) or not template_fc:
+        return None
+    template_count = _count_genbank_features(template_fc)
+
+    if template_count == 0:
+        return None  # Template has no features to lose
+
+    output_seqs = result.get("sequences", [])
+    if not output_seqs:
+        return None
+    total_output = 0
+    for seq in output_seqs:
+        if not isinstance(seq, dict):
+            continue
+        fc = seq.get("file_content", "")
+        if isinstance(fc, str):
+            total_output += _count_genbank_features(fc)
+
+    if total_output < template_count:
+        return {
+            "feature_loss_warning": True,
+            "template_features": template_count,
+            "product_features": total_output,
+            "message": (
+                f"PCR product has {total_output} features but template had "
+                f"{template_count}. The template may have degraded annotations. "
+                "Consider re-importing from the original source (SnapGene, "
+                "Benchling, GenBank) for correct annotations."
+            ),
+        }
+    return None
+
+
+def _count_genbank_features(file_content: str) -> int:
+    """Count features in a GenBank string (lines starting at column 5 in FEATURES section)."""
+    in_features = False
+    count = 0
+    for line in file_content.splitlines():
+        if line.startswith("FEATURES"):
+            in_features = True
+            continue
+        if in_features and (line.startswith("ORIGIN") or line.startswith("//")):
+            break
+        if in_features and len(line) > 5 and line[5] != " " and line[:5] == "     ":
+            count += 1
+    return count

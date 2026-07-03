@@ -6,11 +6,21 @@ Validates that ``rewrite_genbank_features`` correctly:
   * skips features whose sequence is absent (e.g., removed parts)
   * handles complement (reverse strand) features
   * is a no-op when no templates or no matches exist
+
+Also validates that ``detect_feature_loss`` correctly:
+  * warns when PCR product loses features
+  * returns None when no features are lost
+  * returns None for non-PCR endpoints
+  * returns None when template has no features
+  * returns None when request body has no sequences
 """
 
 from __future__ import annotations
 
-from lab_copilot_gateway.opencloning_features import rewrite_genbank_features
+from lab_copilot_gateway.opencloning_features import (
+    detect_feature_loss,
+    rewrite_genbank_features,
+)
 
 
 def _genbank(name: str, length: int, topology: str, features: str, origin_seq: str) -> str:
@@ -193,3 +203,74 @@ def test_circular_wrap_around() -> None:
     result = rewrite_genbank_features(final, [_make_template(template)])
     assert "CDS" in result
     assert '/label="origin_span"' in result
+
+
+# --- PCR feature-loss detection tests ---------------------------------------
+
+
+def _template_with_n_features(n: int) -> str:
+    """Build a GenBank string with n CDS features and a short origin."""
+    features = ""
+    for i in range(n):
+        features += (
+            f"     CDS             joint(1..{i+3})\n"
+            f'                     /label="feat{i}"\n'
+        )
+    return _genbank("template", 40, "circular", features, _wrap_origin("A" * 40))
+
+
+def _product_with_n_features(n: int) -> str:
+    """Build a product GenBank string with n CDS features."""
+    features = ""
+    for i in range(n):
+        features += (
+            f"     CDS             joint(1..{i+3})\n"
+            f'                     /label="prod{i}"\n'
+        )
+    return _genbank("product", 80, "circular", features, _wrap_origin("G" * 80))
+
+
+def test_detect_feature_loss_pcr_template_has_features_product_none() -> None:
+    """Template GenBank with 3 features, product with 0 features → warning."""
+    body = {"sequences": [{"file_content": _template_with_n_features(3)}]}
+    result = {"sequences": [{"file_content": _product_with_n_features(0)}]}
+
+    warning = detect_feature_loss("/pcr", body, result)
+    assert warning is not None
+    assert warning["feature_loss_warning"] is True
+    assert warning["template_features"] == 3
+    assert warning["product_features"] == 0
+    assert "degraded annotations" in warning["message"]
+
+
+def test_detect_feature_loss_pcr_no_loss() -> None:
+    """Template 3 features, product 3 features → None."""
+    body = {"sequences": [{"file_content": _template_with_n_features(3)}]}
+    result = {"sequences": [{"file_content": _product_with_n_features(3)}]}
+
+    warning = detect_feature_loss("/pcr", body, result)
+    assert warning is None
+
+
+def test_detect_feature_loss_not_pcr() -> None:
+    """Endpoint=/gibson_assembly → None (always, even if features differ)."""
+    body = {"sequences": [{"file_content": _template_with_n_features(3)}]}
+    result = {"sequences": [{"file_content": _product_with_n_features(0)}]}
+
+    warning = detect_feature_loss("/gibson_assembly", body, result)
+    assert warning is None
+
+
+def test_detect_feature_loss_template_no_features() -> None:
+    """Template 0 features → None (nothing to lose)."""
+    body = {"sequences": [{"file_content": _template_with_n_features(0)}]}
+    result = {"sequences": [{"file_content": _product_with_n_features(3)}]}
+
+    warning = detect_feature_loss("/pcr", body, result)
+    assert warning is None
+
+
+def test_detect_feature_loss_no_sequences() -> None:
+    """Empty body → None."""
+    warning = detect_feature_loss("/pcr", {}, {})
+    assert warning is None

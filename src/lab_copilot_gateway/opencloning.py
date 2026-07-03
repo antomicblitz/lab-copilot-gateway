@@ -901,7 +901,7 @@ class OpenCloningAdapter:
         # here so the LLM never needs to handle raw sequence bytes.
         body = _inject_file_content_from_store(body, self._sequence_store)
 
-        return self._execute(
+        result = self._execute(
             tool_name=TOOL_CALL,
             context_token=context_token,
             mapped_identity=mapped_identity,
@@ -915,6 +915,17 @@ class OpenCloningAdapter:
             api_call_summary={"method": "POST", "path": endpoint},
             exec_fn=lambda _client: _client.call_endpoint(endpoint, body),
         )
+
+        # Feature-loss detection for PCR (single-template operations only).
+        # Assembly operations legitimately change feature counts, so we
+        # only warn for PCR where feature loss indicates a degraded template.
+        if endpoint == "/pcr":
+            from lab_copilot_gateway.opencloning_features import detect_feature_loss
+            warning = detect_feature_loss(endpoint, body, result.result)
+            if warning:
+                result.result["feature_loss_warning"] = warning
+
+        return result
 
     # --- C17: writeback artifact to eLabFTW -------------------------------
 
