@@ -1375,6 +1375,34 @@ class OpenCloningAdapter:
                 ),
             )
 
+        # 6b. Rewrite GenBank features to fix pydna annotation gaps.
+        # pydna's Gibson assembly and PCR do not transfer CDS/promoter/
+        # terminator features from insert templates to the assembled product.
+        # We recover them by searching for each template feature's nucleotide
+        # sequence in the final product (see opencloning_features.py).
+        if artifact_bytes and self._strategy_sequences:
+            try:
+                from lab_copilot_gateway.opencloning_features import (
+                    rewrite_genbank_features,
+                )
+
+                genbank_str = (
+                    artifact_bytes.decode("utf-8")
+                    if isinstance(artifact_bytes, bytes)
+                    else artifact_bytes
+                )
+                rewritten = rewrite_genbank_features(
+                    genbank_str, self._strategy_sequences
+                )
+                artifact_bytes = (
+                    rewritten.encode("utf-8")
+                    if isinstance(artifact_bytes, bytes)
+                    else rewritten
+                )
+            except Exception:
+                # Non-fatal — upload the original if rewriting fails.
+                pass
+
         # 7. Upload the artifact as an attachment.
         # record_type: "resource" → /api/v2/items/{id}, else /api/v2/experiments/{id}
         rt_param = "items" if claims.record_type == "resource" else "experiments"
