@@ -1513,14 +1513,31 @@ def create_app() -> FastAPI:
                         "tool_name": tool.name,
                         "result": {"results": results, "count": len(results)},
                     }
+                elif tool.name == "opencloning.fetch_igem_part":
+                    # Fetch a part from the official iGEM Registry API
+                    # (api.registry.igem.org). Returns sequence + annotations
+                    # as a GenBank string for parse_sequence_file.
+                    from lab_copilot_gateway.igem_registry import (
+                        fetch_igem_part_as_genbank,
+                    )
+
+                    part_name = body.args.get("part_name", "")
+                    if not part_name:
+                        return {
+                            "ok": False,
+                            "tool_name": tool.name,
+                            "reason": "missing_arg",
+                            "message": "part_name is required",
+                        }
+                    genbank_str = fetch_igem_part_as_genbank(part_name)
                     return {
-                        "ok": False,
+                        "ok": True,
                         "tool_name": tool.name,
-                        "reason": "tool_not_dispatched",
-                        "message": (
-                            f"tool {tool.name!r} is in the wallac adapter "
-                            "but has no /invoke dispatch path"
-                        ),
+                        "result": {
+                            "part_name": part_name,
+                            "genbank": genbank_str,
+                            "file_format": "genbank",
+                        },
                     }
             except WallacAdapterError as exc:
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}

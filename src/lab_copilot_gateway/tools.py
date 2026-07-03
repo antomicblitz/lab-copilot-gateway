@@ -464,6 +464,24 @@ _CATALOG: tuple[Tool, ...] = (
             "retmax (int, default 5)."
         ),
     ),
+    # --- iGEM Registry part fetch (retrieve sequence + features) -----------
+    Tool(
+        name="opencloning.fetch_igem_part",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Fetch a biological part from the official iGEM Registry API "
+            "(api.registry.igem.org, 75,000+ parts). Returns the part's "
+            "sequence, annotations (CDS, promoter, RBS, etc. with SO "
+            "ontology types), and metadata as a GenBank string. Pass the "
+            "GenBank string to opencloning.parse_sequence_file to import "
+            "it into the cloning session. Use this instead of "
+            "/repository_id/igem (which is broken). "
+            "Args: part_name (str, e.g. 'BBa_J23105', 'BBa_E1010')."
+        ),
+    ),
 )
 
 
