@@ -897,6 +897,69 @@ class SearchResult:
         }
 
 
+@dataclass(frozen=True)
+class ItemSummary:
+    """Compact summary of one item (resource) in a search result (C36b).
+
+    Mirrors ``ExperimentSummary`` but uses ``item_id`` so the LLM knows
+    to call ``read_item_by_id`` (not ``read_experiment_by_id``) with it.
+    """
+
+    item_id: int
+    title: str
+    created_at: str | None = None
+    updated_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "title": self.title,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class ItemSearchResult:
+    """Outcome of a successful ``search_items`` call (C36b)."""
+
+    query: str
+    total_returned: int
+    items: list[ItemSummary]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "query": self.query,
+            "total_returned": self.total_returned,
+            "items": [i.to_dict() for i in self.items],
+        }
+
+
+@dataclass(frozen=True)
+class ItemReadResult:
+    """Outcome of a successful ``read_item_by_id`` call (C36b).
+
+    Mirrors ``ReadResult`` but uses ``item_id`` so the LLM can chain
+    the id into ``download_upload`` with ``record_type=\"items\"``.
+    """
+
+    item_id: int
+    title: str
+    body: str
+    metadata: dict[str, Any] | None
+    uploads: list[dict[str, Any]]
+    raw: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item_id,
+            "title": self.title,
+            "body": self.body,
+            "metadata": self.metadata,
+            "uploads": self.uploads,
+        }
+
+
 # --- adapter -------------------------------------------------------------
 
 
@@ -1616,7 +1679,7 @@ class ElabftwReadAdapter:
         librechat_user_id: str | None = None,
         provider: str | None = None,
         model_id: str | None = None,
-    ) -> SearchResult:
+    ) -> ItemSearchResult:
         """Search the caller's accessible items (resources) by free-text query.
 
         Same orchestration as ``search_my_experiments`` but hits the items
@@ -1731,21 +1794,21 @@ class ElabftwReadAdapter:
             ) from exc
 
         summaries = [
-            ExperimentSummary(
-                experiment_id=int(p.get("id", 0)),
+            ItemSummary(
+                item_id=int(p.get("id", 0)),
                 title=str(p.get("title", "")),
                 created_at=p.get("created_at") or p.get("createdat"),
                 updated_at=p.get("updated_at") or p.get("updatedat"),
             )
             for p in payloads
         ]
-        result = SearchResult(
+        result = ItemSearchResult(
             query=query,
             total_returned=len(summaries),
-            experiments=summaries,
+            items=summaries,
         )
 
-        record_ids = [s.experiment_id for s in summaries]
+        record_ids = [s.item_id for s in summaries]
         self._audit(
             policy_decision="allow",
             reason="search_succeeded",
@@ -1788,7 +1851,7 @@ class ElabftwReadAdapter:
         librechat_user_id: str | None = None,
         provider: str | None = None,
         model_id: str | None = None,
-    ) -> ReadResult:
+    ) -> ItemReadResult:
         """Read a specific item (resource) by id.
 
         Same orchestration as ``read_experiment_by_id`` but hits the items
@@ -1910,8 +1973,8 @@ class ElabftwReadAdapter:
         except Exception:
             pass
 
-        result = ReadResult(
-            experiment_id=item_id,
+        result = ItemReadResult(
+            item_id=item_id,
             title=str(payload.get("title", "")),
             body=str(payload.get("body", "")),
             metadata=_normalize_metadata(payload.get("metadata")),
