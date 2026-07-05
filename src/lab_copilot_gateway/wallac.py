@@ -888,6 +888,12 @@ class WallacAdapter:
             "elabftw_experiment_id": 0,
         }
 
+        # Pass wells_spec if the LLM specified which wells to measure.
+        # Format: {"all": true}, {"rows": ["A","B"]}, or {"wells": ["A1","A2"]}
+        plate_layout = raw_args.get("plate_layout")
+        if plate_layout:
+            job_payload["wells_spec"] = plate_layout
+
         try:
             req_data = json.dumps(job_payload).encode()
             req = urllib.request.Request(
