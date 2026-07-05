@@ -51,7 +51,6 @@ from lab_copilot_gateway.bentolab import (
     get_bentolab_adapter,
 )
 from lab_copilot_gateway.opencloning import (
-    OpenCloningAdapterError,
     OpenCloningResult,
     get_opencloning_adapter,
 )
@@ -1154,7 +1153,9 @@ def create_app() -> FastAPI:
                 elif tool.name == "elabftw.read_experiment_by_id":
                     adapter = get_elabftw_read_adapter()
                     result = adapter.read_experiment_by_id(
-                        experiment_id=int(body.args.get("experiment_id", body.args.get("id", 0))),
+                        experiment_id=int(
+                            body.args.get("experiment_id", body.args.get("id", 0))
+                        ),
                         mapped_identity=mapped_identity,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
@@ -1210,7 +1211,9 @@ def create_app() -> FastAPI:
                     # from read_current_experiment / read_experiment_by_id.
                     upload_id = int(body.args.get("upload_id", 0))
                     record_type = body.args.get("record_type", "experiments")
-                    record_id = int(body.args.get("record_id", body.args.get("experiment_id", 0)))
+                    record_id = int(
+                        body.args.get("record_id", body.args.get("experiment_id", 0))
+                    )
                     if record_id == 0:
                         # Fall back to the context token's experiment
                         if not body.context_token:
@@ -1221,10 +1224,15 @@ def create_app() -> FastAPI:
                                 "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
                             }
                         from .elabftw import verify_context_token
+
                         try:
                             claims = verify_context_token(body.context_token)
                             record_id = claims.experiment_id
-                            record_type = "items" if claims.record_type == "resource" else "experiments"
+                            record_type = (
+                                "items"
+                                if claims.record_type == "resource"
+                                else "experiments"
+                            )
                         except Exception:
                             return {
                                 "ok": False,
@@ -1233,6 +1241,12 @@ def create_app() -> FastAPI:
                                 "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
                             }
                     adapter = get_elabftw_read_adapter()
+                    if adapter.client is None:
+                        return {
+                            "ok": False,
+                            "tool_name": tool.name,
+                            "reason": "download_failed",
+                        }
                     # If the LLM didn't specify record_type, try both.
                     # The LLM often doesn't know if a record is an experiment
                     # or a database resource — it just has an ID from uploads.
@@ -1257,7 +1271,9 @@ def create_app() -> FastAPI:
                             "ok": False,
                             "tool_name": tool.name,
                             "reason": "download_failed",
-                            "message": str(last_exc) if last_exc else "upload not found",
+                            "message": str(last_exc)
+                            if last_exc
+                            else "upload not found",
                         }
                     return {
                         "ok": True,
@@ -1499,15 +1515,17 @@ def create_app() -> FastAPI:
                     results = []
                     for match in data.get("matches", []):
                         m = match.get("metadata", {})
-                        results.append({
-                            "uid": match.get("id", ""),
-                            "name": m.get("name", ""),
-                            "source_collection": m.get("source_collection", ""),
-                            "source_name": m.get("source_name", ""),
-                            "type": m.get("type_level_1", ""),
-                            "subtype": m.get("type_level_2", ""),
-                            "score": match.get("score", 0),
-                        })
+                        results.append(
+                            {
+                                "uid": match.get("id", ""),
+                                "name": m.get("name", ""),
+                                "source_collection": m.get("source_collection", ""),
+                                "source_name": m.get("source_name", ""),
+                                "type": m.get("type_level_1", ""),
+                                "subtype": m.get("type_level_2", ""),
+                                "score": match.get("score", 0),
+                            }
+                        )
                     return {
                         "ok": True,
                         "tool_name": tool.name,
@@ -1606,7 +1624,7 @@ def create_app() -> FastAPI:
                     result = adapter.validate_generated_protocol(
                         context_token=body.context_token,
                         mapped_identity=mapped_identity,
-                        job_item_id=body.args.get("job_item_id"),
+                        job_item_id=body.args.get("job_item_id") or 0,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
                         keycloak_subject=body.keycloak_subject,
@@ -1646,7 +1664,7 @@ def create_app() -> FastAPI:
                         context_token=body.context_token,
                         mapped_identity=mapped_identity,
                         approval_id=body.approval_id or "",
-                        protocol_id=body.args.get("protocol_id"),
+                        protocol_id=body.args.get("protocol_id") or 0,
                         plate_id=body.args.get("plate_id"),
                         plate_layout=body.args.get("plate_layout"),
                         conversation_id=body.conversation_id,
@@ -1667,7 +1685,7 @@ def create_app() -> FastAPI:
                         mapped_identity=mapped_identity,
                         approval_id=body.approval_id or "",
                         approval_args=body.args,
-                        job_item_id=body.args.get("job_item_id"),
+                        job_item_id=body.args.get("job_item_id") or 0,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
                         keycloak_subject=body.keycloak_subject,

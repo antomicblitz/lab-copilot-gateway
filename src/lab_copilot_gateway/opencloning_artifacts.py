@@ -61,10 +61,10 @@ def normalize_opencloning_artifacts(
     are multiple sequences, V1 exposes each as a separate artifact and adds a
     non-blocking warning instead of guessing which construct the user intended.
     """
-    sources = result.get("sources") if isinstance(result.get("sources"), list) else []
-    sequences = (
-        result.get("sequences") if isinstance(result.get("sequences"), list) else []
-    )
+    raw_sources = result.get("sources")
+    sources: list[Any] = raw_sources if isinstance(raw_sources, list) else []
+    raw_sequences = result.get("sequences")
+    sequences: list[Any] = raw_sequences if isinstance(raw_sequences, list) else []
     warnings = _normalize_warnings(result.get("warnings"))
     blocking_errors = _normalize_blocking_errors(result.get("errors"))
 
@@ -88,8 +88,17 @@ def normalize_opencloning_artifacts(
             )
         # Analysis endpoints (primer_details, primer_heterodimer) return
         # analysis results, not sequences. Don't treat as a failure.
-        if any(k in result for k in ("melting_temperature", "tm", "gc_content",
-                                      "heterodimer", "self_dimer", "hairpin")):
+        if any(
+            k in result
+            for k in (
+                "melting_temperature",
+                "tm",
+                "gc_content",
+                "heterodimer",
+                "self_dimer",
+                "hairpin",
+            )
+        ):
             return NormalizedOpenCloningArtifacts(
                 summary="Analysis completed.",
                 warnings=warnings,
@@ -98,7 +107,8 @@ def normalize_opencloning_artifacts(
             )
         # Rename returns sources but no new sequences — not a failure.
         if result.get("sources") and any(
-            s.get("type") == "RenameSequenceSource" for s in result.get("sources", [])
+            s.get("type") == "RenameSequenceSource"
+            for s in result.get("sources", [])
             if isinstance(s, dict)
         ):
             return NormalizedOpenCloningArtifacts(

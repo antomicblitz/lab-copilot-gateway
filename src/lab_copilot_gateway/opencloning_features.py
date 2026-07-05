@@ -65,9 +65,7 @@ def rewrite_genbank_features(
         return final_genbank
 
     existing = _parse_features(final_genbank)
-    existing_labels = {
-        (f["type"], f["start"], f["end"]) for f in existing
-    }
+    existing_labels = {(f["type"], f["start"], f["end"]) for f in existing}
 
     new_features: list[dict[str, Any]] = []
     seen_seqs: set[str] = set()
@@ -220,9 +218,7 @@ def _parse_location(location_str: str) -> tuple[int, int, int]:
     return (start, end, strand)
 
 
-def _extract_feature_sequence(
-    feat: dict[str, Any], template_seq: str
-) -> str:
+def _extract_feature_sequence(feat: dict[str, Any], template_seq: str) -> str:
     """Extract the nucleotide subsequence for a feature from a template.
 
     Handles join() locations with multiple parts and complement().  For
@@ -278,7 +274,7 @@ def _extract_feature_sequence(
             if start > seq_len:
                 return ""
             chunks.append(template_seq[start - 1 : seq_len])
-            chunks.append(template_seq[0 : end])
+            chunks.append(template_seq[0:end])
 
     result = "".join(chunks)
 
@@ -292,9 +288,7 @@ def _reverse_complement(seq: str) -> str:
     return seq.translate(_COMPLEMENT)[::-1]
 
 
-def _find_in_product(
-    feat_seq: str, product_seq: str
-) -> tuple[int, int, int] | None:
+def _find_in_product(feat_seq: str, product_seq: str) -> tuple[int, int, int] | None:
     """Search for feat_seq in product_seq (forward and reverse complement).
 
     Returns (start_1based, end_inclusive, strand) or None.
@@ -358,7 +352,9 @@ def _format_feature(feature: dict[str, Any]) -> str:
 
     qualifiers = feature.get("qualifiers") or {}
     # Prioritize label, then gene, then product for the /label qualifier.
-    label = qualifiers.get("label") or qualifiers.get("gene") or qualifiers.get("product")
+    label = (
+        qualifiers.get("label") or qualifiers.get("gene") or qualifiers.get("product")
+    )
     if label:
         lines.append(f'                     /label="{label}"')
     # Preserve other useful qualifiers.

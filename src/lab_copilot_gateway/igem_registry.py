@@ -28,14 +28,14 @@ IGEM_REGISTRY_TIMEOUT = 15.0
 # The iGEM API returns role objects with SO accessions (e.g. "SO:0000316").
 # GenBank uses simpler type names. This mapping covers the common cases.
 _SO_TO_GENBANK: dict[str, str] = {
-    "SO:0000316": "CDS",            # CDS
-    "SO:0000167": "promoter",       # promoter
+    "SO:0000316": "CDS",  # CDS
+    "SO:0000167": "promoter",  # promoter
     "SO:0000139": "ribosome_entry_site",  # RBS
-    "SO:0000141": "terminator",     # terminator
+    "SO:0000141": "terminator",  # terminator
     "SO:0000296": "origin_of_replication",  # ori
-    "SO:0000286": "primer_bind",    # primer binding site
-    "SO:0000410": "stem_loop",      # stem-loop
-    "SO:0000001": "misc_feature",   # misc
+    "SO:0000286": "primer_bind",  # primer binding site
+    "SO:0000410": "stem_loop",  # stem-loop
+    "SO:0000001": "misc_feature",  # misc
 }
 
 # Fallback mapping by label keyword (when SO accession is missing/unknown).
@@ -236,9 +236,7 @@ def fetch_igem_part_as_genbank(part_name: str) -> str:
     part = _fetch_part(part_name)
     sequence = part.get("sequence", "")
     if not sequence:
-        raise ValueError(
-            f"iGEM part '{part_name}' has no sequence data"
-        )
+        raise ValueError(f"iGEM part '{part_name}' has no sequence data")
 
     part_uuid = part.get("uuid", "")
     annotations: list[dict[str, Any]] = []

@@ -1,12 +1,15 @@
-.PHONY: help check lint format format-check test run
+.PHONY: help check lint typecheck format format-check test run
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "%-18s %s\n", $$1, $$2}'
 
-check: lint format-check test ## Run all local quality gates
+check: lint typecheck format-check test ## Run all local quality gates
 
 lint: ## Lint Python code
 	uv run ruff check .
+
+typecheck: ## Static type check (pyright)
+	pyright src/
 
 format: ## Format Python code
 	uv run ruff format .

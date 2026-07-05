@@ -39,6 +39,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import requests
+
 from lab_copilot_gateway.approval import ApprovalStore, compute_args_hash
 from lab_copilot_gateway.artifact_bundle import (
     ArtifactBundleError,
@@ -299,6 +301,7 @@ class HttpOpenCloningClient:
         sees the downstream error message (e.g. 'wrong sequence accession')
         and can correct its next call."""
         import requests as _requests
+
         try:
             detail = resp.json()
             body_text = str(detail.get("detail", detail))
@@ -430,6 +433,7 @@ def _inject_file_content_from_store(
     - body["homologous_recombination_target"]["sequence"] (used by /primer_design/hr)
     - body["sequence"] (used by /align_sanger, /primer_details)
     """
+
     def _inject_one(seq: Any) -> None:
         """Inject file_content into a single sequence dict if needed."""
         if not isinstance(seq, dict):
@@ -921,6 +925,7 @@ class OpenCloningAdapter:
         # only warn for PCR where feature loss indicates a degraded template.
         if endpoint == "/pcr":
             from lab_copilot_gateway.opencloning_features import detect_feature_loss
+
             warning = detect_feature_loss(endpoint, body, result.result)
             if warning:
                 result.result["feature_loss_warning"] = warning
@@ -1483,7 +1488,9 @@ class OpenCloningAdapter:
                 pass
 
             strategy_json = _json.dumps(strategy, indent=2).encode("utf-8")
-            strategy_filename = _os.path.splitext(artifact_filename)[0] + "_history.json"
+            strategy_filename = (
+                _os.path.splitext(artifact_filename)[0] + "_history.json"
+            )
 
             try:
                 history_upload_id = self.elabftw_client.upload_attachment(
@@ -1870,7 +1877,10 @@ class OpenCloningAdapter:
                     existing_src_ids.add(src.get("id"))
             existing_primer_names = {p.get("name") for p in self._strategy_primers}
             for primer in result.get("primers", []):
-                if isinstance(primer, dict) and primer.get("name") not in existing_primer_names:
+                if (
+                    isinstance(primer, dict)
+                    and primer.get("name") not in existing_primer_names
+                ):
                     self._strategy_primers.append(dict(primer))
                     existing_primer_names.add(primer.get("name"))
 

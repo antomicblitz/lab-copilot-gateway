@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import jwt
+import jwt.algorithms  # pyright: ignore — runtime submodule accessed via jwt.algorithms.RSAAlgorithm
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
@@ -200,7 +201,7 @@ class JwksCache:
         resp.raise_for_status()
         data = resp.json()
         keys_list = data.get("keys", [])
-        new_keys: dict[str, str] = {}
+        new_keys: dict[str, Any] = {}
         for key_data in keys_list:
             kid = key_data.get("kid")
             if not kid:

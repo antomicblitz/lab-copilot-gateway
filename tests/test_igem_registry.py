@@ -343,4 +343,6 @@ class TestFetchIgemPartAsGenbank:
 
         # First call should be to the slug endpoint.
         first_call = mock_get.call_args_list[0]
-        assert "bba-j23105" in first_call.kwargs.get("url", "") or "bba-j23105" in str(first_call)
+        assert "bba-j23105" in first_call.kwargs.get("url", "") or "bba-j23105" in str(
+            first_call
+        )

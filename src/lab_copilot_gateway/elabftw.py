@@ -420,10 +420,22 @@ class ElabftwClient(Protocol):
         """
         ...
 
-    def get_upload_content(self, record_type: str, record_id: int, upload_id: int) -> str:
+    def get_upload_content(
+        self, record_type: str, record_id: int, upload_id: int
+    ) -> str:
         """Download the raw content of an attached file.
 
         Returns the file body as a string (text files: GenBank, FASTA, etc.).
+        """
+        ...
+
+    def search_items(
+        self, query: str, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Search items (database resources) by free-text query.
+
+        Same shape as ``search_experiments`` but against the items endpoint.
+        Used to find plasmids, primers, antibodies, etc.
         """
         ...
 
@@ -514,7 +526,9 @@ class StubElabftwClient:
         record = self.seeds.get(record_id, {})
         return list(record.get("uploads", []))
 
-    def get_upload_content(self, record_type: str, record_id: int, upload_id: int) -> str:
+    def get_upload_content(
+        self, record_type: str, record_id: int, upload_id: int
+    ) -> str:
         for u in self.get_uploads(record_type, record_id):
             if u.get("id") == upload_id:
                 return u.get("_content", "")
@@ -772,10 +786,7 @@ class HttpElabftwClient:
         Returns the new upload id parsed from the Location header.
         """
         rt = "items" if record_type == "items" else "experiments"
-        url = (
-            f"{self.base_url.rstrip('/')}/api/v2/{rt}/{int(experiment_id)}"
-            "/uploads"
-        )
+        url = f"{self.base_url.rstrip('/')}/api/v2/{rt}/{int(experiment_id)}/uploads"
         s = self._connect()
         files = {"file": (filename, data)}
         form = {"comment": comment} if comment else {}
@@ -790,7 +801,9 @@ class HttpElabftwClient:
             return 0
 
     def patch_experiment_metadata(
-        self, experiment_id: int, metadata: dict[str, Any],
+        self,
+        experiment_id: int,
+        metadata: dict[str, Any],
         record_type: str = "experiments",
     ) -> None:
         """PATCH /{record_type}/{id} with metadata field.
@@ -1243,13 +1256,15 @@ class ElabftwReadAdapter:
             uploads_payload = self.client.get_uploads(record_type, claims.experiment_id)
             if isinstance(uploads_payload, list):
                 for u in uploads_payload:
-                    uploads.append({
-                        "id": u.get("id"),
-                        "real_name": u.get("real_name", ""),
-                        "type": u.get("type", ""),
-                        "file_extension": u.get("file_extension", ""),
-                        "filesize": u.get("filesize"),
-                    })
+                    uploads.append(
+                        {
+                            "id": u.get("id"),
+                            "real_name": u.get("real_name", ""),
+                            "type": u.get("type", ""),
+                            "file_extension": u.get("file_extension", ""),
+                            "filesize": u.get("filesize"),
+                        }
+                    )
         except Exception:
             pass  # uploads are best-effort; don't fail the read
 
@@ -1619,13 +1634,15 @@ class ElabftwReadAdapter:
             uploads_payload = self.client.get_uploads("experiments", experiment_id)
             if isinstance(uploads_payload, list):
                 for u in uploads_payload:
-                    uploads.append({
-                        "id": u.get("id"),
-                        "real_name": u.get("real_name", ""),
-                        "type": u.get("type", ""),
-                        "file_extension": u.get("file_extension", ""),
-                        "filesize": u.get("filesize"),
-                    })
+                    uploads.append(
+                        {
+                            "id": u.get("id"),
+                            "real_name": u.get("real_name", ""),
+                            "type": u.get("type", ""),
+                            "file_extension": u.get("file_extension", ""),
+                            "filesize": u.get("filesize"),
+                        }
+                    )
         except Exception:
             pass
 
@@ -1833,9 +1850,7 @@ class ElabftwReadAdapter:
                 "record_count": result.total_returned,
                 "record_ids": record_ids,
             },
-            extra_context_refs=[
-                {"kind": "item", "id": rid} for rid in record_ids
-            ],
+            extra_context_refs=[{"kind": "item", "id": rid} for rid in record_ids],
             require_persistence=True,
         )
         return result
@@ -1963,13 +1978,15 @@ class ElabftwReadAdapter:
             uploads_payload = self.client.get_uploads("items", item_id)
             if isinstance(uploads_payload, list):
                 for u in uploads_payload:
-                    uploads.append({
-                        "id": u.get("id"),
-                        "real_name": u.get("real_name", ""),
-                        "type": u.get("type", ""),
-                        "file_extension": u.get("file_extension", ""),
-                        "filesize": u.get("filesize"),
-                    })
+                    uploads.append(
+                        {
+                            "id": u.get("id"),
+                            "real_name": u.get("real_name", ""),
+                            "type": u.get("type", ""),
+                            "file_extension": u.get("file_extension", ""),
+                            "filesize": u.get("filesize"),
+                        }
+                    )
         except Exception:
             pass
 
@@ -2573,7 +2590,11 @@ class ElabftwWriteAdapter:
             raise PolicyDenied(decision)
 
         # 3. Append-only enforcement (when applicable).
-        if apply_append_only and self.client is not None:
+        if (
+            apply_append_only
+            and self.client is not None
+            and target_experiment_id is not None
+        ):
             try:
                 target = self.client.get_experiment(target_experiment_id)
             except Exception as exc:
@@ -3170,9 +3191,11 @@ class ElabftwWriteAdapter:
             )
             return audit_action_id
 
-        existing_metadata = _normalize_metadata(current.get("metadata"))
+        existing_metadata: dict[str, Any] | None = _normalize_metadata(
+            current.get("metadata")
+        )
         if existing_metadata is None:
-            existing_metadata = {}
+            existing_metadata = dict()
         if not isinstance(existing_metadata, dict):
             existing_metadata = {"_raw": existing_metadata}
         extra_fields = existing_metadata.get("extra_fields") or {}

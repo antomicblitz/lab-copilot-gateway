@@ -342,7 +342,7 @@ _CATALOG: tuple[Tool, ...] = (
             "POST /runs (forces dry_run=true), /runs/{id}/abort, "
             "/admin/reconnect. "
             "PATCH /mdb/protocols/{id}/plate_map (set which wells to "
-            "measure — body: {\"plate_map\": [108 ints]}). "
+            'measure — body: {"plate_map": [108 ints]}). '
             "Args: method (GET, POST, or PATCH), endpoint (e.g. "
             "'/protocols'), body (dict, for POST/PATCH)."
         ),

@@ -118,7 +118,9 @@ class WallacClient(Protocol):
         """
         ...
 
-    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call(
+        self, method: str, endpoint: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Generic vm-agent API call.
 
         Covers all vm-agent REST endpoints: /health, /status, /instrument,
@@ -163,9 +165,16 @@ class StubWallacClient:
             raise self.error
         return dict(self.status_response)
 
-    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call(
+        self, method: str, endpoint: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         key = f"{method.upper()} {endpoint}"
-        self.calls.append({"method": "call", "args": {"method": method, "endpoint": endpoint, "body": body}})
+        self.calls.append(
+            {
+                "method": "call",
+                "args": {"method": method, "endpoint": endpoint, "body": body},
+            }
+        )
         if self.error is not None:
             raise self.error
         if key in self.call_responses:
@@ -209,7 +218,9 @@ class HttpWallacClient:
         resp.raise_for_status()
         return resp.json()
 
-    def call(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    def call(
+        self, method: str, endpoint: str, body: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         """Generic vm-agent API call.
 
         ``method`` is GET, POST, or PATCH. ``endpoint`` is a path like
@@ -570,7 +581,9 @@ class WallacAdapter:
                 "body": effective_body,
             },
             api_call_summary={"method": method_upper, "path": f"/{endpoint_clean}"},
-            exec_fn=lambda _client: _client.call(method_upper, endpoint_clean, effective_body),
+            exec_fn=lambda _client: _client.call(
+                method_upper, endpoint_clean, effective_body
+            ),
             tier_override=TOOL_TIER_C19,
         )
 
@@ -926,7 +939,11 @@ class WallacAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                error={"code": "BRIDGE_SUBMIT_FAILED", "status": exc.code, "body": err_body},
+                error={
+                    "code": "BRIDGE_SUBMIT_FAILED",
+                    "status": exc.code,
+                    "body": err_body,
+                },
             )
             raise WallacAdapterError(
                 reason="bridge_submit_failed",
@@ -942,7 +959,6 @@ class WallacAdapter:
 
         # Success — audit + return.
         import secrets as _secrets
-        import time as _time
 
         action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
 
@@ -1006,11 +1022,36 @@ class WallacAdapter:
                 message="Wallac bridge not configured (set LAB_COPILOT_WALLAC_BRIDGE_URL)",
             )
 
+        if not context_token:
+            raise InvalidContextToken("missing")
+
+        try:
+            claims = verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name="wallac.bridge_status",
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
         bridge_token = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "")
         bridge_timeout = float(os.getenv("LAB_COPILOT_WALLAC_TIMEOUT", "30"))
 
         import urllib.request
         import urllib.error
+
+        import secrets as _secrets
+        import time as _time
 
         try:
             req = urllib.request.Request(
@@ -1027,9 +1068,33 @@ class WallacAdapter:
                 message=f"Bridge GET /jobs/{job_id} failed (HTTP {exc.code})",
             ) from exc
 
+        action_id = f"{self.action_id_prefix}-status-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+
+        self._audit(
+            tool_name="wallac.bridge_status",
+            policy_decision="allow",
+            reason="call_succeeded",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            api_call_summary={"method": "GET", "path": f"/jobs/{job_id}"},
+            result_summary={
+                "status": result.get("status"),
+                "elabftw_experiment_id": result.get("elabftw_experiment_id"),
+            },
+            require_persistence=False,
+            action_id=action_id,
+        )
+
         return WallacResult(
             tool_name="wallac.bridge_status",
             result=result,
+            audit_action_id=action_id,
         )
 
     # --- C19 tools: proposal / validation / submission package -----------

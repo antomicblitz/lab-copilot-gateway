@@ -300,6 +300,10 @@ class PlanExecutor:
                     summary=f"Approval consume failed: {exc}",
                 )
 
+        # At this point effective_approval_id is guaranteed to be non-None
+        # (autonomous synthetic ID or validated through the approval_id guard).
+        assert effective_approval_id is not None
+
         # 3. Execute steps.
         step_results: list[StepResult] = []
         all_steps = [(i, step, "read") for i, step in enumerate(plan.reads)]
