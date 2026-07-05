@@ -935,34 +935,14 @@ class WallacAdapter:
 
         bridge_job_id = job_resp.get("job_id", "")
 
-        # Poll the bridge job for up to 60s. Returns immediately with
-        # "accepted" status if the job hasn't completed within the window.
-        # The orchestrator can then tell the user to check back later.
-        poll_interval = 3.0
-        poll_max = 20  # 60s max
+        # Return immediately — the orchestrator polls bridge status via
+        # wallac.bridge_status and emits SSE progress events to the widget.
+        # Polling here blocks the HTTP connection and causes browser timeouts.
         result = {"job_id": bridge_job_id, "status": "accepted"}
-
-        import time as _time
-        for _poll_i in range(poll_max):
-            _time.sleep(poll_interval)
-            try:
-                poll_req = urllib.request.Request(
-                    f"{bridge_url.rstrip('/')}/jobs/{bridge_job_id}",
-                    method="GET",
-                )
-                if bridge_token:
-                    poll_req.add_header("Authorization", f"Bearer {bridge_token}")
-                with urllib.request.urlopen(poll_req, timeout=bridge_timeout) as poll_resp:
-                    result = json.loads(poll_resp.read())
-            except Exception:
-                pass
-
-            status = result.get("status", "")
-            if status in ("completed", "failed", "aborted"):
-                break
 
         # Success — audit + return.
         import secrets as _secrets
+        import time as _time
 
         action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
 
@@ -995,6 +975,61 @@ class WallacAdapter:
             tool_name=TOOL_RUN,
             result=result,
             audit_action_id=action_id,
+        )
+
+    def bridge_status(
+        self,
+        *,
+        job_id: str,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None = None,
+        request_id: str | None = None,
+        keycloak_subject: str | None = None,
+        librechat_user_id: str | None = None,
+        provider: str | None = None,
+        model_id: str | None = None,
+    ) -> WallacResult:
+        """Query the Wallac bridge for job status, events, and live_wells.
+
+        Returns the full bridge job object including:
+          - status: accepted/running/completed/failed
+          - events: list of {ts, event, detail} showing progress stages
+          - live_wells: wells measured so far (for real-time progress)
+          - elabftw_experiment_id: set when writeback completes
+          - run_id, assay_prot_id: set during/after execution
+        """
+        bridge_url = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "")
+        if not bridge_url:
+            raise WallacAdapterError(
+                reason="bridge_not_configured",
+                message="Wallac bridge not configured (set LAB_COPILOT_WALLAC_BRIDGE_URL)",
+            )
+
+        bridge_token = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "")
+        bridge_timeout = float(os.getenv("LAB_COPILOT_WALLAC_TIMEOUT", "30"))
+
+        import urllib.request
+        import urllib.error
+
+        try:
+            req = urllib.request.Request(
+                f"{bridge_url.rstrip('/')}/jobs/{job_id}",
+                method="GET",
+            )
+            if bridge_token:
+                req.add_header("Authorization", f"Bearer {bridge_token}")
+            with urllib.request.urlopen(req, timeout=bridge_timeout) as resp:
+                result = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            raise WallacAdapterError(
+                reason="bridge_query_failed",
+                message=f"Bridge GET /jobs/{job_id} failed (HTTP {exc.code})",
+            ) from exc
+
+        return WallacResult(
+            tool_name="wallac.bridge_status",
+            result=result,
         )
 
     # --- C19 tools: proposal / validation / submission package -----------

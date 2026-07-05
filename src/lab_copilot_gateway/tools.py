@@ -386,6 +386,19 @@ _CATALOG: tuple[Tool, ...] = (
             "Args: protocol_id (int, from GET /protocols), plate_id (int, optional)."
         ),
     ),
+    Tool(
+        name="wallac.bridge_status",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="wallac",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Query the Wallac bridge for job status, events, and live_wells. "
+            "Args: job_id (str, from wallac.run response). "
+            "Returns: status (accepted/running/completed/failed), events list, "
+            "live_wells, elabftw_experiment_id."
+        ),
+    ),
     # --- Wallac hardware execution (v1.1 — blocked by policy in v1) ------
     Tool(
         name="wallac.submit_generated_protocol",
