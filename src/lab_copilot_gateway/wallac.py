@@ -584,6 +584,7 @@ class WallacAdapter:
         approval_id: str,
         protocol_id: int,
         plate_id: int | None = None,
+        plate_layout: dict[str, Any] | None = None,
         experiment_id: int | None = None,
         conversation_id: str | None = None,
         request_id: str | None = None,
@@ -622,6 +623,8 @@ class WallacAdapter:
         raw_args: dict[str, Any] = {"protocol_id": protocol_id}
         if plate_id is not None:
             raw_args["plate_id"] = plate_id
+        if plate_layout:
+            raw_args["plate_layout"] = plate_layout
 
         return self._execute_run(
             context_token=context_token,

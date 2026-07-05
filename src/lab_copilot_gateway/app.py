@@ -1648,6 +1648,7 @@ def create_app() -> FastAPI:
                         approval_id=body.approval_id or "",
                         protocol_id=body.args.get("protocol_id"),
                         plate_id=body.args.get("plate_id"),
+                        plate_layout=body.args.get("plate_layout"),
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
                         keycloak_subject=body.keycloak_subject,
