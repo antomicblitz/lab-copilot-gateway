@@ -882,7 +882,10 @@ class WallacAdapter:
             "title": f"Lab Copilot — Protocol {protocol_id}",
             "execution_mode": "existing_protocol",
             "protocol_id": protocol_id,
-            "elabftw_experiment_id": experiment_id or claims.experiment_id or 0,
+            # Don't pass the current experiment_id — the bridge creates
+            # a NEW experiment for the results. Writing to the current
+            # experiment would overwrite its body with the heatmap HTML.
+            "elabftw_experiment_id": 0,
         }
 
         try:
