@@ -1547,6 +1547,152 @@ def create_app() -> FastAPI:
                 # subclasses. Map them to the same {ok:false, reason, message} shape.
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
+        if tool.adapter == "wallac":
+            try:
+                adapter = get_wallac_adapter()
+                if tool.name == "wallac.get_status":
+                    result = adapter.get_status(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.call":
+                    result = adapter.call(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        method=body.args.get("method", "GET"),
+                        endpoint=body.args.get("endpoint", "/"),
+                        body=body.args.get("body"),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.propose_generated_protocol":
+                    result = adapter.propose_generated_protocol(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        measurement_type=body.args.get("measurement_type", ""),
+                        wavelength=body.args.get("wavelength"),
+                        exposure=body.args.get("exposure"),
+                        plate_format=body.args.get("plate_format", 96),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.validate_generated_protocol":
+                    result = adapter.validate_generated_protocol(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        protocol_package=body.args.get("protocol_package", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.prepare_submission_package":
+                    result = adapter.prepare_submission_package(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        protocol_id=body.args.get("protocol_id"),
+                        experiment_id=body.args.get("experiment_id"),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.run":
+                    result = adapter.run(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        protocol_id=body.args.get("protocol_id"),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                elif tool.name == "wallac.submit_generated_protocol":
+                    result = adapter.submit_generated_protocol(
+                        context_token=body.context_token,
+                        mapped_identity=mapped_identity,
+                        approval_id=body.approval_id or "",
+                        approval_args=body.args,
+                        protocol_package=body.args.get("protocol_package", {}),
+                        conversation_id=body.conversation_id,
+                        request_id=body.request_id,
+                        keycloak_subject=body.keycloak_subject,
+                        librechat_user_id=body.librechat_user_id,
+                        provider=body.provider,
+                        model_id=body.model_id,
+                    )
+                    return {
+                        "ok": True,
+                        "tool_name": tool.name,
+                        "result": result.to_dict(),
+                    }
+                else:
+                    return {
+                        "ok": False,
+                        "tool_name": tool.name,
+                        "reason": "tool_not_dispatched",
+                        "message": (
+                            f"tool {tool.name!r} is in the wallac adapter "
+                            "but has no /invoke dispatch path"
+                        ),
+                    }
+            except WallacAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+            except ElabftwAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
         if tool.adapter == "bentolab":
             try:
                 adapter = get_bentolab_adapter()
