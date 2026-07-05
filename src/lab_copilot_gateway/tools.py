@@ -260,7 +260,7 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=True,
         mutability="append",
-        description="Draft a proposed amendment section for the user's experiment for review prior to append.",
+        description="Create a brand new draft experiment with a title. Use ONLY when the user wants a new experiment — NOT for adding to an existing one (use amend_my_experiment_after_approval for that).",
     ),
     Tool(
         name="elabftw.amend_my_experiment_after_approval",
@@ -268,7 +268,7 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=True,
         mutability="append",
-        description="Append an approved AI-generated amendment section and provenance to the user's experiment.",
+        description="Append an approved amendment section (HTML) and provenance to the user's CURRENT context experiment. Does NOT create a new experiment — use draft_experiment_update for that.",
     ),
     Tool(
         name="elabftw.edit_experiment_section",
