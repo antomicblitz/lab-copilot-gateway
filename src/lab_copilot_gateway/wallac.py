@@ -935,11 +935,14 @@ class WallacAdapter:
 
         bridge_job_id = job_resp.get("job_id", "")
 
-        # 8. Poll bridge GET /jobs/{job_id} until terminal.
+        # Poll the bridge job for up to 60s. Returns immediately with
+        # "accepted" status if the job hasn't completed within the window.
+        # The orchestrator can then tell the user to check back later.
         poll_interval = 3.0
-        poll_max = 200  # 10 minutes max
+        poll_max = 20  # 60s max
         result = {"job_id": bridge_job_id, "status": "accepted"}
 
+        import time as _time
         for _poll_i in range(poll_max):
             _time.sleep(poll_interval)
             try:
@@ -952,13 +955,13 @@ class WallacAdapter:
                 with urllib.request.urlopen(poll_req, timeout=bridge_timeout) as poll_resp:
                     result = json.loads(poll_resp.read())
             except Exception:
-                pass  # keep polling on transient errors
+                pass
 
             status = result.get("status", "")
-            if status in ("completed", "failed", "aborted", "unknown_requires_operator_review"):
+            if status in ("completed", "failed", "aborted"):
                 break
 
-        # 9. Success — audit + return.
+        # Success — audit + return.
         import secrets as _secrets
 
         action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
