@@ -105,6 +105,15 @@ def stub_client() -> StubElabftwClient:
                 "locked": 1,
                 "uploads": [],
             },
+            55: {
+                "id": 55,
+                "title": "Targetable experiment",
+                "body": "<p>Experiment 55 body</p>",
+                "metadata": {"extra_fields": {}},
+                "state": 1,  # normal
+                "locked": 0,
+                "uploads": [],
+            },
             100: {  # not appendable: archived
                 "id": 100,
                 "title": "Archived",
@@ -1288,3 +1297,124 @@ def test_edit_section_missing_old_body_hash_rejects(
     assert stub_client.seeds[42]["body"] == "WHATEVER"
     # Audit row recorded the deny.
     assert audit.count() >= 1
+
+
+# --- target_experiment_id --------------------------------------------------
+
+
+def test_amend_with_target_experiment_id_writes_to_specified_experiment(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """With target_experiment_id=55 in approval_args, the amend writes to
+    experiment 55 (not 42, the context token's experiment)."""
+    approval_args = {
+        "experiment_id": 42,
+        "amendment_html": "<p>AI note on target</p>",
+        "target_experiment_id": 55,
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_AMEND,
+        args=approval_args,
+        target_record="elabftw:experiment:55",
+    )
+    result = write_adapter.amend_my_experiment_after_approval(
+        context_token=_token(),  # bound to experiment 42
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+        amendment_html="<p>AI note on target</p>",
+    )
+
+    assert result.experiment_id == 55
+    # Experiment 55 body was modified.
+    body_55 = stub_client.seeds[55]["body"]
+    assert 'data-amendment="1"' in body_55
+    assert "<p>AI note on target</p>" in body_55
+    # Experiment 42 body was NOT modified.
+    body_42 = stub_client.seeds[42]["body"]
+    assert 'data-amendment="1"' not in body_42
+    assert "<p>AI note on target</p>" not in body_42
+
+
+def test_amend_without_target_experiment_id_falls_back_to_context(
+    write_adapter: ElabftwWriteAdapter,
+    stub_client: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """Without target_experiment_id in approval_args, the amend writes
+    to the context experiment (42) — backward compatible."""
+    approval_args = {"experiment_id": 42, "amendment_html": "<p>Fallback note</p>"}
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_AMEND,
+        args=approval_args,
+        target_record="elabftw:experiment:42",
+    )
+    result = write_adapter.amend_my_experiment_after_approval(
+        context_token=_token(),  # bound to experiment 42
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+        amendment_html="<p>Fallback note</p>",
+    )
+
+    assert result.experiment_id == 42
+    # Experiment 42 body was modified.
+    body_42 = stub_client.seeds[42]["body"]
+    assert 'data-amendment="1"' in body_42
+    assert "<p>Fallback note</p>" in body_42
+
+
+def test_amend_with_target_experiment_id_includes_it_in_approval_hash(
+    write_adapter: ElabftwWriteAdapter,
+    approval_store: ApprovalStore,
+) -> None:
+    """The approval hash includes target_experiment_id: a call with the
+    same target_experiment_id succeeds (hash matches), then a second call
+    with the same approval_id is rejected (already consumed)."""
+    approval_args = {
+        "experiment_id": 42,
+        "amendment_html": "<p>note</p>",
+        "target_experiment_id": 55,
+    }
+    approval_id = _issue_approval(
+        approval_store,
+        tool_name=TOOL_NAME_AMEND,
+        args=approval_args,
+        target_record="elabftw:experiment:55",
+    )
+
+    # First call with matching target_experiment_id succeeds (hash matches).
+    result = write_adapter.amend_my_experiment_after_approval(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+        amendment_html="<p>note</p>",
+    )
+    assert result.experiment_id == 55
+
+    # Second call with different target_experiment_id but the SAME
+    # approval_id — the args_hash no longer matches (target_experiment_id
+    # is part of the hash), so the approval is rejected.
+    tampered_args = {
+        "experiment_id": 42,
+        "amendment_html": "<p>note</p>",
+        "target_experiment_id": 42,
+    }
+    with pytest.raises(ElabftwAdapterError) as exc_info:
+        write_adapter.amend_my_experiment_after_approval(
+            context_token=_token(),
+            approval_id=approval_id,
+            approval_args=tampered_args,
+            mapped_identity=_identity(),
+            amendment_html="<p>note</p>",
+        )
+    # The rejection proves target_experiment_id is part of the approval
+    # hash — changing it invalidates the approval.
+    assert "mismatch" in exc_info.value.reason

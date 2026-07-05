@@ -260,7 +260,7 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=True,
         mutability="append",
-        description="Create a brand new draft experiment with a title. Use ONLY when the user wants a new experiment — NOT for adding to an existing one (use amend_my_experiment_after_approval for that).",
+        description="Create a BRAND NEW experiment with a title. Returns the new experiment_id. Does NOT add content — follow up with amend_my_experiment_after_approval (target_experiment_id=<new_id>) to add body content. Use ONLY when the user explicitly wants a new experiment.",
     ),
     Tool(
         name="elabftw.amend_my_experiment_after_approval",
@@ -268,7 +268,7 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=True,
         mutability="append",
-        description="Append an approved amendment section (HTML) and provenance to the user's CURRENT context experiment. Does NOT create a new experiment — use draft_experiment_update for that.",
+        description="Append an approved amendment section (HTML) and optional file attachment to an experiment. By default appends to the current context experiment. To target a different experiment, pass target_experiment_id in args. Use this — NOT draft_experiment_update — when the user wants to ADD content to an existing experiment.",
     ),
     Tool(
         name="elabftw.edit_experiment_section",

@@ -2383,7 +2383,18 @@ class ElabftwWriteAdapter:
         if len(verified) == 1:
             raise verified[0]  # type: ignore[misc]
         claims, tool_args_hash = verified  # type: ignore[assignment]
-        target_experiment_id = claims.experiment_id
+        # Reason: when the LLM passes target_experiment_id in approval_args,
+        # write to THAT experiment instead of the context token's experiment.
+        # This enables cross-experiment workflows (copy results from #78 to
+        # #42, create new experiment then amend it, etc.).  The approval
+        # hash already binds target_experiment_id because it's part of
+        # approval_args — the user approves writing to that specific target.
+        # Fall back to claims.experiment_id for backward compatibility.
+        target_experiment_id = (
+            approval_args.get("target_experiment_id") or claims.experiment_id
+        )
+        if not isinstance(target_experiment_id, int):
+            target_experiment_id = int(target_experiment_id)
         return self._execute(
             operation="append_amendment",
             tool_name=TOOL_NAME_AMEND,
