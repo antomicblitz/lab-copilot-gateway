@@ -45,6 +45,8 @@ Future chunks (C20/C21) will add:
 from __future__ import annotations
 
 import os
+import json
+import contextlib
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -582,6 +584,7 @@ class WallacAdapter:
         approval_id: str,
         protocol_id: int,
         plate_id: int | None = None,
+        experiment_id: int | None = None,
         conversation_id: str | None = None,
         request_id: str | None = None,
         keycloak_subject: str | None = None,
@@ -590,24 +593,30 @@ class WallacAdapter:
         model_id: str | None = None,
         plan_approval_id: str | None = None,
     ) -> WallacResult:
-        """Start a real measurement run on the Wallac Victor2.
+        """Start a real measurement run on the Wallac Victor2 via the bridge.
 
         This is tier 4 (BOUNDED_WRITES) — it requires an approval token.
-        The approval is consumed server-side before the vm-agent call.
+        The approval is consumed server-side before the bridge call.
 
-        Unlike ``wallac.call`` (which forces dry_run=true for POST /runs),
-        this tool sends the real request to the vm-agent's POST /runs
-        endpoint with dry_run=false (or omitted).
+        Routes through the Wallac bridge (POST /jobs) instead of calling
+        the vm-agent directly. The bridge handles:
+          - Protocol resolution (by ID)
+          - Run execution on the vm-agent
+          - Polling for completion
+          - eLabFTW writeback (experiment creation, CSV/JSON upload,
+            heatmap HTML)
+          - Result retrieval
+
+        Returns the bridge job result including ``elabftw_experiment_id``
+        so the chat can show a "View Results in eLabFTW" link.
 
         Args:
             protocol_id: the vm-agent protocol ID (from GET /protocols).
             plate_id: optional plate identifier.
+            experiment_id: eLabFTW experiment ID for result writeback.
+                If 0 or None, the bridge creates a new experiment.
             approval_id: single-use approval token from POST /approval/request.
         """
-        body: dict[str, Any] = {"protocol_id": protocol_id, "dry_run": False}
-        if plate_id is not None:
-            body["plate_id"] = plate_id
-
         # The raw args dict is what the approval request hashed — must match
         # for the approval consume to succeed.
         raw_args: dict[str, Any] = {"protocol_id": protocol_id}
@@ -618,7 +627,8 @@ class WallacAdapter:
             context_token=context_token,
             mapped_identity=mapped_identity,
             approval_id=approval_id,
-            body=body,
+            protocol_id=protocol_id,
+            experiment_id=experiment_id or 0,
             raw_args=raw_args,
             conversation_id=conversation_id,
             request_id=request_id,
@@ -635,7 +645,8 @@ class WallacAdapter:
         context_token: str,
         mapped_identity: MappedIdentity | None,
         approval_id: str,
-        body: dict[str, Any],
+        protocol_id: int,
+        experiment_id: int = 0,
         raw_args: dict[str, Any],
         conversation_id: str | None,
         request_id: str | None,
@@ -645,11 +656,11 @@ class WallacAdapter:
         model_id: str | None,
         plan_approval_id: str | None = None,
     ) -> WallacResult:
-        """Shared orchestration for wallac.run (approval-gated POST /runs).
+        """Shared orchestration for wallac.run (approval-gated, bridge-routed).
 
         Follows the same pattern as _execute_submit: token verify →
-        identity → policy (tier 4) → approval consume → downstream call
-        → audit.
+        identity → policy (tier 4) → approval consume → bridge submit
+        + poll → audit.
         """
         # Compute early hash for audit on failure paths.
         # The hash must match what the approval request computed —
@@ -834,49 +845,16 @@ class WallacAdapter:
                     message=f"approval consume failed: {exc}",
                 ) from exc
 
-        # 7. Downstream call — POST /runs with dry_run=false.
-        try:
-            result = self.client.call("POST", "runs", body)
-        except Exception as exc:
-            err_str = str(exc)
-            if "409" in err_str and "Conflict" in err_str:
-                # A run is already in progress. Do NOT auto-abort —
-                # return a clear error so the LLM can inform the user
-                # and ask for approval to abort the existing run.
-                self._audit(
-                    tool_name=TOOL_RUN,
-                    policy_decision="allow",
-                    reason="run_in_progress",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    api_call_summary={"method": "POST", "path": "/runs"},
-                    approval_id=effective_approval_id,
-                    error={
-                        "code": "RUN_IN_PROGRESS",
-                        "message": "A measurement run is already in progress on the Wallac Victor2.",
-                    },
-                )
-                raise WallacAdapterError(
-                    reason="run_in_progress",
-                    message=(
-                        "A measurement run is already in progress on the "
-                        "Wallac Victor2. Inform the user that a run is active "
-                        "and ask if they want to abort it before starting a "
-                        "new one. To abort: GET /runs to find the running "
-                        "run_id, then POST /runs/{run_id}/abort."
-                    ),
-                )
+        # 7. Submit job to the Wallac bridge (POST /jobs).
+        #    The bridge handles: protocol resolution, run execution,
+        #    polling for completion, eLabFTW writeback (experiment
+        #    creation, CSV/JSON upload, heatmap HTML).
+        bridge_url = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "")
+        if not bridge_url:
             self._audit(
                 tool_name=TOOL_RUN,
                 policy_decision="allow",
-                reason="client_error",
+                reason="bridge_not_configured",
                 mapped_identity=mapped_identity,
                 experiment_id=claims.experiment_id,
                 conversation_id=conversation_id,
@@ -886,22 +864,90 @@ class WallacAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                api_call_summary={"method": "POST", "path": "/runs"},
-                approval_id=effective_approval_id,
-                error={
-                    "code": "CLIENT_ERROR",
-                    "exception": type(exc).__name__,
-                    "message": str(exc),
-                },
+                error={"code": "BRIDGE_NOT_CONFIGURED"},
             )
             raise WallacAdapterError(
-                reason="client_error",
-                message=f"Wallac client raised {type(exc).__name__}: {exc}",
+                reason="bridge_not_configured",
+                message="Wallac bridge not configured (set LAB_COPILOT_WALLAC_BRIDGE_URL)",
+            )
+
+        import urllib.request
+        import urllib.error
+        import time as _time
+
+        bridge_token = os.getenv("LAB_COPILOT_WALLAC_BRIDGE_TOKEN", "")
+        bridge_timeout = float(os.getenv("LAB_COPILOT_WALLAC_TIMEOUT", "30"))
+
+        job_payload = {
+            "title": f"Lab Copilot — Protocol {protocol_id}",
+            "execution_mode": "existing_protocol",
+            "protocol_id": protocol_id,
+            "elabftw_experiment_id": experiment_id or claims.experiment_id or 0,
+        }
+
+        try:
+            req_data = json.dumps(job_payload).encode()
+            req = urllib.request.Request(
+                f"{bridge_url.rstrip('/')}/jobs",
+                data=req_data,
+                method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            if bridge_token:
+                req.add_header("Authorization", f"Bearer {bridge_token}")
+            with urllib.request.urlopen(req, timeout=bridge_timeout) as resp:
+                job_resp = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            err_body = ""
+            with contextlib.suppress(Exception):
+                err_body = exc.read().decode()[:500]
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="allow",
+                reason="bridge_submit_failed",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "BRIDGE_SUBMIT_FAILED", "status": exc.code, "body": err_body},
+            )
+            raise WallacAdapterError(
+                reason="bridge_submit_failed",
+                message=f"Bridge POST /jobs failed (HTTP {exc.code}): {err_body}",
             ) from exc
 
-        # 8. Success — audit + return.
+        bridge_job_id = job_resp.get("job_id", "")
+
+        # 8. Poll bridge GET /jobs/{job_id} until terminal.
+        poll_interval = 3.0
+        poll_max = 200  # 10 minutes max
+        result = {"job_id": bridge_job_id, "status": "accepted"}
+
+        for _poll_i in range(poll_max):
+            _time.sleep(poll_interval)
+            try:
+                poll_req = urllib.request.Request(
+                    f"{bridge_url.rstrip('/')}/jobs/{bridge_job_id}",
+                    method="GET",
+                )
+                if bridge_token:
+                    poll_req.add_header("Authorization", f"Bearer {bridge_token}")
+                with urllib.request.urlopen(poll_req, timeout=bridge_timeout) as poll_resp:
+                    result = json.loads(poll_resp.read())
+            except Exception:
+                pass  # keep polling on transient errors
+
+            status = result.get("status", "")
+            if status in ("completed", "failed", "aborted", "unknown_requires_operator_review"):
+                break
+
+        # 9. Success — audit + return.
         import secrets as _secrets
-        import time as _time
 
         action_id = f"{self.action_id_prefix}-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
 
@@ -918,11 +964,12 @@ class WallacAdapter:
             provider=provider,
             model_id=model_id,
             tool_args_hash=tool_args_hash,
-            api_call_summary={"method": "POST", "path": "/runs"},
+            api_call_summary={"method": "POST", "path": "/jobs"},
             result_summary={
+                "job_id": bridge_job_id,
+                "status": result.get("status"),
                 "run_id": result.get("run_id"),
-                "state": result.get("state"),
-                "protocol_id": result.get("protocol_id"),
+                "elabftw_experiment_id": result.get("elabftw_experiment_id"),
             },
             require_persistence=True,
             action_id=action_id,

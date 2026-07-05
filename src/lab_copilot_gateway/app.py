@@ -1638,12 +1638,22 @@ def create_app() -> FastAPI:
                         "result": result.to_dict(),
                     }
                 elif tool.name == "wallac.run":
+                    # Extract experiment_id from context token for bridge writeback.
+                    exp_id = 0
+                    if body.context_token:
+                        try:
+                            from .elabftw import verify_context_token
+                            claims = verify_context_token(body.context_token)
+                            exp_id = claims.experiment_id
+                        except Exception:
+                            pass
                     result = adapter.run(
                         context_token=body.context_token,
                         mapped_identity=mapped_identity,
                         approval_id=body.approval_id or "",
                         protocol_id=body.args.get("protocol_id"),
                         plate_id=body.args.get("plate_id"),
+                        experiment_id=exp_id,
                         conversation_id=body.conversation_id,
                         request_id=body.request_id,
                         keycloak_subject=body.keycloak_subject,
