@@ -2775,6 +2775,7 @@ class ElabftwWriteAdapter:
         # 7. Provenance writeback — embed the audit action_id into the
         # experiment metadata so eLabFTW-facing viewers see the gateway's
         # trail.  Best-effort; failures are logged but not fatal.
+        assert self.client is not None  # guarded by _require_write_client above
         audit_action_id = self._write_provenance(
             client=self.client,
             experiment_id=effective_experiment_id,
@@ -2895,6 +2896,7 @@ class ElabftwWriteAdapter:
         tool_args_hash: str,
     ) -> None:
         """Check append-only state and raise on violation."""
+        assert self.client is not None  # caller guards before invoking
         try:
             target = self.client.get_experiment(target_experiment_id)
         except Exception as exc:
@@ -3393,10 +3395,10 @@ class ElabftwWriteAdapter:
             )
             return audit_action_id
 
-        existing_metadata: dict[str, Any] | None = _normalize_metadata(
-            current.get("metadata")
+        existing_metadata = _merge_provenance_into_metadata(
+            _normalize_metadata(current.get("metadata")),
+            audit_action_id,
         )
-        _merge_provenance_into_metadata(existing_metadata, audit_action_id)
 
         try:
             client.patch_experiment_metadata(experiment_id, existing_metadata)

@@ -209,11 +209,10 @@ class PlanExecutor:
         plan_hash: str,
         approval_id: str | None,
         autonomy_active: bool,
-    ) -> str | None:
+    ) -> str:
         """Consume plan-level approval. Returns effective_approval_id or error message.
 
-        Returns None on success (caller should check for a string error).
-        Actually: returns the effective_approval_id on success, or an error
+        Returns the effective_approval_id on success, or an error
         string starting with "error:" on failure.
         """
         if autonomy_active:
@@ -302,8 +301,7 @@ class PlanExecutor:
         step_results: list[StepResult] = []
         all_steps = [(i, step, "read") for i, step in enumerate(plan.reads)]
         all_steps += [
-            (len(plan.reads) + i, step, "write")
-            for i, step in enumerate(plan.writes)
+            (len(plan.reads) + i, step, "write") for i, step in enumerate(plan.writes)
         ]
 
         write_failed = False

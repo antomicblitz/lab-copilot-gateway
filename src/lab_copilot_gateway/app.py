@@ -25,7 +25,7 @@ from lab_copilot_gateway.auth import (
     register_auth_exception_handler,
     verified_principal,
 )
-from lab_copilot_gateway.audit import AuditRecord, get_audit_store
+from lab_copilot_gateway.audit import AuditRecord, AuditStore, get_audit_store
 from lab_copilot_gateway.artifact_bundle import (
     ArtifactBundleStore,
     ArtifactContextMismatch,
@@ -41,6 +41,7 @@ from lab_copilot_gateway.config import (
 )
 from lab_copilot_gateway.elabftw import (
     ElabftwAdapterError,
+    ElabftwReadAdapter,
     InvalidContextToken,
     mint_token_for_identity,
     get_elabftw_read_adapter,
@@ -52,12 +53,14 @@ from lab_copilot_gateway.bentolab import (
     get_bentolab_adapter,
 )
 from lab_copilot_gateway.opencloning import (
+    OpenCloningAdapter,
     OpenCloningAdapterError,
     OpenCloningResult,
     get_opencloning_adapter,
 )
 from lab_copilot_gateway.opencloning_artifacts import normalize_opencloning_artifacts
 from lab_copilot_gateway.wallac import (
+    WallacAdapter,
     WallacAdapterError,
     get_wallac_adapter,
 )
@@ -68,6 +71,7 @@ from lab_copilot_gateway.identity import (
     get_identity_mapper,
 )
 from lab_copilot_gateway.policy import (
+    PolicyEngine,
     PolicyRequest,
     Tier,
     get_policy_engine,
@@ -420,9 +424,7 @@ def _opencloning_invoke_success(
 ) -> dict[str, object]:
     """Return OpenCloning /invoke output without raw sequence bytes."""
     raw = result.to_dict()
-    raw_result = (
-        raw.get("result", {}) if isinstance(raw.get("result"), dict) else {}
-    )
+    raw_result = raw.get("result", {}) if isinstance(raw.get("result"), dict) else {}
     plan_id = f"invoke-{request_id or result.audit_action_id}"
     plan_hash = compute_args_hash(
         {"tool_name": tool_name, "audit_action_id": result.audit_action_id}
@@ -466,9 +468,7 @@ def _opencloning_invoke_success(
                 plan_hash=plan_hash,
                 artifact_id=artifact_id,
                 filename=str(artifact.get("filename") or "artifact.bin"),
-                mime_type=str(
-                    artifact.get("mime_type") or "application/octet-stream"
-                ),
+                mime_type=str(artifact.get("mime_type") or "application/octet-stream"),
                 data=data,
                 binding=binding,
                 manifest_extra=extra,
@@ -654,31 +654,33 @@ def _resolve_download_record_id(
     Returns (record_id, record_type, error_dict).  If error_dict is not None,
     the caller should return it as the error response.
     """
-    record_id = int(
-        body.args.get("record_id", body.args.get("experiment_id", 0))
-    )
+    record_id = int(body.args.get("record_id", body.args.get("experiment_id", 0)))
     record_type = body.args.get("record_type", "experiments")
     if record_id == 0:
         if not body.context_token:
-            return 0, "", {
-                "ok": False,
-                "reason": "missing_record_id",
-                "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
-            }
+            return (
+                0,
+                "",
+                {
+                    "ok": False,
+                    "reason": "missing_record_id",
+                    "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
+                },
+            )
         try:
             claims = verify_context_token(body.context_token)
             record_id = claims.experiment_id
-            record_type = (
-                "items"
-                if claims.record_type == "resource"
-                else "experiments"
-            )
+            record_type = "items" if claims.record_type == "resource" else "experiments"
         except Exception:
-            return 0, "", {
-                "ok": False,
-                "reason": "invalid_context_token",
-                "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
-            }
+            return (
+                0,
+                "",
+                {
+                    "ok": False,
+                    "reason": "invalid_context_token",
+                    "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
+                },
+            )
     return record_id, record_type, None
 
 
@@ -710,9 +712,7 @@ def _invoke_elabftw_download_upload(
     last_exc: Exception | None = None
     for rt in try_record_types:
         try:
-            content = adapter.client.get_upload_content(
-                rt, record_id, upload_id
-            )
+            content = adapter.client.get_upload_content(rt, record_id, upload_id)
             break
         except Exception as exc:
             last_exc = exc
@@ -721,9 +721,7 @@ def _invoke_elabftw_download_upload(
             "ok": False,
             "tool_name": tool.name,
             "reason": "download_failed",
-            "message": str(last_exc)
-            if last_exc
-            else "upload not found",
+            "message": str(last_exc) if last_exc else "upload not found",
         }
     return {
         "ok": True,
@@ -1297,9 +1295,17 @@ def create_app() -> FastAPI:
     artifact_store = get_artifact_bundle_store()
 
     # Register routes in dependency groups.
-    _register_health_routes(api, service_name, audit_store, policy_engine,
-                            identity_mapper, approval_store, elabftw_adapter,
-                            opencloning_adapter, wallac_adapter)
+    _register_health_routes(
+        api,
+        service_name,
+        audit_store,
+        policy_engine,
+        identity_mapper,
+        approval_store,
+        elabftw_adapter,
+        opencloning_adapter,
+        wallac_adapter,
+    )
     _register_config_routes(api, service_name)
     _register_artifact_routes(api, artifact_store)
     _register_audit_routes(api, audit_store)
@@ -1314,9 +1320,8 @@ def create_app() -> FastAPI:
 
     return api
 
-def _register_config_routes(
-    api: FastAPI, service_name: str
-) -> None:
+
+def _register_config_routes(api: FastAPI, service_name: str) -> None:
     """Register /config/public and /tools routes."""
 
     @api.get("/config/public")
@@ -1358,26 +1363,44 @@ def _register_artifact_routes(
         if not artifact_sha256 or artifact_size_bytes is None:
             raise HTTPException(
                 status_code=400,
-                detail={"reason": "missing_artifact_identity",
-                        "message": "artifact_sha256 and artifact_size_bytes are required"},
+                detail={
+                    "reason": "missing_artifact_identity",
+                    "message": "artifact_sha256 and artifact_size_bytes are required",
+                },
             )
         try:
             artifact = artifact_store.get(
-                plan_id=plan_id, plan_hash=plan_hash, artifact_id=artifact_id,
+                plan_id=plan_id,
+                plan_hash=plan_hash,
+                artifact_id=artifact_id,
                 expected_sha256=artifact_sha256,
-                expected_size_bytes=artifact_size_bytes, binding=binding,
+                expected_size_bytes=artifact_size_bytes,
+                binding=binding,
             )
         except ArtifactExpired as exc:
-            raise HTTPException(status_code=410, detail={"reason": "artifact_expired", "message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=410,
+                detail={"reason": "artifact_expired", "message": str(exc)},
+            ) from exc
         except ArtifactMissing as exc:
-            raise HTTPException(status_code=404, detail={"reason": "artifact_missing", "message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=404,
+                detail={"reason": "artifact_missing", "message": str(exc)},
+            ) from exc
         except ArtifactContextMismatch as exc:
-            raise HTTPException(status_code=403, detail={"reason": "artifact_context_mismatch", "message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=403,
+                detail={"reason": "artifact_context_mismatch", "message": str(exc)},
+            ) from exc
         except (ArtifactHashMismatch, ArtifactSizeMismatch) as exc:
-            raise HTTPException(status_code=409, detail={"reason": "artifact_identity_mismatch", "message": str(exc)}) from exc
+            raise HTTPException(
+                status_code=409,
+                detail={"reason": "artifact_identity_mismatch", "message": str(exc)},
+            ) from exc
         filename = _download_filename(artifact.filename)
         return Response(
-            content=artifact.bytes_data, media_type=artifact.mime_type,
+            content=artifact.bytes_data,
+            media_type=artifact.mime_type,
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
@@ -1386,9 +1409,7 @@ def _register_artifact_routes(
         )
 
 
-def _register_audit_routes(
-    api: FastAPI, audit_store: AuditStore
-) -> None:
+def _register_audit_routes(api: FastAPI, audit_store: AuditStore) -> None:
     """Register audit POST/GET routes."""
 
     @api.post("/audit")
@@ -1419,15 +1440,23 @@ def _register_policy_routes(
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
         req = PolicyRequest(
-            tool_name=body.tool_name, tier=Tier(body.tier), adapter=body.adapter,
-            user_id=body.user_id, team_id=body.team_id,
+            tool_name=body.tool_name,
+            tier=Tier(body.tier),
+            adapter=body.adapter,
+            user_id=body.user_id,
+            team_id=body.team_id,
             autonomy_enabled=body.autonomy_enabled,
-            has_approval=body.has_approval, approval_id=body.approval_id,
+            has_approval=body.has_approval,
+            approval_id=body.approval_id,
         )
         decision = policy_engine.decide(req)
-        return {"decision": decision.decision, "reason": decision.reason,
-                "tier": decision.tier, "requires_approval": decision.requires_approval,
-                "matched_kill_switches": decision.matched_kill_switches}
+        return {
+            "decision": decision.decision,
+            "reason": decision.reason,
+            "tier": decision.tier,
+            "requires_approval": decision.requires_approval,
+            "matched_kill_switches": decision.matched_kill_switches,
+        }
 
     @api.post("/policy/kill_switch")
     def set_kill_switch(
@@ -1435,23 +1464,29 @@ def _register_policy_routes(
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
         if body.switch not in KILL_SWITCH_CATEGORY_NAMES:
-            return {"ok": False, "reason": "unknown_switch",
-                    "message": f"unknown kill switch category {body.switch!r}; valid switches: {sorted(KILL_SWITCH_CATEGORY_NAMES)}"}
+            return {
+                "ok": False,
+                "reason": "unknown_switch",
+                "message": f"unknown kill switch category {body.switch!r}; valid switches: {sorted(KILL_SWITCH_CATEGORY_NAMES)}",
+            }
         action_id = str(_uuid.uuid4())
         record = AuditRecord(
-            action_id=action_id, tool_name="__kill_switch__",
+            action_id=action_id,
+            tool_name="__kill_switch__",
             policy_decision="deny" if body.enabled else "allow",
             api_call_summary={"switch": body.switch, "enabled": body.enabled},
         )
         audit_store.append(record)
         set_kill_category(body.switch, body.enabled)
-        return {"ok": True, "switch": body.switch, "enabled": body.enabled,
-                "audit_action_id": action_id}
+        return {
+            "ok": True,
+            "switch": body.switch,
+            "enabled": body.enabled,
+            "audit_action_id": action_id,
+        }
 
 
-def _register_identity_routes(
-    api: FastAPI, identity_mapper: IdentityMapper
-) -> None:
+def _register_identity_routes(api: FastAPI, identity_mapper: IdentityMapper) -> None:
     """Register /identity/resolve route."""
 
     @api.post("/identity/resolve")
@@ -1479,18 +1514,26 @@ def _register_approval_routes(
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
         from lab_copilot_gateway.approval import DEFAULT_APPROVAL_TTL_SECONDS
+
         req = ApprovalRequest(
-            tool_name=body.tool_name, args_hash=compute_args_hash(body.args),
-            target_record=body.target_record, tier=body.tier,
+            tool_name=body.tool_name,
+            args_hash=compute_args_hash(body.args),
+            target_record=body.target_record,
+            tier=body.tier,
             keycloak_subject=body.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
             mapped_elabftw_user_id=body.mapped_elabftw_user_id,
-            provider=body.provider, model_id=body.model_id,
+            provider=body.provider,
+            model_id=body.model_id,
             ttl_seconds=body.ttl_seconds or DEFAULT_APPROVAL_TTL_SECONDS,
         )
         approval_id, expires_at = approval_store.request(req)
-        return {"approval_id": approval_id, "expires_at": expires_at,
-                "tool_name": req.tool_name, "args_hash": req.args_hash}
+        return {
+            "approval_id": approval_id,
+            "expires_at": expires_at,
+            "tool_name": req.tool_name,
+            "args_hash": req.args_hash,
+        }
 
     @api.post("/approval/consume")
     def consume_approval(
@@ -1500,15 +1543,22 @@ def _register_approval_routes(
         args_hash = compute_args_hash(body.args)
         try:
             result = approval_store.consume(
-                body.approval_id, tool_name=body.tool_name,
-                args_hash=args_hash, target_record=body.target_record,
+                body.approval_id,
+                tool_name=body.tool_name,
+                args_hash=args_hash,
+                target_record=body.target_record,
             )
         except ApprovalError as exc:
             return {"consumed": False, **exc.to_dict()}
-        return {"consumed": True, "approval_id": result.approval_id,
-                "tool_name": result.tool_name, "args_hash": result.args_hash,
-                "target_record": result.target_record, "tier": result.tier,
-                "consumed_at": result.consumed_at}
+        return {
+            "consumed": True,
+            "approval_id": result.approval_id,
+            "tool_name": result.tool_name,
+            "args_hash": result.args_hash,
+            "target_record": result.target_record,
+            "tier": result.tier,
+            "consumed_at": result.consumed_at,
+        }
 
     @api.get("/approval/{approval_id}")
     def get_approval(
@@ -1521,9 +1571,7 @@ def _register_approval_routes(
         return record.to_dict()
 
 
-def _register_elabftw_routes(
-    api: FastAPI, identity_mapper: IdentityMapper
-) -> None:
+def _register_elabftw_routes(api: FastAPI, identity_mapper: IdentityMapper) -> None:
     """Register all /elabftw/* routes."""
 
     @api.post("/elabftw/read_current_experiment")
@@ -1538,11 +1586,14 @@ def _register_elabftw_routes(
         )
         try:
             result = adapter.read_current_experiment(
-                context_token=body.context_token, mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id, request_id=body.request_id,
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider, model_id=body.model_id,
+                provider=body.provider,
+                model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
@@ -1558,22 +1609,33 @@ def _register_elabftw_routes(
             librechat_user_id=body.librechat_user_id,
         )
         if mapped is None:
-            return {"ok": False, "reason": "unmapped_caller",
-                    "message": "caller did not resolve to a mapped eLabFTW identity"}
+            return {
+                "ok": False,
+                "reason": "unmapped_caller",
+                "message": "caller did not resolve to a mapped eLabFTW identity",
+            }
         if body.experiment_id < 0:
-            return {"ok": False, "reason": "invalid_experiment_id",
-                    "message": "experiment_id must be a non-negative integer "
-                    "(0 means no experiment context)"}
+            return {
+                "ok": False,
+                "reason": "invalid_experiment_id",
+                "message": "experiment_id must be a non-negative integer "
+                "(0 means no experiment context)",
+            }
         token, expires_at = mint_token_for_identity(
             experiment_id=body.experiment_id,
             mapped_elabftw_user_id=mapped.elabftw_user_id,
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
-            ttl_seconds=body.requested_ttl_seconds, record_type=body.record_type,
+            ttl_seconds=body.requested_ttl_seconds,
+            record_type=body.record_type,
         )
-        return {"ok": True, "context_token": token, "expires_at": expires_at,
-                "experiment_id": body.experiment_id,
-                "mapped_elabftw_user_id": mapped.elabftw_user_id}
+        return {
+            "ok": True,
+            "context_token": token,
+            "expires_at": expires_at,
+            "experiment_id": body.experiment_id,
+            "mapped_elabftw_user_id": mapped.elabftw_user_id,
+        }
 
     @api.post("/elabftw/draft_experiment_update")
     def elabftw_draft_experiment_update(
@@ -1587,12 +1649,16 @@ def _register_elabftw_routes(
         )
         try:
             result = adapter.draft_experiment_update(
-                context_token=body.context_token, approval_id=body.approval_id,
-                approval_args=body.approval_args, mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id, request_id=body.request_id,
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider, model_id=body.model_id,
+                provider=body.provider,
+                model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
@@ -1610,12 +1676,16 @@ def _register_elabftw_routes(
         )
         try:
             result = adapter.edit_experiment_section(
-                context_token=body.context_token, approval_id=body.approval_id,
-                approval_args=body.approval_args, mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id, request_id=body.request_id,
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider, model_id=body.model_id,
+                provider=body.provider,
+                model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
@@ -1633,13 +1703,17 @@ def _register_elabftw_amend_route(
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
         import base64
+
         attachment_data: bytes | None = None
         if body.attachment_b64 is not None and body.attachment_filename:
             try:
                 attachment_data = base64.b64decode(body.attachment_b64)
             except Exception as exc:
-                return {"ok": False, "reason": "client_error",
-                        "message": f"attachment_b64 is not valid base64: {exc}"}
+                return {
+                    "ok": False,
+                    "reason": "client_error",
+                    "message": f"attachment_b64 is not valid base64: {exc}",
+                }
         adapter = get_elabftw_write_adapter()
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
@@ -1647,12 +1721,16 @@ def _register_elabftw_amend_route(
         )
         try:
             result = adapter.amend_my_experiment_after_approval(
-                context_token=body.context_token, approval_id=body.approval_id,
-                approval_args=body.approval_args, mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id, request_id=body.request_id,
+                context_token=body.context_token,
+                approval_id=body.approval_id,
+                approval_args=body.approval_args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider, model_id=body.model_id,
+                provider=body.provider,
+                model_id=body.model_id,
                 amendment_html=body.amendment_html,
                 attachment_filename=body.attachment_filename,
                 attachment_data=attachment_data,
@@ -1664,7 +1742,8 @@ def _register_elabftw_amend_route(
 
 
 def _register_invoke_route(
-    api: FastAPI, identity_mapper: IdentityMapper,
+    api: FastAPI,
+    identity_mapper: IdentityMapper,
     artifact_store: ArtifactBundleStore,
 ) -> None:
     """Register POST /invoke route."""
@@ -1677,10 +1756,13 @@ def _register_invoke_route(
         registry = get_tool_registry()
         tool = registry.find(body.tool_name)
         if tool is None:
-            return {"ok": False, "tool_name": body.tool_name,
-                    "reason": "tool_not_registered",
-                    "message": f"tool {body.tool_name!r} is not in the gateway registry; "
-                    "LibreChat may only invoke curated C06 tools"}
+            return {
+                "ok": False,
+                "tool_name": body.tool_name,
+                "reason": "tool_not_registered",
+                "message": f"tool {body.tool_name!r} is not in the gateway registry; "
+                "LibreChat may only invoke curated C06 tools",
+            }
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
@@ -1690,15 +1772,16 @@ def _register_invoke_route(
             if tool.adapter == "opencloning":
                 return dispatcher(tool, body, mapped_identity, artifact_store)
             return dispatcher(tool, body, mapped_identity)
-        return {"ok": False, "tool_name": tool.name,
-                "reason": "adapter_not_implemented",
-                "message": f"tool {tool.name!r} is in the registry but its "
-                f"{tool.adapter!r} adapter is not implemented yet (lands in C19+)"}
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "adapter_not_implemented",
+            "message": f"tool {tool.name!r} is in the registry but its "
+            f"{tool.adapter!r} adapter is not implemented yet (lands in C19+)",
+        }
 
 
-def _register_plan_route(
-    api: FastAPI, identity_mapper: IdentityMapper
-) -> None:
+def _register_plan_route(api: FastAPI, identity_mapper: IdentityMapper) -> None:
     """Register POST /plan/execute route."""
 
     @api.post("/plan/execute")
@@ -1709,23 +1792,30 @@ def _register_plan_route(
         try:
             plan = Plan.from_dict(body.plan)
         except PlanValidationError as exc:
-            return {"ok": False, "plan_id": body.plan.get("plan_id", ""),
-                    "reason": "plan_validation_failed", "errors": exc.errors}
+            return {
+                "ok": False,
+                "plan_id": body.plan.get("plan_id", ""),
+                "reason": "plan_validation_failed",
+                "errors": exc.errors,
+            }
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         executor = get_plan_executor()
         result = executor.execute(
-            plan, approval_id=body.approval_id, context_token=body.context_token,
+            plan,
+            approval_id=body.approval_id,
+            context_token=body.context_token,
             mapped_identity=mapped_identity,
-            conversation_id=body.conversation_id, request_id=body.request_id,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
             keycloak_subject=body.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
-            provider=body.provider, model_id=body.model_id,
+            provider=body.provider,
+            model_id=body.model_id,
         )
         return {"ok": result.status == "completed", **result.to_dict()}
-
 
 
 def _build_health_deps(
@@ -1757,10 +1847,14 @@ def _build_health_deps(
             "configured" if wallac_adapter.client is not None else "not_configured"
         ),
         "wallac_bridge": (
-            "configured" if wallac_adapter.bridge_client is not None else "not_configured"
+            "configured"
+            if wallac_adapter.bridge_client is not None
+            else "not_configured"
         ),
         "bentolab": (
-            "configured" if get_bentolab_adapter().client is not None else "not_configured"
+            "configured"
+            if get_bentolab_adapter().client is not None
+            else "not_configured"
         ),
     }
     deps.update(_identity_backend_status(identity_mapper))
@@ -1805,12 +1899,15 @@ def _register_health_routes(
             opencloning_adapter=opencloning_adapter,
             wallac_adapter=wallac_adapter,
         )
-        return {"service": service_name, "version": __version__, "status": "ok", "dependencies": deps}
+        return {
+            "service": service_name,
+            "version": __version__,
+            "status": "ok",
+            "dependencies": deps,
+        }
 
 
-def _register_bentolab_route(
-    api: FastAPI, identity_mapper: IdentityMapper
-) -> None:
+def _register_bentolab_route(api: FastAPI, identity_mapper: IdentityMapper) -> None:
     """Register POST /bentolab route."""
 
     @api.post("/bentolab")
@@ -1819,24 +1916,30 @@ def _register_bentolab_route(
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
         import base64
+
         registry = get_tool_registry()
         tool = registry.find(body.tool_name)
         if tool is None:
-            return {"ok": False, "tool_name": body.tool_name,
-                    "reason": "tool_not_registered",
-                    "message": f"tool {body.tool_name!r} is not in the gateway registry"}
+            return {
+                "ok": False,
+                "tool_name": body.tool_name,
+                "reason": "tool_not_registered",
+                "message": f"tool {body.tool_name!r} is not in the gateway registry",
+            }
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
-        attachment_data: bytes | None = None
         if body.args.get("attachment_b64") and body.args.get("attachment_filename"):
             try:
-                attachment_data = base64.b64decode(body.args["attachment_b64"])
+                base64.b64decode(body.args["attachment_b64"])
             except Exception as exc:
-                return {"ok": False, "tool_name": tool.name,
-                        "reason": "client_error",
-                        "message": f"attachment_b64 is not valid base64: {exc}"}
+                return {
+                    "ok": False,
+                    "tool_name": tool.name,
+                    "reason": "client_error",
+                    "message": f"attachment_b64 is not valid base64: {exc}",
+                }
         return _invoke_bentolab_tool(tool, body, mapped_identity)
 
 

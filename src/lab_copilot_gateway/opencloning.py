@@ -412,9 +412,7 @@ class HttpOpenCloningClient:
         return resp.json()
 
 
-def _inject_one_sequence(
-    seq: Any, store: dict[str, dict[str, Any]]
-) -> None:
+def _inject_one_sequence(seq: Any, store: dict[str, dict[str, Any]]) -> None:
     """Inject file_content into a single sequence dict if needed."""
     if not isinstance(seq, dict):
         return
@@ -528,9 +526,7 @@ def _rewrite_sequence_ids(
     return next_id, id_map
 
 
-def _rewrite_source_ids(
-    result: dict[str, Any], id_map: dict[str, int]
-) -> None:
+def _rewrite_source_ids(result: dict[str, Any], id_map: dict[str, int]) -> None:
     """Rewrite source ids and input sequence references using id_map."""
     for src in result.get("sources", []):
         if not isinstance(src, dict):
@@ -541,9 +537,7 @@ def _rewrite_source_ids(
         _rewrite_source_inputs(src, id_map)
 
 
-def _rewrite_source_inputs(
-    src: dict[str, Any], id_map: dict[str, int]
-) -> None:
+def _rewrite_source_inputs(src: dict[str, Any], id_map: dict[str, int]) -> None:
     """Rewrite sequence references in a source's input list."""
     inputs = src.get("input")
     if not isinstance(inputs, list):
@@ -1045,9 +1039,7 @@ class OpenCloningAdapter:
         artifact_comment = approval_args.get(
             "artifact_comment", "OpenCloning design artifact"
         )
-        artifact_reference = _parse_artifact_reference(
-            approval_args, artifact_content
-        )
+        artifact_reference = _parse_artifact_reference(approval_args, artifact_content)
 
         # The artifact content is the hash-bound payload.  Convert to bytes
         # for the eLabFTW upload_attachment call.
@@ -1215,7 +1207,7 @@ class OpenCloningAdapter:
         self,
         *,
         tool_name: str,
-        tier: int,
+        tier: Tier,
         mapped_identity: MappedIdentity,
         experiment_id: int,
         conversation_id: str | None,
@@ -1429,9 +1421,7 @@ class OpenCloningAdapter:
                 reason="artifact_bundle_error",
                 message=f"artifact bundle lookup failed: {exc}",
             ) from exc
-        resolved_filename = str(
-            artifact_filename or stored.filename or "construct.gb"
-        )
+        resolved_filename = str(artifact_filename or stored.filename or "construct.gb")
         if len(stored.bytes_data) > MAX_FILE_SIZE_BYTES:
             raise FileTooLarge(len(stored.bytes_data), MAX_FILE_SIZE_BYTES)
         return resolved_filename, stored.bytes_data
@@ -1491,9 +1481,7 @@ class OpenCloningAdapter:
                 ) from exc
         return approval_id
 
-    def _maybe_rewrite_genbank_features(
-        self, artifact_bytes: bytes
-    ) -> bytes:
+    def _maybe_rewrite_genbank_features(self, artifact_bytes: bytes) -> bytes:
         """Re-annotate GenBank with features recovered from templates."""
         if not artifact_bytes or not self._strategy_sequences:
             return artifact_bytes
@@ -1501,14 +1489,13 @@ class OpenCloningAdapter:
             from lab_copilot_gateway.opencloning_features import (
                 rewrite_genbank_features,
             )
+
             genbank_str = (
                 artifact_bytes.decode("utf-8")
                 if isinstance(artifact_bytes, bytes)
                 else artifact_bytes
             )
-            rewritten = rewrite_genbank_features(
-                genbank_str, self._strategy_sequences
-            )
+            rewritten = rewrite_genbank_features(genbank_str, self._strategy_sequences)
             return (
                 rewritten.encode("utf-8")
                 if isinstance(artifact_bytes, bytes)
@@ -1648,6 +1635,7 @@ class OpenCloningAdapter:
         )
 
         # 4. Policy decision (tier 4 write, requires approval).
+        assert mapped_identity is not None
         self._check_policy_decision(
             tool_name=TOOL_WRITEBACK,
             tier=TOOL_TIER_WRITE,
@@ -1701,6 +1689,7 @@ class OpenCloningAdapter:
         # 7. Upload the artifact as an attachment.
         # record_type: "resource" → /api/v2/items/{id}, else /api/v2/experiments/{id}
         rt_param = "items" if claims.record_type == "resource" else "experiments"
+        assert self.elabftw_client is not None
         try:
             upload_id = self.elabftw_client.upload_attachment(
                 experiment_id=claims.experiment_id,
@@ -1771,6 +1760,7 @@ class OpenCloningAdapter:
                 _os.path.splitext(artifact_filename)[0] + "_history.json"
             )
 
+            assert self.elabftw_client is not None
             try:
                 history_upload_id = self.elabftw_client.upload_attachment(
                     experiment_id=claims.experiment_id,
@@ -1790,6 +1780,7 @@ class OpenCloningAdapter:
 
         action_id = f"{self.action_id_prefix}-writeback-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
 
+        assert self.elabftw_client is not None
         try:
             self.elabftw_client.patch_experiment_metadata(
                 experiment_id=claims.experiment_id,
@@ -1909,6 +1900,7 @@ class OpenCloningAdapter:
         )
 
         # 4. Policy decision (tier 3 read-only, no approval needed).
+        assert mapped_identity is not None
         self._check_policy_decision(
             tool_name=tool_name,
             tier=TOOL_TIER,

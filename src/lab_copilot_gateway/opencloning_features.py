@@ -88,13 +88,15 @@ def _extract_features_from_template(
         seen_seqs.add(feat_seq)
         qualifiers = dict(feat["qualifiers"])
         qualifiers["note"] = "lab-copilot:insert"
-        new_features.append({
-            "type": feat["type"],
-            "start": start,
-            "end": end,
-            "strand": strand,
-            "qualifiers": qualifiers,
-        })
+        new_features.append(
+            {
+                "type": feat["type"],
+                "start": start,
+                "end": end,
+                "strand": strand,
+                "qualifiers": qualifiers,
+            }
+        )
 
 
 def rewrite_genbank_features(
@@ -209,9 +211,7 @@ def _parse_feature_match(match: re.Match[str]) -> dict[str, Any]:
     }
 
 
-def _parse_feature_qualifier(
-    current: dict[str, Any], line: str
-) -> None:
+def _parse_feature_qualifier(current: dict[str, Any], line: str) -> None:
     """Parse a qualifier line (/key=value) into the current feature dict."""
     if not re.match(r"^\s+/", line):
         return
@@ -302,9 +302,7 @@ def _parse_single_location(part_str: str) -> tuple[int, int] | None:
     return None
 
 
-def _extract_parts_sequence(
-    parts: list[tuple[int, int]], template_seq: str
-) -> str:
+def _extract_parts_sequence(parts: list[tuple[int, int]], template_seq: str) -> str:
     """Extract and concatenate nucleotide chunks from location parts."""
     seq_len = len(template_seq)
     chunks: list[str] = []

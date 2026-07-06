@@ -68,8 +68,12 @@ def _normalize_empty_sequences_result(
         )
     # Analysis endpoints return analysis results, not sequences.
     analysis_keys = {
-        "melting_temperature", "tm", "gc_content",
-        "heterodimer", "self_dimer", "hairpin",
+        "melting_temperature",
+        "tm",
+        "gc_content",
+        "heterodimer",
+        "self_dimer",
+        "hairpin",
     }
     if any(k in result for k in analysis_keys):
         return NormalizedOpenCloningArtifacts(
@@ -90,11 +94,13 @@ def _normalize_empty_sequences_result(
             blocking_errors=blocking_errors,
             provenance=provenance,
         )
-    blocking_errors.append({
-        "severity": "blocking_error",
-        "code": "no_final_sequence",
-        "message": "OpenCloning returned no final product sequence.",
-    })
+    blocking_errors.append(
+        {
+            "severity": "blocking_error",
+            "code": "no_final_sequence",
+            "message": "OpenCloning returned no final product sequence.",
+        }
+    )
     return NormalizedOpenCloningArtifacts(
         summary="OpenCloning produced no final construct.",
         warnings=warnings,
@@ -470,9 +476,7 @@ def _is_genbank_section_boundary(line: str) -> bool:
     return line.startswith("ORIGIN") or line.startswith("//")
 
 
-def _genbank_feature_qualifier(
-    current: dict[str, str], line: str
-) -> None:
+def _genbank_feature_qualifier(current: dict[str, str], line: str) -> None:
     """Parse a qualifier line, extracting label/gene/product."""
     if not re.match(r"^\s+/", line):
         return

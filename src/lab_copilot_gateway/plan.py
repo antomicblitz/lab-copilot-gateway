@@ -196,9 +196,7 @@ class Plan:
         if not isinstance(raw, list):
             return []
         return [
-            PlanStep.from_dict(s)
-            if isinstance(s, dict)
-            else PlanStep(tool_name=str(s))
+            PlanStep.from_dict(s) if isinstance(s, dict) else PlanStep(tool_name=str(s))
             for s in raw
         ]
 
@@ -324,9 +322,7 @@ def validate_plan(plan: Plan) -> list[str]:
     return errors
 
 
-def _validate_anchor(
-    anchor: dict[str, object], errors: list[str]
-) -> None:
+def _validate_anchor(anchor: dict[str, object], errors: list[str]) -> None:
     """Validate the anchor dict has required fields."""
     if not isinstance(anchor, dict):
         errors.append("anchor must be a dict")
@@ -336,14 +332,10 @@ def _validate_anchor(
             errors.append(f"anchor.{key} must be non-empty")
 
 
-def _validate_rollback_and_approval(
-    plan: Plan, errors: list[str]
-) -> None:
+def _validate_rollback_and_approval(plan: Plan, errors: list[str]) -> None:
     """Validate hardware rollback and write approval requirements."""
     if plan.risk_tier >= PlanRiskTier.HARDWARE and not plan.rollback:
-        errors.append(
-            f"risk_tier {plan.risk_tier.label} requires a rollback strategy"
-        )
+        errors.append(f"risk_tier {plan.risk_tier.label} requires a rollback strategy")
     if plan.writes and not plan.approval_required:
         errors.append("plans with writes must have approval_required=True")
 

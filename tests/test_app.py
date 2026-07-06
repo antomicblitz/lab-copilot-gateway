@@ -1150,14 +1150,31 @@ def test_elabftw_mint_denies_caller_with_no_identity_fields() -> None:
     assert out["reason"] == "unmapped_caller"
 
 
-def test_elabftw_mint_rejects_nonpositive_experiment_id() -> None:
-    """experiment_id <= 0 is invalid even for a mapped user."""
+def test_elabftw_mint_accepts_zero_experiment_id() -> None:
+    """experiment_id=0 means 'no experiment context' and is valid."""
     _register_mapped_user()
     client = make_client()
     r = client.post(
         "/elabftw/mint_context_token",
         json={
             "experiment_id": 0,
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert "context_token" in out
+
+
+def test_elabftw_mint_rejects_negative_experiment_id() -> None:
+    """Negative experiment_id is invalid even for a mapped user."""
+    _register_mapped_user()
+    client = make_client()
+    r = client.post(
+        "/elabftw/mint_context_token",
+        json={
+            "experiment_id": -1,
             "keycloak_subject": "kc-mint-1",
         },
     )
