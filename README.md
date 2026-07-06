@@ -92,6 +92,7 @@ Required environment variables:
 | `LAB_COPILOT_KEYCLOAK_JWKS_TIMEOUT` | JWKS fetch timeout (default: `10`) |
 
 Fail-closed behavior:
+
 - Missing issuer/audience/JWKS config → gateway refuses to start
 - First-boot JWKS fetch failure → gateway refuses to start
 - Unknown `kid` during JWKS outage → 401
@@ -102,7 +103,7 @@ Fail-closed behavior:
 Allowed only in `local`, `test`, or `dev` environments. Requires
 `LAB_COPILOT_DEV_AUTH_SECRET` to be set. Requests must include:
 
-```
+```text
 X-Lab-Copilot-Dev-Auth: <secret>
 X-Lab-Copilot-Dev-Sub: <keycloak_subject>   # optional, defaults to "dev-unverified"
 ```
