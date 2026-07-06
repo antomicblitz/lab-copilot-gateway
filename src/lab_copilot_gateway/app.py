@@ -1285,80 +1285,39 @@ def create_app() -> FastAPI:
     api = FastAPI(title="Lab Copilot Gateway", version=__version__)
     register_auth_exception_handler(api)
 
-    # Eagerly initialize audit store, policy engine, identity mapper,
-    # approval store, eLabFTW read adapter (C08), eLabFTW write adapter
-    # (C09), and OpenCloning adapter (C16) so /health reflects state.
+    # Eagerly initialize all singleton dependencies.
     audit_store = get_audit_store()
     policy_engine = get_policy_engine()
     identity_mapper = get_identity_mapper()
     approval_store = get_approval_store()
     elabftw_adapter = get_elabftw_read_adapter()
-    # Trigger construction of the write adapter singleton (no binding needed
-    # here, but the call ensures /health shows the configured state).
     get_elabftw_write_adapter()
     opencloning_adapter = get_opencloning_adapter()
     wallac_adapter = get_wallac_adapter()
     artifact_store = get_artifact_bundle_store()
 
-    # CORS is intentionally closed in the scaffold. Configure allowed LibreChat
-    # origins when browser-based calls are introduced.
+    # Register routes in dependency groups.
+    _register_health_routes(api, service_name, audit_store, policy_engine,
+                            identity_mapper, approval_store, elabftw_adapter,
+                            opencloning_adapter, wallac_adapter)
+    _register_config_routes(api, service_name)
+    _register_artifact_routes(api, artifact_store)
+    _register_audit_routes(api, audit_store)
+    _register_policy_routes(api, policy_engine, audit_store)
+    _register_identity_routes(api, identity_mapper)
+    _register_approval_routes(api, approval_store, identity_mapper)
+    _register_elabftw_routes(api, identity_mapper)
+    _register_elabftw_amend_route(api, identity_mapper)
+    _register_invoke_route(api, identity_mapper, artifact_store)
+    _register_plan_route(api, identity_mapper)
+    _register_bentolab_route(api, identity_mapper)
 
-    @api.get("/health")
-    def health() -> dict[str, object]:
-        deps: dict[str, object] = {
-            "audit_db": "configured" if audit_store.db_path != ":memory:" else "memory",
-            "policy_engine": "ready",
-            "policy_max_tier": int(policy_engine.max_tier),
-            "kill_switches": list(policy_engine.kill_switches),
-            "kill_switch_categories": {
-                k: v for k, v in policy_engine.kill_categories.items() if v
-            },
-            "elabftw": (
-                "configured" if elabftw_adapter.client is not None else "not_configured"
-            ),
-            "opencloning": (
-                "configured"
-                if opencloning_adapter.client is not None
-                else "not_configured"
-            ),
-            "wallac": (
-                "configured" if wallac_adapter.client is not None else "not_configured"
-            ),
-            "wallac_bridge": (
-                "configured"
-                if wallac_adapter.bridge_client is not None
-                else "not_configured"
-            ),
-            "bentolab": (
-                "configured"
-                if get_bentolab_adapter().client is not None
-                else "not_configured"
-            ),
-        }
-        deps.update(_identity_backend_status(identity_mapper))
-        deps.update(_approval_backend_status(approval_store))
-        deps["tool_count"] = len(get_tool_registry().list())
+    return api
 
-        # C14 auth status
-        auth_cfg = get_auth_config()
-        auth_status: dict[str, object] = {
-            "auth_mode": "dev" if not auth_cfg.verify_enabled else "jwt",
-            "verify_enabled": auth_cfg.verify_enabled,
-        }
-        if auth_cfg.verify_enabled:
-            try:
-                jwks_status = get_jwks_cache().status()
-                auth_status["jwks"] = jwks_status
-            except Exception:
-                auth_status["jwks"] = {"error": "unavailable"}
-        deps["auth"] = auth_status
-
-        return {
-            "service": service_name,
-            "version": __version__,
-            "status": "ok",
-            "dependencies": deps,
-        }
+def _register_config_routes(
+    api: FastAPI, service_name: str
+) -> None:
+    """Register /config/public and /tools routes."""
 
     @api.get("/config/public")
     def public_config() -> dict[str, object]:
@@ -1367,6 +1326,12 @@ def create_app() -> FastAPI:
     @api.get("/tools")
     def tools() -> dict[str, list[dict[str, object]]]:
         return {"tools": list_tools()}
+
+
+def _register_artifact_routes(
+    api: FastAPI, artifact_store: ArtifactBundleStore
+) -> None:
+    """Register /v1/artifacts/{id}/download route."""
 
     @api.get("/v1/artifacts/{artifact_id}/download")
     def download_artifact(
@@ -1378,13 +1343,6 @@ def create_app() -> FastAPI:
         context_token: str = Header("", alias="X-Lab-Copilot-Context-Token"),
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> Response:
-        """Download an approved-preview OpenCloning artifact by manifest identity.
-
-        The browser must call this route through the same-origin copilot proxy
-        and include the short-lived context token header.  Artifact bytes remain
-        process-local and are resolved by ``plan_id`` + ``plan_hash`` +
-        ``artifact_id`` so stale chat cards fail closed.
-        """
         try:
             claims = verify_context_token(context_token)
         except InvalidContextToken as exc:
@@ -1392,7 +1350,6 @@ def create_app() -> FastAPI:
                 status_code=401,
                 detail={"reason": "invalid_context_token", "message": exc.detail},
             ) from exc
-
         binding = {
             "record_type": claims.record_type,
             "record_id": str(claims.experiment_id),
@@ -1401,51 +1358,38 @@ def create_app() -> FastAPI:
         if not artifact_sha256 or artifact_size_bytes is None:
             raise HTTPException(
                 status_code=400,
-                detail={
-                    "reason": "missing_artifact_identity",
-                    "message": "artifact_sha256 and artifact_size_bytes are required",
-                },
+                detail={"reason": "missing_artifact_identity",
+                        "message": "artifact_sha256 and artifact_size_bytes are required"},
             )
         try:
             artifact = artifact_store.get(
-                plan_id=plan_id,
-                plan_hash=plan_hash,
-                artifact_id=artifact_id,
+                plan_id=plan_id, plan_hash=plan_hash, artifact_id=artifact_id,
                 expected_sha256=artifact_sha256,
-                expected_size_bytes=artifact_size_bytes,
-                binding=binding,
+                expected_size_bytes=artifact_size_bytes, binding=binding,
             )
         except ArtifactExpired as exc:
-            raise HTTPException(
-                status_code=410,
-                detail={"reason": "artifact_expired", "message": str(exc)},
-            ) from exc
+            raise HTTPException(status_code=410, detail={"reason": "artifact_expired", "message": str(exc)}) from exc
         except ArtifactMissing as exc:
-            raise HTTPException(
-                status_code=404,
-                detail={"reason": "artifact_missing", "message": str(exc)},
-            ) from exc
+            raise HTTPException(status_code=404, detail={"reason": "artifact_missing", "message": str(exc)}) from exc
         except ArtifactContextMismatch as exc:
-            raise HTTPException(
-                status_code=403,
-                detail={"reason": "artifact_context_mismatch", "message": str(exc)},
-            ) from exc
+            raise HTTPException(status_code=403, detail={"reason": "artifact_context_mismatch", "message": str(exc)}) from exc
         except (ArtifactHashMismatch, ArtifactSizeMismatch) as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"reason": "artifact_identity_mismatch", "message": str(exc)},
-            ) from exc
-
+            raise HTTPException(status_code=409, detail={"reason": "artifact_identity_mismatch", "message": str(exc)}) from exc
         filename = _download_filename(artifact.filename)
         return Response(
-            content=artifact.bytes_data,
-            media_type=artifact.mime_type,
+            content=artifact.bytes_data, media_type=artifact.mime_type,
             headers={
                 "Content-Disposition": f'attachment; filename="{filename}"',
                 "Cache-Control": "no-store",
                 "X-Lab-Copilot-Artifact-Sha256": artifact.sha256,
             },
         )
+
+
+def _register_audit_routes(
+    api: FastAPI, audit_store: AuditStore
+) -> None:
+    """Register audit POST/GET routes."""
 
     @api.post("/audit")
     def append_audit(
@@ -1463,74 +1407,52 @@ def create_app() -> FastAPI:
     ) -> dict[str, object] | None:
         return audit_store.get(action_id)
 
+
+def _register_policy_routes(
+    api: FastAPI, policy_engine: PolicyEngine, audit_store: AuditStore
+) -> None:
+    """Register /policy/evaluate and /policy/kill_switch routes."""
+
     @api.post("/policy/evaluate")
     def evaluate_policy(
         body: PolicyRequestBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
         req = PolicyRequest(
-            tool_name=body.tool_name,
-            tier=Tier(body.tier),
-            adapter=body.adapter,
-            user_id=body.user_id,
-            team_id=body.team_id,
+            tool_name=body.tool_name, tier=Tier(body.tier), adapter=body.adapter,
+            user_id=body.user_id, team_id=body.team_id,
             autonomy_enabled=body.autonomy_enabled,
-            has_approval=body.has_approval,
-            approval_id=body.approval_id,
+            has_approval=body.has_approval, approval_id=body.approval_id,
         )
         decision = policy_engine.decide(req)
-        return {
-            "decision": decision.decision,
-            "reason": decision.reason,
-            "tier": decision.tier,
-            "requires_approval": decision.requires_approval,
-            "matched_kill_switches": decision.matched_kill_switches,
-        }
+        return {"decision": decision.decision, "reason": decision.reason,
+                "tier": decision.tier, "requires_approval": decision.requires_approval,
+                "matched_kill_switches": decision.matched_kill_switches}
 
     @api.post("/policy/kill_switch")
     def set_kill_switch(
         body: KillSwitchBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
-        """Enable or disable a named kill switch category at runtime.
-
-        This is an admin-only endpoint (no auth enforcement in v1, but
-        callers MUST be authorized operators).  Changes take effect
-        immediately on the process-wide policy engine singleton and are
-        recorded in the audit log with ``tool_name="__kill_switch__"``.
-        """
         if body.switch not in KILL_SWITCH_CATEGORY_NAMES:
-            return {
-                "ok": False,
-                "reason": "unknown_switch",
-                "message": (
-                    f"unknown kill switch category {body.switch!r}; "
-                    f"valid switches: {sorted(KILL_SWITCH_CATEGORY_NAMES)}"
-                ),
-            }
-
-        # Write audit record.
+            return {"ok": False, "reason": "unknown_switch",
+                    "message": f"unknown kill switch category {body.switch!r}; valid switches: {sorted(KILL_SWITCH_CATEGORY_NAMES)}"}
         action_id = str(_uuid.uuid4())
         record = AuditRecord(
-            action_id=action_id,
-            tool_name="__kill_switch__",
+            action_id=action_id, tool_name="__kill_switch__",
             policy_decision="deny" if body.enabled else "allow",
-            api_call_summary={
-                "switch": body.switch,
-                "enabled": body.enabled,
-            },
+            api_call_summary={"switch": body.switch, "enabled": body.enabled},
         )
         audit_store.append(record)
-
-        # Update policy engine at runtime (in-place dict mutation).
         set_kill_category(body.switch, body.enabled)
+        return {"ok": True, "switch": body.switch, "enabled": body.enabled,
+                "audit_action_id": action_id}
 
-        return {
-            "ok": True,
-            "switch": body.switch,
-            "enabled": body.enabled,
-            "audit_action_id": action_id,
-        }
+
+def _register_identity_routes(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register /identity/resolve route."""
 
     @api.post("/identity/resolve")
     def resolve_identity(
@@ -1542,118 +1464,85 @@ def create_app() -> FastAPI:
             librechat_user_id=body.librechat_user_id,
         )
         if identity is None:
-            # Missing mapping fails closed — caller (LibreChat) must treat
-            # this as "no lab access" and the policy engine separately denies
-            # any subsequent /policy/evaluate call (user_id would be None).
             return {"mapped": False}
         return _identity_to_dict(identity)
+
+
+def _register_approval_routes(
+    api: FastAPI, approval_store: ApprovalStore, identity_mapper: IdentityMapper
+) -> None:
+    """Register /approval/* routes."""
 
     @api.post("/approval/request")
     def request_approval(
         body: ApprovalRequestBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
-        """Issue a single-use approval token bound to (tool, args hash, target).
-
-        The caller (typically the gateway's tool-execution path or the
-        LibreChat approval card) supplies the EXACT args the tool will run
-        with; the gateway hashes them and stores the hash.  ``approval_id``
-        is opaque to the client and may be displayed but not modified.
-        """
         from lab_copilot_gateway.approval import DEFAULT_APPROVAL_TTL_SECONDS
-
         req = ApprovalRequest(
-            tool_name=body.tool_name,
-            args_hash=compute_args_hash(body.args),
-            target_record=body.target_record,
-            tier=body.tier,
+            tool_name=body.tool_name, args_hash=compute_args_hash(body.args),
+            target_record=body.target_record, tier=body.tier,
             keycloak_subject=body.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
             mapped_elabftw_user_id=body.mapped_elabftw_user_id,
-            provider=body.provider,
-            model_id=body.model_id,
+            provider=body.provider, model_id=body.model_id,
             ttl_seconds=body.ttl_seconds or DEFAULT_APPROVAL_TTL_SECONDS,
         )
         approval_id, expires_at = approval_store.request(req)
-        return {
-            "approval_id": approval_id,
-            "expires_at": expires_at,
-            "tool_name": req.tool_name,
-            "args_hash": req.args_hash,
-        }
+        return {"approval_id": approval_id, "expires_at": expires_at,
+                "tool_name": req.tool_name, "args_hash": req.args_hash}
 
     @api.post("/approval/consume")
     def consume_approval(
         body: ApprovalConsumeBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object]:
-        """Verify + consume a single-use approval token.
-
-        Returns ``{"consumed": true, ...}`` on success or
-        ``{"consumed": false, "reason": ..., "message": ...}`` on any failure
-        (not_found / already_consumed / expired / mismatch).  The reason code
-        is stable for callers; the message is human-readable.
-        """
         args_hash = compute_args_hash(body.args)
         try:
             result = approval_store.consume(
-                body.approval_id,
-                tool_name=body.tool_name,
-                args_hash=args_hash,
-                target_record=body.target_record,
+                body.approval_id, tool_name=body.tool_name,
+                args_hash=args_hash, target_record=body.target_record,
             )
         except ApprovalError as exc:
             return {"consumed": False, **exc.to_dict()}
-        return {
-            "consumed": True,
-            "approval_id": result.approval_id,
-            "tool_name": result.tool_name,
-            "args_hash": result.args_hash,
-            "target_record": result.target_record,
-            "tier": result.tier,
-            "consumed_at": result.consumed_at,
-        }
+        return {"consumed": True, "approval_id": result.approval_id,
+                "tool_name": result.tool_name, "args_hash": result.args_hash,
+                "target_record": result.target_record, "tier": result.tier,
+                "consumed_at": result.consumed_at}
 
     @api.get("/approval/{approval_id}")
     def get_approval(
         approval_id: str,
         principal: AuthenticatedPrincipal = Depends(verified_principal),  # noqa: ARG001
     ) -> dict[str, object] | None:
-        """Fetch one approval row by id (admin / test reads)."""
         record = approval_store.get(approval_id)
         if record is None:
             return None
         return record.to_dict()
+
+
+def _register_elabftw_routes(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register all /elabftw/* routes."""
 
     @api.post("/elabftw/read_current_experiment")
     def elabftw_read_current_experiment(
         body: ElabftwReadBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Read the experiment referenced by the caller's context token.
-
-        Orchestrates token verification → identity resolution → policy decision
-        → downstream eLabFTW HTTP call → audit record.  Returns the read
-        result on success or an ``error`` payload on any adapter failure
-        (invalid token, unmapped caller, policy denied, client error).
-        """
         adapter = get_elabftw_read_adapter()
-        # Resolve the mapped identity before invoking the adapter so the
-        # adapter receives a `MappedIdentity | None` to fail closed on.
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         try:
             result = adapter.read_current_experiment(
-                context_token=body.context_token,
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
+                context_token=body.context_token, mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id, request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
+                provider=body.provider, model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
@@ -1664,73 +1553,32 @@ def create_app() -> FastAPI:
         body: ElabftwMintBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Mint a short-lived context token for the C11 launcher.
-
-        Resolves the caller to a mapped eLabFTW identity via the identity
-        mapper (fail-closed if unmapped), then mints a token bound to
-        ``experiment_id`` + the resolved identity.  Returns the token and
-        its ``expires_at`` ISO timestamp.  TTL is clamped server-side.
-
-        The token authorizes downstream reads/writes (C08/C09) on this
-        experiment only, scoped to the resolved user.  The launcher opens
-        LibreChat with the token in the URL.
-
-        In C11, trust is the identity mapper (callers self-attest their
-        ``keycloak_subject``/``librechat_user_id``; only pre-registered
-        mappings resolve).  C14 wraps this endpoint with Keycloak
-        session cookie verification layered on top.
-        """
-        # Fail-closed auth gate: identity mapper must resolve the caller.
-        # Either keycloak_subject or librechat_user_id may be the lookup key
-        # depending on the mapper backend; both-None is always unmapped.
         mapped = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
         if mapped is None:
-            return {
-                "ok": False,
-                "reason": "unmapped_caller",
-                "message": ("caller did not resolve to a mapped eLabFTW identity"),
-            }
-
+            return {"ok": False, "reason": "unmapped_caller",
+                    "message": "caller did not resolve to a mapped eLabFTW identity"}
         if body.experiment_id <= 0:
-            return {
-                "ok": False,
-                "reason": "invalid_experiment_id",
-                "message": "experiment_id must be a positive integer",
-            }
-
+            return {"ok": False, "reason": "invalid_experiment_id",
+                    "message": "experiment_id must be a positive integer"}
         token, expires_at = mint_token_for_identity(
             experiment_id=body.experiment_id,
             mapped_elabftw_user_id=mapped.elabftw_user_id,
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
-            ttl_seconds=body.requested_ttl_seconds,
-            record_type=body.record_type,
+            ttl_seconds=body.requested_ttl_seconds, record_type=body.record_type,
         )
-        return {
-            "ok": True,
-            "context_token": token,
-            "expires_at": expires_at,
-            "experiment_id": body.experiment_id,
-            "mapped_elabftw_user_id": mapped.elabftw_user_id,
-        }
+        return {"ok": True, "context_token": token, "expires_at": expires_at,
+                "experiment_id": body.experiment_id,
+                "mapped_elabftw_user_id": mapped.elabftw_user_id}
 
     @api.post("/elabftw/draft_experiment_update")
     def elabftw_draft_experiment_update(
         body: ElabftwDraftBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Create a new draft experiment through the C09 write adapter.
-
-        Orchestrates token verification → identity resolution → policy
-        decision (tier 4 bounded write) → approval token consume →
-        downstream ``create_experiment`` → provenance writeback → audit
-        record.  Returns the new experiment id on success or an ``error``
-        payload on any failure (invalid token, unmapped caller, policy
-        denied, approval_denied, append_only_violation, client_error).
-        """
         adapter = get_elabftw_write_adapter()
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
@@ -1738,70 +1586,12 @@ def create_app() -> FastAPI:
         )
         try:
             result = adapter.draft_experiment_update(
-                context_token=body.context_token,
-                approval_id=body.approval_id,
-                approval_args=body.approval_args,
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
+                context_token=body.context_token, approval_id=body.approval_id,
+                approval_args=body.approval_args, mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id, request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-        except ElabftwAdapterError as exc:
-            return {"ok": False, **exc.to_dict()}
-        return {"ok": True, "write": result.to_dict()}
-
-    @api.post("/elabftw/amend_my_experiment_after_approval")
-    def elabftw_amend_my_experiment_after_approval(
-        body: ElabftwAmendBody,
-        principal: AuthenticatedPrincipal = Depends(verified_principal),
-    ) -> dict[str, object]:
-        """Append an approved amendment section to the user's experiment.
-
-        Orchestrates token verification → identity resolution → policy
-        decision (tier 4 bounded write) → append-only state check →
-        approval token consume → append amendment + optional attachment →
-        provenance writeback → audit record.  Returns the amendment
-        outcome on success or an ``error`` payload on any failure.
-        """
-        import base64
-
-        # Decode attachment (if provided) from base64 to bytes.  Malformed
-        # base64 returns a clean error rather than a 500.
-        attachment_data: bytes | None = None
-        if body.attachment_b64 is not None and body.attachment_filename:
-            try:
-                attachment_data = base64.b64decode(body.attachment_b64)
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "reason": "client_error",
-                    "message": f"attachment_b64 is not valid base64: {exc}",
-                }
-
-        adapter = get_elabftw_write_adapter()
-        mapped_identity = identity_mapper.map(
-            keycloak_subject=principal.keycloak_subject,
-            librechat_user_id=body.librechat_user_id,
-        )
-        try:
-            result = adapter.amend_my_experiment_after_approval(
-                context_token=body.context_token,
-                approval_id=body.approval_id,
-                approval_args=body.approval_args,
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-                amendment_html=body.amendment_html,
-                attachment_filename=body.attachment_filename,
-                attachment_data=attachment_data,
-                attachment_comment=body.attachment_comment,
+                provider=body.provider, model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
@@ -1812,15 +1602,6 @@ def create_app() -> FastAPI:
         body: ElabftwEditBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Replace the experiment body with approved content (C35 direct edit).
-
-        Unlike the append-only amend, this is a direct edit: the approved
-        ``new_body`` replaces the body wholesale. The adapter re-reads the
-        current body and refuses if its hash no longer matches the
-        ``old_body_hash`` captured at approval time (stale-edit guard).
-        Rollback is via eLabFTW revision history; the gateway records
-        audit/provenance.
-        """
         adapter = get_elabftw_write_adapter()
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
@@ -1828,133 +1609,231 @@ def create_app() -> FastAPI:
         )
         try:
             result = adapter.edit_experiment_section(
-                context_token=body.context_token,
-                approval_id=body.approval_id,
-                approval_args=body.approval_args,
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
+                context_token=body.context_token, approval_id=body.approval_id,
+                approval_args=body.approval_args, mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id, request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,
                 librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
+                provider=body.provider, model_id=body.model_id,
             )
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "write": result.to_dict()}
 
-    # --- C13: LibreChat tool-surface dispatcher -------------------------
-    #
-    # POST /invoke is the single entry point used by the LibreChat
-    # custom-endpoint service (copilot/librechat-custom-endpoint/).  It
-    # enforces the C06 tool registry — anything not in the registry is
-    # rejected with tool_not_registered (C13 acceptance #4).  Routing
-    # then fans out by adapter via the _INVOKE_DISPATCHERS table.
-    #
-    # Returns a uniform {ok, tool_name, result? | reason, message?}
-    # shape so the custom-endpoint translator can map it into OpenAI's
-    # chat-completions tool-call response without per-tool branching.
+
+def _register_elabftw_amend_route(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register the amend route (separated to reduce complexity)."""
+
+    @api.post("/elabftw/amend_my_experiment_after_approval")
+    def elabftw_amend_my_experiment_after_approval(
+        body: ElabftwAmendBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        import base64
+        attachment_data: bytes | None = None
+        if body.attachment_b64 is not None and body.attachment_filename:
+            try:
+                attachment_data = base64.b64decode(body.attachment_b64)
+            except Exception as exc:
+                return {"ok": False, "reason": "client_error",
+                        "message": f"attachment_b64 is not valid base64: {exc}"}
+        adapter = get_elabftw_write_adapter()
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        try:
+            result = adapter.amend_my_experiment_after_approval(
+                context_token=body.context_token, approval_id=body.approval_id,
+                approval_args=body.approval_args, mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id, request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider, model_id=body.model_id,
+                amendment_html=body.amendment_html,
+                attachment_filename=body.attachment_filename,
+                attachment_data=attachment_data,
+                attachment_comment=body.attachment_comment,
+            )
+        except ElabftwAdapterError as exc:
+            return {"ok": False, **exc.to_dict()}
+        return {"ok": True, "write": result.to_dict()}
+
+
+def _register_invoke_route(
+    api: FastAPI, identity_mapper: IdentityMapper,
+    artifact_store: ArtifactBundleStore,
+) -> None:
+    """Register POST /invoke route."""
 
     @api.post("/invoke")
     def invoke(
         body: InvokeBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Invoke a registered tool by name (C13 LibreChat surface).
-
-        Acceptance #4 (gateway rejects direct privileged calls not in
-        tool registry): an unregistered ``tool_name`` returns
-        ``ok:false`` with reason ``tool_not_registered`` and HTTP 200
-        (the custom-endpoint service treats non-200 as transport
-        failure; structured errors stay in-band).
-        """
         registry = get_tool_registry()
         tool = registry.find(body.tool_name)
         if tool is None:
-            return {
-                "ok": False,
-                "tool_name": body.tool_name,
-                "reason": "tool_not_registered",
-                "message": (
-                    f"tool {body.tool_name!r} is not in the gateway registry; "
-                    "LibreChat may only invoke curated C06 tools"
-                ),
-            }
-
+            return {"ok": False, "tool_name": body.tool_name,
+                    "reason": "tool_not_registered",
+                    "message": f"tool {body.tool_name!r} is not in the gateway registry; "
+                    "LibreChat may only invoke curated C06 tools"}
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
-
         dispatcher = _INVOKE_DISPATCHERS.get(tool.adapter)
         if dispatcher is not None:
             if tool.adapter == "opencloning":
                 return dispatcher(tool, body, mapped_identity, artifact_store)
             return dispatcher(tool, body, mapped_identity)
+        return {"ok": False, "tool_name": tool.name,
+                "reason": "adapter_not_implemented",
+                "message": f"tool {tool.name!r} is in the registry but its "
+                f"{tool.adapter!r} adapter is not implemented yet (lands in C19+)"}
 
-        # Adapters that don't exist yet (C19+).  Return a structured
-        # error so the LibreChat side can surface a clear "this tool
-        # is not wired up yet" message instead of a transport 404.
-        return {
-            "ok": False,
-            "tool_name": tool.name,
-            "reason": "adapter_not_implemented",
-            "message": (
-                f"tool {tool.name!r} is in the registry but its "
-                f"{tool.adapter!r} adapter is not implemented yet "
-                "(lands in C19+)"
-            ),
-        }
 
-    # ========================================================================
-    # C39 — Plan execution endpoint
-    # ========================================================================
+def _register_plan_route(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register POST /plan/execute route."""
 
     @api.post("/plan/execute")
     def plan_execute(
         body: PlanExecuteBody,
         principal: AuthenticatedPrincipal = Depends(verified_principal),
     ) -> dict[str, object]:
-        """Execute a validated plan with plan-level approval (C39).
-
-        Accepts a plan dict (C38 schema), an approval_id bound to the plan
-        hash, and identity context.  The plan executor validates the plan,
-        consumes the approval, executes steps in order, and returns a
-        per-step result summary.
-        """
-        # Parse the plan dict into a Plan object.
         try:
             plan = Plan.from_dict(body.plan)
         except PlanValidationError as exc:
-            return {
-                "ok": False,
-                "plan_id": body.plan.get("plan_id", ""),
-                "reason": "plan_validation_failed",
-                "errors": exc.errors,
-            }
-
-        # Resolve identity.
+            return {"ok": False, "plan_id": body.plan.get("plan_id", ""),
+                    "reason": "plan_validation_failed", "errors": exc.errors}
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
-
         executor = get_plan_executor()
         result = executor.execute(
-            plan,
-            approval_id=body.approval_id,
-            context_token=body.context_token,
+            plan, approval_id=body.approval_id, context_token=body.context_token,
             mapped_identity=mapped_identity,
-            conversation_id=body.conversation_id,
-            request_id=body.request_id,
+            conversation_id=body.conversation_id, request_id=body.request_id,
             keycloak_subject=body.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
-            provider=body.provider,
-            model_id=body.model_id,
+            provider=body.provider, model_id=body.model_id,
         )
         return {"ok": result.status == "completed", **result.to_dict()}
 
-    return api
 
 
-app = create_app()
+def _build_health_deps(
+    *,
+    audit_store: AuditStore,
+    policy_engine: PolicyEngine,
+    identity_mapper: IdentityMapper,
+    approval_store: ApprovalStore,
+    elabftw_adapter: ElabftwReadAdapter,
+    opencloning_adapter: OpenCloningAdapter,
+    wallac_adapter: WallacAdapter,
+) -> dict[str, object]:
+    """Build the /health dependencies dict."""
+    deps: dict[str, object] = {
+        "audit_db": "configured" if audit_store.db_path != ":memory:" else "memory",
+        "policy_engine": "ready",
+        "policy_max_tier": int(policy_engine.max_tier),
+        "kill_switches": list(policy_engine.kill_switches),
+        "kill_switch_categories": {
+            k: v for k, v in policy_engine.kill_categories.items() if v
+        },
+        "elabftw": (
+            "configured" if elabftw_adapter.client is not None else "not_configured"
+        ),
+        "opencloning": (
+            "configured" if opencloning_adapter.client is not None else "not_configured"
+        ),
+        "wallac": (
+            "configured" if wallac_adapter.client is not None else "not_configured"
+        ),
+        "wallac_bridge": (
+            "configured" if wallac_adapter.bridge_client is not None else "not_configured"
+        ),
+        "bentolab": (
+            "configured" if get_bentolab_adapter().client is not None else "not_configured"
+        ),
+    }
+    deps.update(_identity_backend_status(identity_mapper))
+    deps.update(_approval_backend_status(approval_store))
+    deps["tool_count"] = len(get_tool_registry().list())
+    auth_cfg = get_auth_config()
+    auth_status: dict[str, object] = {
+        "auth_mode": "dev" if not auth_cfg.verify_enabled else "jwt",
+        "verify_enabled": auth_cfg.verify_enabled,
+    }
+    if auth_cfg.verify_enabled:
+        try:
+            jwks_status = get_jwks_cache().status()
+            auth_status["jwks"] = jwks_status
+        except Exception:
+            auth_status["jwks"] = {"error": "unavailable"}
+    deps["auth"] = auth_status
+    return deps
+
+
+def _register_health_routes(
+    api: FastAPI,
+    service_name: str,
+    audit_store: AuditStore,
+    policy_engine: PolicyEngine,
+    identity_mapper: IdentityMapper,
+    approval_store: ApprovalStore,
+    elabftw_adapter: ElabftwReadAdapter,
+    opencloning_adapter: OpenCloningAdapter,
+    wallac_adapter: WallacAdapter,
+) -> None:
+    """Register GET /health route."""
+
+    @api.get("/health")
+    def health() -> dict[str, object]:
+        deps = _build_health_deps(
+            audit_store=audit_store,
+            policy_engine=policy_engine,
+            identity_mapper=identity_mapper,
+            approval_store=approval_store,
+            elabftw_adapter=elabftw_adapter,
+            opencloning_adapter=opencloning_adapter,
+            wallac_adapter=wallac_adapter,
+        )
+        return {"service": service_name, "version": __version__, "status": "ok", "dependencies": deps}
+
+
+def _register_bentolab_route(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register POST /bentolab route."""
+
+    @api.post("/bentolab")
+    def bentolab_invoke(
+        body: InvokeBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        import base64
+        registry = get_tool_registry()
+        tool = registry.find(body.tool_name)
+        if tool is None:
+            return {"ok": False, "tool_name": body.tool_name,
+                    "reason": "tool_not_registered",
+                    "message": f"tool {body.tool_name!r} is not in the gateway registry"}
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        attachment_data: bytes | None = None
+        if body.args.get("attachment_b64") and body.args.get("attachment_filename"):
+            try:
+                attachment_data = base64.b64decode(body.args["attachment_b64"])
+            except Exception as exc:
+                return {"ok": False, "tool_name": tool.name,
+                        "reason": "client_error",
+                        "message": f"attachment_b64 is not valid base64: {exc}"}
+        return _invoke_bentolab_tool(tool, body, mapped_identity)

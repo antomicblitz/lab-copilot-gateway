@@ -2638,43 +2638,21 @@ class ElabftwWriteAdapter:
                 raise verified[0]  # type: ignore[misc]
             claims, tool_args_hash = verified  # type: ignore[assignment]
 
-        # 2. Policy decision — tier 4 write requires approval.  The policy
-        # engine returns approval_required for tier >= 4 without approval;
-        # the adapter must additionally CONSUME the approval token below.
-        policy_req = PolicyRequest(
+        # 2. Policy decision — tier 4 write requires approval.
+        self._check_write_policy(
             tool_name=tool_name,
-            tier=TOOL_TIER_WRITE,
-            adapter="elabftw",
-            user_id=mapped_identity.elabftw_user_id if mapped_identity else None,
-            team_id=mapped_identity.elabftw_team_id if mapped_identity else None,
-            has_approval=bool(approval_id),
             approval_id=approval_id,
+            mapped_identity=mapped_identity,
+            target_experiment_id=target_experiment_id,
+            claims=claims,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
         )
-        decision = self.policy_engine.decide(policy_req)
-        if decision.decision != "allow":
-            self._audit(
-                policy_decision="deny",
-                reason=decision.reason,
-                mapped_identity=mapped_identity,
-                experiment_id=target_experiment_id or claims.experiment_id,
-                tool_name=tool_name,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
-                error={
-                    "code": "POLICY_DENIED",
-                    "reason": decision.reason,
-                    "tier": int(decision.tier),
-                },
-            )
-            if decision.requires_approval:
-                raise ApprovalRequired(decision.reason)
-            raise PolicyDenied(decision)
 
         # 3. Append-only enforcement (when applicable).
         if (
@@ -2682,134 +2660,11 @@ class ElabftwWriteAdapter:
             and self.client is not None
             and target_experiment_id is not None
         ):
-            try:
-                target = self.client.get_experiment(target_experiment_id)
-            except Exception as exc:
-                self._audit(
-                    policy_decision="allow",
-                    reason="state_check_failed",
-                    mapped_identity=mapped_identity,
-                    experiment_id=target_experiment_id,
-                    tool_name=tool_name,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    approval_id=approval_id,
-                    error={
-                        "code": "STATE_CHECK_FAILED",
-                        "exception": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                raise ElabftwAdapterError(
-                    reason="client_error",
-                    message=(
-                        f"eLabFTW client raised {type(exc).__name__} during "
-                        f"append-only state check: {exc}"
-                    ),
-                ) from exc
-            state = int(target.get("state", _STATE_NORMAL) or _STATE_NORMAL)
-            locked = bool(target.get("locked", 0))
-            if state != _STATE_NORMAL or locked:
-                self._audit(
-                    policy_decision="deny",
-                    reason="append_only_violation",
-                    mapped_identity=mapped_identity,
-                    experiment_id=target_experiment_id,
-                    tool_name=tool_name,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    approval_id=approval_id,
-                    error={
-                        "code": "APPEND_ONLY_VIOLATION",
-                        "experiment_id": target_experiment_id,
-                        "state": state,
-                        "locked": locked,
-                    },
-                )
-                raise AppendOnlyViolation(target_experiment_id, state, locked)  # type: ignore[arg-type]
-
-        # 4. Approval token consume.  Hash the EXACT args the caller is using
-        # now and verify the approval token was bound to the same hash.  This
-        # is the server-side enforcement single point — LibreChat cannot forge
-        # the token because the gateway is the one comparing hashes.
-        #
-        # C39: when ``plan_approval_id`` is set, the plan executor has
-        # already consumed the plan-level approval (bound to the plan hash,
-        # which covers all step args).  Skip the per-step consume and use
-        # the plan approval_id in audit records.
-        if plan_approval_id:
-            effective_approval_id = plan_approval_id
-        else:
-            args_hash_now = compute_args_hash(approval_args)
-            target_record_str = (
-                f"elabftw:experiment:{target_experiment_id}"
-                if target_experiment_id is not None
-                else None
-            )
-            try:
-                self.approval_store.consume(
-                    approval_id,
-                    tool_name=tool_name,
-                    args_hash=args_hash_now,
-                    target_record=target_record_str,
-                )
-                effective_approval_id = approval_id
-            except Exception as exc:
-                # Reason: any approval-consume failure (not_found, expired,
-                # already_consumed, mismatch) is treated as an unauthorized
-                # write attempt.  We surface the underlying reason code in
-                # the audit.
-                from lab_copilot_gateway.approval import ApprovalError
-
-                reason_code = "approval_consume_failed"
-                error_payload: dict[str, Any] = {
-                    "code": "APPROVAL_CONSUME_FAILED",
-                    "exception": type(exc).__name__,
-                }
-                if isinstance(exc, ApprovalError):
-                    reason_code = f"approval_denied:{exc.reason}"
-                    error_payload["approval_reason"] = exc.reason
-                    error_payload["approval_id"] = exc.approval_id
-                self._audit(
-                    policy_decision="deny",
-                    reason=reason_code,
-                    mapped_identity=mapped_identity,
-                    experiment_id=target_experiment_id or claims.experiment_id,
-                    tool_name=tool_name,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    approval_id=approval_id,
-                    error=error_payload,
-                )
-                raise ElabftwAdapterError(
-                    reason=reason_code,
-                    message=f"approval token consume failed: {exc}",
-                ) from exc
-
-        # 5. Client must be present — checked after approval to keep the
-        # audit trail consistent ("approved, but misconfigured gateway").
-        if self.client is None:
-            self._audit(
-                policy_decision="allow",
-                reason="elabftw_not_configured",
-                mapped_identity=mapped_identity,
-                experiment_id=target_experiment_id or claims.experiment_id,
+            self._enforce_append_only(
                 tool_name=tool_name,
+                approval_id=approval_id,
+                mapped_identity=mapped_identity,
+                target_experiment_id=target_experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -2817,17 +2672,41 @@ class ElabftwWriteAdapter:
                 provider=provider,
                 model_id=model_id,
                 tool_args_hash=tool_args_hash,
-                approval_id=effective_approval_id,
-                error={"code": "ELABFTW_NOT_CONFIGURED"},
             )
-            raise ElabftwAdapterError(
-                reason="elabftw_not_configured",
-                message=(
-                    "eLabFTW client not configured "
-                    "(set LAB_COPILOT_ELABFTW_BASE_URL and "
-                    "LAB_COPILOT_ELABFTW_API_KEY)"
-                ),
-            )
+
+        # 4. Approval token consume.
+        effective_approval_id = self._consume_write_approval(
+            plan_approval_id=plan_approval_id,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            target_experiment_id=target_experiment_id,
+            tool_name=tool_name,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
+
+        # 5. Client must be present.
+        self._require_write_client(
+            tool_name=tool_name,
+            effective_approval_id=effective_approval_id,
+            mapped_identity=mapped_identity,
+            target_experiment_id=target_experiment_id,
+            claims=claims,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 6. Downstream write.  Wrap any failure in an ElabftwAdapterError
         # after the audit row persists.  The approval was already consumed —
@@ -2946,6 +2825,242 @@ class ElabftwWriteAdapter:
             if downstream_id != effective_experiment_id
             else None,
             audit_action_id=audit_action_id,
+        )
+
+    def _check_write_policy(
+        self,
+        *,
+        tool_name: str,
+        approval_id: str,
+        mapped_identity: MappedIdentity | None,
+        target_experiment_id: int | None,
+        claims: ContextTokenClaims,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Check tier 4 write policy and raise on denial."""
+        policy_req = PolicyRequest(
+            tool_name=tool_name,
+            tier=TOOL_TIER_WRITE,
+            adapter="elabftw",
+            user_id=mapped_identity.elabftw_user_id if mapped_identity else None,
+            team_id=mapped_identity.elabftw_team_id if mapped_identity else None,
+            has_approval=bool(approval_id),
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision != "allow":
+            self._audit(
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=target_experiment_id or claims.experiment_id,
+                tool_name=tool_name,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": int(decision.tier),
+                },
+            )
+            if decision.requires_approval:
+                raise ApprovalRequired(decision.reason)
+            raise PolicyDenied(decision)
+
+    def _enforce_append_only(
+        self,
+        *,
+        tool_name: str,
+        approval_id: str,
+        mapped_identity: MappedIdentity | None,
+        target_experiment_id: int,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Check append-only state and raise on violation."""
+        try:
+            target = self.client.get_experiment(target_experiment_id)
+        except Exception as exc:
+            self._audit(
+                policy_decision="allow",
+                reason="state_check_failed",
+                mapped_identity=mapped_identity,
+                experiment_id=target_experiment_id,
+                tool_name=tool_name,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": "STATE_CHECK_FAILED",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise ElabftwAdapterError(
+                reason="client_error",
+                message=(
+                    f"eLabFTW client raised {type(exc).__name__} during "
+                    f"append-only state check: {exc}"
+                ),
+            ) from exc
+        state = int(target.get("state", _STATE_NORMAL) or _STATE_NORMAL)
+        locked = bool(target.get("locked", 0))
+        if state != _STATE_NORMAL or locked:
+            self._audit(
+                policy_decision="deny",
+                reason="append_only_violation",
+                mapped_identity=mapped_identity,
+                experiment_id=target_experiment_id,
+                tool_name=tool_name,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": "APPEND_ONLY_VIOLATION",
+                    "experiment_id": target_experiment_id,
+                    "state": state,
+                    "locked": locked,
+                },
+            )
+            raise AppendOnlyViolation(target_experiment_id, state, locked)  # type: ignore[arg-type]
+
+    def _consume_write_approval(
+        self,
+        *,
+        plan_approval_id: str | None,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        claims: ContextTokenClaims,
+        mapped_identity: MappedIdentity | None,
+        target_experiment_id: int | None,
+        tool_name: str,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> str:
+        """Consume write approval token (or use plan-level bypass)."""
+        if plan_approval_id:
+            return plan_approval_id
+        args_hash_now = compute_args_hash(approval_args)
+        target_record_str = (
+            f"elabftw:experiment:{target_experiment_id}"
+            if target_experiment_id is not None
+            else None
+        )
+        try:
+            self.approval_store.consume(
+                approval_id,
+                tool_name=tool_name,
+                args_hash=args_hash_now,
+                target_record=target_record_str,
+            )
+            return approval_id
+        except Exception as exc:
+            from lab_copilot_gateway.approval import ApprovalError
+
+            reason_code = "approval_consume_failed"
+            error_payload: dict[str, Any] = {
+                "code": "APPROVAL_CONSUME_FAILED",
+                "exception": type(exc).__name__,
+            }
+            if isinstance(exc, ApprovalError):
+                reason_code = f"approval_denied:{exc.reason}"
+                error_payload["approval_reason"] = exc.reason
+                error_payload["approval_id"] = exc.approval_id
+            self._audit(
+                policy_decision="deny",
+                reason=reason_code,
+                mapped_identity=mapped_identity,
+                experiment_id=target_experiment_id or claims.experiment_id,
+                tool_name=tool_name,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error=error_payload,
+            )
+            raise ElabftwAdapterError(
+                reason=reason_code,
+                message=f"approval token consume failed: {exc}",
+            ) from exc
+
+    def _require_write_client(
+        self,
+        *,
+        tool_name: str,
+        effective_approval_id: str,
+        mapped_identity: MappedIdentity | None,
+        target_experiment_id: int | None,
+        claims: ContextTokenClaims,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Raise ElabftwAdapterError if the write client is not configured."""
+        if self.client is not None:
+            return
+        self._audit(
+            policy_decision="allow",
+            reason="elabftw_not_configured",
+            mapped_identity=mapped_identity,
+            experiment_id=target_experiment_id or claims.experiment_id,
+            tool_name=tool_name,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=effective_approval_id,
+            error={"code": "ELABFTW_NOT_CONFIGURED"},
+        )
+        raise ElabftwAdapterError(
+            reason="elabftw_not_configured",
+            message=(
+                "eLabFTW client not configured "
+                "(set LAB_COPILOT_ELABFTW_BASE_URL and "
+                "LAB_COPILOT_ELABFTW_API_KEY)"
+            ),
         )
 
     # --- token + identity verify (shared with read adapter) --------------

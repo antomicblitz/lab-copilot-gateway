@@ -1263,6 +1263,301 @@ class OpenCloningAdapter:
             )
             raise PolicyDenied(decision)
 
+    def _verify_and_decode_token(
+        self,
+        *,
+        tool_name: str,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        early_hash: str,
+    ) -> Any:
+        """Verify context token signature and expiry.  Returns claims or raises."""
+        if not context_token:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="missing_context_token",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "MISSING_CONTEXT_TOKEN"},
+            )
+            raise InvalidContextToken("missing")
+        try:
+            return verify_context_token(context_token)
+        except InvalidContextToken as exc:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason=f"invalid_context_token:{exc.detail}",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+            )
+            raise
+
+    def _require_client(
+        self,
+        *,
+        tool_name: str,
+        mapped_identity: MappedIdentity | None,
+        experiment_id: int,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Raise OpenCloningAdapterError if the client is not configured."""
+        if self.client is not None:
+            return
+        self._audit(
+            tool_name=tool_name,
+            policy_decision="deny",
+            reason="opencloning_not_configured",
+            mapped_identity=mapped_identity,
+            experiment_id=experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            error={"code": "OPENCLONING_NOT_CONFIGURED"},
+        )
+        raise OpenCloningAdapterError(
+            reason="opencloning_not_configured",
+            message=(
+                "OpenCloning client not configured "
+                "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+            ),
+        )
+
+    def _accumulate_strategy_data(self, result: dict[str, Any]) -> None:
+        """Accumulate sequences, sources, and primers for cloning history JSON."""
+        existing_seq_ids = {s.get("id") for s in self._strategy_sequences}
+        for seq in result.get("sequences", []):
+            if isinstance(seq, dict) and seq.get("id") not in existing_seq_ids:
+                self._strategy_sequences.append(dict(seq))
+                existing_seq_ids.add(seq.get("id"))
+        existing_src_ids = {s.get("id") for s in self._strategy_sources}
+        for src in result.get("sources", []):
+            if isinstance(src, dict) and src.get("id") not in existing_src_ids:
+                self._strategy_sources.append(dict(src))
+                existing_src_ids.add(src.get("id"))
+        existing_primer_names = {p.get("name") for p in self._strategy_primers}
+        for primer in result.get("primers", []):
+            if (
+                isinstance(primer, dict)
+                and primer.get("name") not in existing_primer_names
+            ):
+                self._strategy_primers.append(dict(primer))
+                existing_primer_names.add(primer.get("name"))
+
+    def _resolve_artifact_bundle(
+        self,
+        *,
+        artifact_reference: dict[str, Any],
+        artifact_filename: str,
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        early_hash: str,
+    ) -> tuple[str, bytes]:
+        """Resolve artifact content from the artifact bundle store."""
+        try:
+            stored = (self.artifact_store or get_artifact_bundle_store()).get(
+                plan_id=str(artifact_reference.get("plan_id") or ""),
+                plan_hash=str(artifact_reference.get("plan_hash") or ""),
+                artifact_id=str(artifact_reference.get("artifact_id") or ""),
+                expected_sha256=artifact_reference.get("expected_sha256"),
+                expected_size_bytes=artifact_reference.get("expected_size_bytes"),
+                binding={
+                    "record_type": claims.record_type,
+                    "record_id": str(claims.experiment_id),
+                    "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
+                },
+            )
+        except ArtifactBundleError as exc:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason=f"artifact_bundle_error:{type(exc).__name__}",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={
+                    "code": "ARTIFACT_BUNDLE_ERROR",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                },
+            )
+            raise OpenCloningAdapterError(
+                reason="artifact_bundle_error",
+                message=f"artifact bundle lookup failed: {exc}",
+            ) from exc
+        resolved_filename = str(
+            artifact_filename or stored.filename or "construct.gb"
+        )
+        if len(stored.bytes_data) > MAX_FILE_SIZE_BYTES:
+            raise FileTooLarge(len(stored.bytes_data), MAX_FILE_SIZE_BYTES)
+        return resolved_filename, stored.bytes_data
+
+    def _consume_writeback_approval(
+        self,
+        *,
+        plan_approval_id: str | None,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> str:
+        """Consume writeback approval token (or use plan-level bypass)."""
+        if plan_approval_id:
+            return plan_approval_id
+        if self.approval_store is not None and approval_id:
+            try:
+                self.approval_store.consume(
+                    approval_id,
+                    tool_name=TOOL_WRITEBACK,
+                    args_hash=compute_args_hash(approval_args),
+                    target_record=str(claims.experiment_id),
+                )
+                return approval_id
+            except Exception as exc:
+                self._audit(
+                    tool_name=TOOL_WRITEBACK,
+                    policy_decision="deny",
+                    reason=f"approval_consume_failed:{exc}",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    approval_id=approval_id,
+                    error={
+                        "code": "APPROVAL_CONSUME_FAILED",
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    },
+                )
+                raise OpenCloningAdapterError(
+                    reason="approval_consume_failed",
+                    message=f"approval token consume failed: {exc}",
+                ) from exc
+        return approval_id
+
+    def _maybe_rewrite_genbank_features(
+        self, artifact_bytes: bytes
+    ) -> bytes:
+        """Re-annotate GenBank with features recovered from templates."""
+        if not artifact_bytes or not self._strategy_sequences:
+            return artifact_bytes
+        try:
+            from lab_copilot_gateway.opencloning_features import (
+                rewrite_genbank_features,
+            )
+            genbank_str = (
+                artifact_bytes.decode("utf-8")
+                if isinstance(artifact_bytes, bytes)
+                else artifact_bytes
+            )
+            rewritten = rewrite_genbank_features(
+                genbank_str, self._strategy_sequences
+            )
+            return (
+                rewritten.encode("utf-8")
+                if isinstance(artifact_bytes, bytes)
+                else rewritten
+            )
+        except Exception:
+            return artifact_bytes
+
+    def _require_elabftw_client(
+        self,
+        *,
+        mapped_identity: MappedIdentity | None,
+        experiment_id: int,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        approval_id: str,
+    ) -> None:
+        """Raise OpenCloningAdapterError if eLabFTW client is not configured."""
+        if self.elabftw_client is not None:
+            return
+        self._audit(
+            tool_name=TOOL_WRITEBACK,
+            policy_decision="deny",
+            reason="elabftw_not_configured",
+            mapped_identity=mapped_identity,
+            experiment_id=experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=approval_id,
+            error={"code": "ELABFTW_NOT_CONFIGURED"},
+        )
+        raise OpenCloningAdapterError(
+            reason="elabftw_not_configured",
+            message=(
+                "eLabFTW client not configured for writeback "
+                "(set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)"
+            ),
+        )
+
     def _execute_writeback(
         self,
         *,
@@ -1302,89 +1597,33 @@ class OpenCloningAdapter:
         )
 
         # 1. Verify context token.
-        if not context_token:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason="missing_context_token",
-                mapped_identity=mapped_identity,
-                experiment_id=None,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=early_hash,
-                error={"code": "MISSING_CONTEXT_TOKEN"},
-            )
-            raise InvalidContextToken("missing")
-
-        try:
-            claims = verify_context_token(context_token)
-        except InvalidContextToken as exc:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason=f"invalid_context_token:{exc.detail}",
-                mapped_identity=mapped_identity,
-                experiment_id=None,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=early_hash,
-                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
-            )
-            raise
+        claims = self._verify_and_decode_token(
+            tool_name=TOOL_WRITEBACK,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            early_hash=early_hash,
+        )
 
         if artifact_reference:
-            try:
-                stored = (self.artifact_store or get_artifact_bundle_store()).get(
-                    plan_id=str(artifact_reference.get("plan_id") or ""),
-                    plan_hash=str(artifact_reference.get("plan_hash") or ""),
-                    artifact_id=str(artifact_reference.get("artifact_id") or ""),
-                    expected_sha256=artifact_reference.get("expected_sha256"),
-                    expected_size_bytes=artifact_reference.get("expected_size_bytes"),
-                    binding={
-                        "record_type": claims.record_type,
-                        "record_id": str(claims.experiment_id),
-                        "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
-                    },
-                )
-            except ArtifactBundleError as exc:
-                self._audit(
-                    tool_name=TOOL_WRITEBACK,
-                    policy_decision="deny",
-                    reason=f"artifact_bundle_error:{type(exc).__name__}",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=early_hash,
-                    error={
-                        "code": "ARTIFACT_BUNDLE_ERROR",
-                        "exception": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                raise OpenCloningAdapterError(
-                    reason="artifact_bundle_error",
-                    message=f"artifact bundle lookup failed: {exc}",
-                ) from exc
-            artifact_filename = str(
-                artifact_filename or stored.filename or "construct.gb"
+            artifact_filename, artifact_bytes = self._resolve_artifact_bundle(
+                artifact_reference=artifact_reference,
+                artifact_filename=artifact_filename,
+                claims=claims,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                early_hash=early_hash,
             )
-            artifact_bytes = stored.bytes_data
-
-            if len(artifact_bytes) > MAX_FILE_SIZE_BYTES:
-                raise FileTooLarge(len(artifact_bytes), MAX_FILE_SIZE_BYTES)
 
         tool_args_hash = compute_args_hash(
             {
@@ -1426,102 +1665,38 @@ class OpenCloningAdapter:
         )
 
         # 5. Approval token consume (single-use, args-hash-bound).
-        # C41: when ``plan_approval_id`` is set, the plan executor has
-        # already consumed the plan-level approval (bound to the plan hash,
-        # which covers all step args).  Skip the per-step consume and use
-        # the plan approval_id in audit records.
-        if plan_approval_id:
-            effective_approval_id = plan_approval_id
-        elif self.approval_store is not None and approval_id:
-            try:
-                self.approval_store.consume(
-                    approval_id,
-                    tool_name=TOOL_WRITEBACK,
-                    args_hash=compute_args_hash(approval_args),
-                    target_record=str(claims.experiment_id),
-                )
-                effective_approval_id = approval_id
-            except Exception as exc:
-                self._audit(
-                    tool_name=TOOL_WRITEBACK,
-                    policy_decision="deny",
-                    reason=f"approval_consume_failed:{exc}",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    approval_id=approval_id,
-                    error={
-                        "code": "APPROVAL_CONSUME_FAILED",
-                        "exception": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                raise OpenCloningAdapterError(
-                    reason="approval_consume_failed",
-                    message=f"approval token consume failed: {exc}",
-                ) from exc
-        else:
-            effective_approval_id = approval_id
+        # C41: plan_approval_id skips per-step consume.
+        effective_approval_id = self._consume_writeback_approval(
+            plan_approval_id=plan_approval_id,
+            approval_id=approval_id,
+            approval_args=approval_args,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 6. eLabFTW client must be configured for writeback.
-        if self.elabftw_client is None:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason="elabftw_not_configured",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=effective_approval_id,
-                error={"code": "ELABFTW_NOT_CONFIGURED"},
-            )
-            raise OpenCloningAdapterError(
-                reason="elabftw_not_configured",
-                message=(
-                    "eLabFTW client not configured for writeback "
-                    "(set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)"
-                ),
-            )
+        self._require_elabftw_client(
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=effective_approval_id,
+        )
 
         # 6b. Rewrite GenBank features to fix pydna annotation gaps.
-        # pydna's Gibson assembly and PCR do not transfer CDS/promoter/
-        # terminator features from insert templates to the assembled product.
-        # We recover them by searching for each template feature's nucleotide
-        # sequence in the final product (see opencloning_features.py).
-        if artifact_bytes and self._strategy_sequences:
-            try:
-                from lab_copilot_gateway.opencloning_features import (
-                    rewrite_genbank_features,
-                )
-
-                genbank_str = (
-                    artifact_bytes.decode("utf-8")
-                    if isinstance(artifact_bytes, bytes)
-                    else artifact_bytes
-                )
-                rewritten = rewrite_genbank_features(
-                    genbank_str, self._strategy_sequences
-                )
-                artifact_bytes = (
-                    rewritten.encode("utf-8")
-                    if isinstance(artifact_bytes, bytes)
-                    else rewritten
-                )
-            except Exception:
-                # Non-fatal — upload the original if rewriting fails.
-                pass
+        artifact_bytes = self._maybe_rewrite_genbank_features(artifact_bytes)
 
         # 7. Upload the artifact as an attachment.
         # record_type: "resource" → /api/v2/items/{id}, else /api/v2/experiments/{id}
@@ -1700,44 +1875,18 @@ class OpenCloningAdapter:
             {**args_for_hash, "token_present": bool(context_token)}
         )
 
-        # 1. Verify context token (signature + expiry).
-        if not context_token:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="missing_context_token",
-                mapped_identity=mapped_identity,
-                experiment_id=None,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=early_hash,
-                error={"code": "MISSING_CONTEXT_TOKEN"},
-            )
-            raise InvalidContextToken("missing")
-
-        try:
-            claims = verify_context_token(context_token)
-        except InvalidContextToken as exc:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason=f"invalid_context_token:{exc.detail}",
-                mapped_identity=mapped_identity,
-                experiment_id=None,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=early_hash,
-                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
-            )
-            raise
+        claims = self._verify_and_decode_token(
+            tool_name=tool_name,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            early_hash=early_hash,
+        )
 
         # Once claims verified, use the experiment_id from the token for
         # context_refs correlation.
@@ -1775,29 +1924,18 @@ class OpenCloningAdapter:
         )
 
         # 5. Client-not-configured check.
-        if self.client is None:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="opencloning_not_configured",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "OPENCLONING_NOT_CONFIGURED"},
-            )
-            raise OpenCloningAdapterError(
-                reason="opencloning_not_configured",
-                message=(
-                    "OpenCloning client not configured "
-                    "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
-                ),
-            )
+        self._require_client(
+            tool_name=tool_name,
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 6. Downstream call.
         try:
@@ -1870,32 +2008,7 @@ class OpenCloningAdapter:
                 result, self._sequence_store, self._seq_counter
             )
             _enrich_strategy_names(result)
-
-            # 7c. Accumulate sequences, sources, and primers for the
-            # cloning strategy JSON. This matches what the OpenCloning
-            # frontend saves to eLabFTW as {title}_history.json — the
-            # full reproducible workflow including all intermediate
-            # sequences, their sources (provenance chain), and primers.
-            # Deduplicate by sequence ID to avoid accumulating duplicates
-            # across multiple runs in the same gateway process.
-            existing_seq_ids = {s.get("id") for s in self._strategy_sequences}
-            for seq in result.get("sequences", []):
-                if isinstance(seq, dict) and seq.get("id") not in existing_seq_ids:
-                    self._strategy_sequences.append(dict(seq))
-                    existing_seq_ids.add(seq.get("id"))
-            existing_src_ids = {s.get("id") for s in self._strategy_sources}
-            for src in result.get("sources", []):
-                if isinstance(src, dict) and src.get("id") not in existing_src_ids:
-                    self._strategy_sources.append(dict(src))
-                    existing_src_ids.add(src.get("id"))
-            existing_primer_names = {p.get("name") for p in self._strategy_primers}
-            for primer in result.get("primers", []):
-                if (
-                    isinstance(primer, dict)
-                    and primer.get("name") not in existing_primer_names
-                ):
-                    self._strategy_primers.append(dict(primer))
-                    existing_primer_names.add(primer.get("name"))
+            self._accumulate_strategy_data(result)
 
         return OpenCloningResult(
             tool_name=tool_name,
