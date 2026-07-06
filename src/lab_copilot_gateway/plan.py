@@ -191,6 +191,18 @@ class Plan:
         }
 
     @classmethod
+    def _parse_steps(cls, raw: Any) -> list[PlanStep]:
+        """Parse a raw reads/writes list into PlanStep objects."""
+        if not isinstance(raw, list):
+            return []
+        return [
+            PlanStep.from_dict(s)
+            if isinstance(s, dict)
+            else PlanStep(tool_name=str(s))
+            for s in raw
+        ]
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Plan":
         """Construct a Plan from a dict (e.g. JSON from the orchestrator).
 
@@ -209,28 +221,8 @@ class Plan:
         if not isinstance(approval, dict):
             approval = {}
 
-        reads_raw = data.get("reads", [])
-        writes_raw = data.get("writes", [])
-        reads = (
-            [
-                PlanStep.from_dict(s)
-                if isinstance(s, dict)
-                else PlanStep(tool_name=str(s))
-                for s in reads_raw
-            ]
-            if isinstance(reads_raw, list)
-            else []
-        )
-        writes = (
-            [
-                PlanStep.from_dict(s)
-                if isinstance(s, dict)
-                else PlanStep(tool_name=str(s))
-                for s in writes_raw
-            ]
-            if isinstance(writes_raw, list)
-            else []
-        )
+        reads = cls._parse_steps(data.get("reads", []))
+        writes = cls._parse_steps(data.get("writes", []))
 
         artifacts = data.get("artifacts", [])
         if not isinstance(artifacts, list):
