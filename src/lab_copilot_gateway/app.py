@@ -1560,9 +1560,10 @@ def _register_elabftw_routes(
         if mapped is None:
             return {"ok": False, "reason": "unmapped_caller",
                     "message": "caller did not resolve to a mapped eLabFTW identity"}
-        if body.experiment_id <= 0:
+        if body.experiment_id < 0:
             return {"ok": False, "reason": "invalid_experiment_id",
-                    "message": "experiment_id must be a positive integer"}
+                    "message": "experiment_id must be a non-negative integer "
+                    "(0 means no experiment context)"}
         token, expires_at = mint_token_for_identity(
             experiment_id=body.experiment_id,
             mapped_elabftw_user_id=mapped.elabftw_user_id,
@@ -1837,3 +1838,8 @@ def _register_bentolab_route(
                         "reason": "client_error",
                         "message": f"attachment_b64 is not valid base64: {exc}"}
         return _invoke_bentolab_tool(tool, body, mapped_identity)
+
+
+# Module-level ASGI app for uvicorn (Dockerfile CMD expects
+# lab_copilot_gateway.app:app).
+app = create_app()
