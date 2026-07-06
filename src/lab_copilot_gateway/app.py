@@ -409,6 +409,861 @@ _ARTIFACT_MANIFEST_RESERVED_KEYS = {
 }
 
 
+def _opencloning_invoke_success(
+    *,
+    tool_name: str,
+    result: OpenCloningResult,
+    context_token: str,
+    request_id: str | None,
+    artifact_store: ArtifactBundleStore,
+) -> dict[str, object]:
+    """Return OpenCloning /invoke output without raw sequence bytes."""
+    raw = result.to_dict()
+    raw_result = (
+        raw.get("result", {}) if isinstance(raw.get("result"), dict) else {}
+    )
+    plan_id = f"invoke-{request_id or result.audit_action_id}"
+    plan_hash = compute_args_hash(
+        {"tool_name": tool_name, "audit_action_id": result.audit_action_id}
+    )
+    normalized = normalize_opencloning_artifacts(
+        raw_result,
+        plan_id=plan_id,
+        plan_hash=plan_hash,
+        operation_label=tool_name,
+    )
+
+    binding: dict[str, object] = {}
+    try:
+        claims = verify_context_token(context_token)
+        binding = {
+            "record_type": claims.record_type,
+            "record_id": str(claims.experiment_id),
+            "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
+        }
+    except InvalidContextToken:
+        # The adapter already verified the token before returning success.
+        # If this defensive re-verify fails, keep manifests but skip storing
+        # downloadable bytes rather than creating an unbound artifact.
+        binding = {}
+
+    manifests: list[dict[str, object]] = []
+    for artifact in normalized.artifacts:
+        artifact_id = str(artifact.get("artifact_id") or "")
+        data = normalized.artifact_bytes.get(artifact_id)
+        if not artifact_id or data is None or not binding:
+            manifests.append(artifact)
+            continue
+        extra = {
+            key: value
+            for key, value in artifact.items()
+            if key not in _ARTIFACT_MANIFEST_RESERVED_KEYS
+        }
+        manifests.append(
+            artifact_store.put(
+                plan_id=plan_id,
+                plan_hash=plan_hash,
+                artifact_id=artifact_id,
+                filename=str(artifact.get("filename") or "artifact.bin"),
+                mime_type=str(
+                    artifact.get("mime_type") or "application/octet-stream"
+                ),
+                data=data,
+                binding=binding,
+                manifest_extra=extra,
+            )
+        )
+
+    artifact_payload = normalized.to_event_payload()
+    artifact_payload.update(
+        {
+            "type": "lab_copilot_opencloning_artifacts",
+            "plan_id": plan_id,
+            "plan_hash": plan_hash,
+            "artifacts": manifests,
+        }
+    )
+    return {
+        "ok": True,
+        "tool_name": tool_name,
+        "result": _redact_opencloning_file_content(raw),
+        "opencloning_artifacts": artifact_payload,
+    }
+
+
+def _invoke_elabftw_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+) -> dict[str, object]:
+    """Dispatch an elabftw adapter tool invocation."""
+    try:
+        if tool.name == "elabftw.read_current_experiment":
+            adapter = get_elabftw_read_adapter()
+            result = adapter.read_current_experiment(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.search_my_experiments":
+            adapter = get_elabftw_read_adapter()
+            result = adapter.search_my_experiments(
+                query=body.args.get("query", ""),
+                limit=body.args.get("limit", 20),
+                offset=body.args.get("offset", 0),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.read_experiment_by_id":
+            adapter = get_elabftw_read_adapter()
+            result = adapter.read_experiment_by_id(
+                experiment_id=int(
+                    body.args.get("experiment_id", body.args.get("id", 0))
+                ),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.search_items":
+            adapter = get_elabftw_read_adapter()
+            result = adapter.search_items(
+                query=body.args.get("query", ""),
+                limit=body.args.get("limit", 20),
+                offset=body.args.get("offset", 0),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.read_item_by_id":
+            adapter = get_elabftw_read_adapter()
+            result = adapter.read_item_by_id(
+                item_id=int(body.args.get("item_id", body.args.get("id", 0))),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.download_upload":
+            return _invoke_elabftw_download_upload(tool, body)
+        elif tool.name == "elabftw.draft_experiment_update":
+            adapter = get_elabftw_write_adapter()
+            result = adapter.draft_experiment_update(
+                context_token=body.context_token,
+                approval_id=body.approval_id or "",
+                approval_args=body.args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "elabftw.amend_my_experiment_after_approval":
+            return _invoke_elabftw_amend(tool, body, mapped_identity)
+        elif tool.name == "elabftw.edit_experiment_section":
+            adapter = get_elabftw_write_adapter()
+            result = adapter.edit_experiment_section(
+                context_token=body.context_token,
+                approval_id=body.approval_id or "",
+                approval_args=body.args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        else:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "tool_not_dispatched",
+                "message": (
+                    f"tool {tool.name!r} is in the elabftw adapter but "
+                    "has no /invoke dispatch path"
+                ),
+            }
+    except ElabftwAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+
+def _invoke_elabftw_download_upload(
+    tool: Any,
+    body: InvokeBody,
+) -> dict[str, object]:
+    """Handle elabftw.download_upload tool invocation."""
+    upload_id = int(body.args.get("upload_id", 0))
+    record_type = body.args.get("record_type", "experiments")
+    record_id = int(
+        body.args.get("record_id", body.args.get("experiment_id", 0))
+    )
+    if record_id == 0:
+        if not body.context_token:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "missing_record_id",
+                "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
+            }
+        try:
+            claims = verify_context_token(body.context_token)
+            record_id = claims.experiment_id
+            record_type = (
+                "items"
+                if claims.record_type == "resource"
+                else "experiments"
+            )
+        except Exception:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "invalid_context_token",
+                "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
+            }
+    adapter = get_elabftw_read_adapter()
+    if adapter.client is None:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "download_failed",
+        }
+    try_record_types = [record_type]
+    if record_type not in ("items",):
+        try_record_types.append("items")
+    if record_type not in ("experiments",):
+        try_record_types.append("experiments")
+
+    content: str | None = None
+    last_exc: Exception | None = None
+    for rt in try_record_types:
+        try:
+            content = adapter.client.get_upload_content(
+                rt, record_id, upload_id
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+    if content is None:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "download_failed",
+            "message": str(last_exc)
+            if last_exc
+            else "upload not found",
+        }
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": {
+            "upload_id": upload_id,
+            "content": content,
+            "length": len(content),
+        },
+    }
+
+
+def _invoke_elabftw_amend(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+) -> dict[str, object]:
+    """Handle elabftw.amend_my_experiment_after_approval tool invocation."""
+    import base64
+
+    attachment_data: bytes | None = None
+    attachment_filename = body.args.get("attachment_filename")
+    attachment_b64 = body.args.get("attachment_b64")
+    if attachment_b64 and attachment_filename:
+        try:
+            attachment_data = base64.b64decode(attachment_b64)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "client_error",
+                "message": f"attachment_b64 is not valid base64: {exc}",
+            }
+    adapter = get_elabftw_write_adapter()
+    result = adapter.amend_my_experiment_after_approval(
+        context_token=body.context_token,
+        approval_id=body.approval_id or "",
+        approval_args=body.args,
+        mapped_identity=mapped_identity,
+        conversation_id=body.conversation_id,
+        request_id=body.request_id,
+        keycloak_subject=body.keycloak_subject,
+        librechat_user_id=body.librechat_user_id,
+        provider=body.provider,
+        model_id=body.model_id,
+        amendment_html=body.args.get("amendment_html", ""),
+        attachment_filename=attachment_filename,
+        attachment_data=attachment_data,
+        attachment_comment=body.args.get("attachment_comment", ""),
+    )
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": result.to_dict(),
+    }
+
+
+def _invoke_opencloning_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+    artifact_store: ArtifactBundleStore,
+) -> dict[str, object]:
+    """Dispatch an opencloning adapter tool invocation."""
+    try:
+        adapter = get_opencloning_adapter()
+        if tool.name == "opencloning.parse_sequence_file":
+            result = adapter.parse_sequence_file(
+                context_token=body.context_token,
+                file_content=body.args.get("file_content", ""),
+                file_format=body.args.get("file_format", "genbank"),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return _opencloning_invoke_success(
+                tool_name=tool.name,
+                result=result,
+                context_token=body.context_token,
+                request_id=body.request_id,
+                artifact_store=artifact_store,
+            )
+        elif tool.name == "opencloning.manual_sequence":
+            result = adapter.manual_sequence(
+                context_token=body.context_token,
+                sequence=body.args.get("sequence", ""),
+                circular=body.args.get("circular", False),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return _opencloning_invoke_success(
+                tool_name=tool.name,
+                result=result,
+                context_token=body.context_token,
+                request_id=body.request_id,
+                artifact_store=artifact_store,
+            )
+        elif tool.name == "opencloning.oligo_hybridization":
+            result = adapter.oligo_hybridization(
+                context_token=body.context_token,
+                forward_oligo=body.args.get("forward_oligo", ""),
+                reverse_oligo=body.args.get("reverse_oligo", ""),
+                minimal_annealing=body.args.get("minimal_annealing", 20),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return _opencloning_invoke_success(
+                tool_name=tool.name,
+                result=result,
+                context_token=body.context_token,
+                request_id=body.request_id,
+                artifact_store=artifact_store,
+            )
+        elif tool.name == "opencloning.simulate_assembly":
+            result = adapter.simulate_assembly(
+                context_token=body.context_token,
+                sequences=body.args.get("sequences", []),
+                source=body.args.get(
+                    "source", {"id": 0, "type": "GibsonAssemblySource"}
+                ),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return _opencloning_invoke_success(
+                tool_name=tool.name,
+                result=result,
+                context_token=body.context_token,
+                request_id=body.request_id,
+                artifact_store=artifact_store,
+            )
+        elif tool.name == "opencloning.writeback_artifact":
+            result = adapter.writeback_artifact(
+                context_token=body.context_token,
+                approval_id=body.approval_id or "",
+                approval_args=body.args,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "opencloning.call":
+            result = adapter.call_endpoint(
+                context_token=body.context_token,
+                endpoint=body.args.get("endpoint", "/"),
+                body=body.args.get("body", {}),
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return _opencloning_invoke_success(
+                tool_name=tool.name,
+                result=result,
+                context_token=body.context_token,
+                request_id=body.request_id,
+                artifact_store=artifact_store,
+            )
+        elif tool.name == "opencloning.search_parts":
+            return _invoke_opencloning_search_parts(tool, body)
+        elif tool.name == "opencloning.fetch_igem_part":
+            return _invoke_opencloning_fetch_igem(tool, body)
+        else:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "tool_not_dispatched",
+                "message": (
+                    f"tool {tool.name!r} is in the opencloning adapter but "
+                    "has no /invoke dispatch path"
+                ),
+            }
+    except OpenCloningAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+    except WallacAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+    except ElabftwAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+
+def _invoke_opencloning_search_parts(
+    tool: Any,
+    body: InvokeBody,
+) -> dict[str, object]:
+    """Handle opencloning.search_parts — SynVectorDB semantic search."""
+    from urllib.request import urlopen as _urlopen, Request as _Request
+    import json as _json
+
+    query = body.args.get("query", "")
+    retmax = int(body.args.get("retmax", 5))
+
+    svdb_url = "https://testsdb.sjtu.bio/tools/semantic_search_cf"
+    payload = _json.dumps({"query": query, "limit": retmax}).encode()
+    req = _Request(svdb_url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "LabCopilot/1.0")
+    with _urlopen(req, timeout=15) as resp:
+        data = _json.loads(resp.read())
+
+    results = []
+    for match in data.get("matches", []):
+        m = match.get("metadata", {})
+        results.append(
+            {
+                "uid": match.get("id", ""),
+                "name": m.get("name", ""),
+                "source_collection": m.get("source_collection", ""),
+                "source_name": m.get("source_name", ""),
+                "type": m.get("type_level_1", ""),
+                "subtype": m.get("type_level_2", ""),
+                "score": match.get("score", 0),
+            }
+        )
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": {"results": results, "count": len(results)},
+    }
+
+
+def _invoke_opencloning_fetch_igem(
+    tool: Any,
+    body: InvokeBody,
+) -> dict[str, object]:
+    """Handle opencloning.fetch_igem_part — iGEM Registry fetch."""
+    from lab_copilot_gateway.igem_registry import (
+        fetch_igem_part_as_genbank,
+    )
+
+    part_name = body.args.get("part_name", "")
+    if not part_name:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "missing_arg",
+            "message": "part_name is required",
+        }
+    try:
+        genbank_str = fetch_igem_part_as_genbank(part_name)
+    except ValueError as exc:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "client_error",
+            "message": str(exc),
+        }
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": {
+            "part_name": part_name,
+            "genbank": genbank_str,
+            "file_format": "genbank",
+        },
+    }
+
+
+def _invoke_wallac_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+) -> dict[str, object]:
+    """Dispatch a wallac adapter tool invocation."""
+    try:
+        adapter = get_wallac_adapter()
+        if tool.name == "wallac.get_status":
+            result = adapter.get_status(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.call":
+            result = adapter.call(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                method=body.args.get("method", "GET"),
+                endpoint=body.args.get("endpoint", "/"),
+                body=body.args.get("body"),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.propose_generated_protocol":
+            result = adapter.propose_generated_protocol(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                protocol_spec=body.args.get("protocol_spec", {}),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.validate_generated_protocol":
+            result = adapter.validate_generated_protocol(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                job_item_id=body.args.get("job_item_id") or 0,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.prepare_submission_package":
+            result = adapter.prepare_submission_package(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                protocol_spec=body.args.get("protocol_spec", {}),
+                validation_report=body.args.get("validation_report"),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.run":
+            result = adapter.run(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                approval_id=body.approval_id or "",
+                protocol_id=body.args.get("protocol_id") or 0,
+                plate_id=body.args.get("plate_id"),
+                plate_layout=body.args.get("plate_layout"),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.submit_generated_protocol":
+            result = adapter.submit_generated_protocol(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                approval_id=body.approval_id or "",
+                approval_args=body.args,
+                job_item_id=body.args.get("job_item_id") or 0,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "wallac.bridge_status":
+            result = adapter.bridge_status(
+                job_id=body.args.get("job_id", ""),
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        else:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "tool_not_dispatched",
+                "message": (
+                    f"tool {tool.name!r} is in the wallac adapter "
+                    "but has no /invoke dispatch path"
+                ),
+            }
+    except WallacAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+    except ElabftwAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+
+def _invoke_bentolab_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+) -> dict[str, object]:
+    """Dispatch a bentolab adapter tool invocation."""
+    try:
+        adapter = get_bentolab_adapter()
+        if tool.name == "bentolab.get_status":
+            result = adapter.get_status(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "bentolab.validate_pcr_profile":
+            result = adapter.validate_pcr_profile(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                profile=body.args.get("profile", {}),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "bentolab.dry_run_pcr_profile":
+            result = adapter.dry_run_pcr_profile(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                profile=body.args.get("profile", {}),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        elif tool.name == "bentolab.submit_pcr_run":
+            result = adapter.submit_pcr_run(
+                context_token=body.context_token,
+                mapped_identity=mapped_identity,
+                approval_id=body.approval_id or "",
+                approval_args=body.args,
+                profile=body.args.get("profile", {}),
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+            return {
+                "ok": True,
+                "tool_name": tool.name,
+                "result": result.to_dict(),
+            }
+        else:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": "tool_not_dispatched",
+                "message": (
+                    f"tool {tool.name!r} is in the bentolab adapter "
+                    "but has no /invoke dispatch path"
+                ),
+            }
+    except BentoLabAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+    except ElabftwAdapterError as exc:
+        return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+
+
+# Maps adapter name to its dispatch function for POST /invoke.
+_INVOKE_DISPATCHERS: dict[str, Any] = {
+    "elabftw": _invoke_elabftw_tool,
+    "opencloning": _invoke_opencloning_tool,
+    "wallac": _invoke_wallac_tool,
+    "bentolab": _invoke_bentolab_tool,
+}
+
+
 def create_app() -> FastAPI:
     """Create the ASGI application."""
     service_name = "lab-copilot-gateway"
@@ -576,86 +1431,6 @@ def create_app() -> FastAPI:
                 "X-Lab-Copilot-Artifact-Sha256": artifact.sha256,
             },
         )
-
-    def _opencloning_invoke_success(
-        *,
-        tool_name: str,
-        result: OpenCloningResult,
-        context_token: str,
-        request_id: str | None,
-    ) -> dict[str, object]:
-        """Return OpenCloning /invoke output without raw sequence bytes."""
-        raw = result.to_dict()
-        raw_result = (
-            raw.get("result", {}) if isinstance(raw.get("result"), dict) else {}
-        )
-        plan_id = f"invoke-{request_id or result.audit_action_id}"
-        plan_hash = compute_args_hash(
-            {"tool_name": tool_name, "audit_action_id": result.audit_action_id}
-        )
-        normalized = normalize_opencloning_artifacts(
-            raw_result,
-            plan_id=plan_id,
-            plan_hash=plan_hash,
-            operation_label=tool_name,
-        )
-
-        binding: dict[str, object] = {}
-        try:
-            claims = verify_context_token(context_token)
-            binding = {
-                "record_type": claims.record_type,
-                "record_id": str(claims.experiment_id),
-                "mapped_elabftw_user_id": claims.mapped_elabftw_user_id,
-            }
-        except InvalidContextToken:
-            # The adapter already verified the token before returning success.
-            # If this defensive re-verify fails, keep manifests but skip storing
-            # downloadable bytes rather than creating an unbound artifact.
-            binding = {}
-
-        manifests: list[dict[str, object]] = []
-        for artifact in normalized.artifacts:
-            artifact_id = str(artifact.get("artifact_id") or "")
-            data = normalized.artifact_bytes.get(artifact_id)
-            if not artifact_id or data is None or not binding:
-                manifests.append(artifact)
-                continue
-            extra = {
-                key: value
-                for key, value in artifact.items()
-                if key not in _ARTIFACT_MANIFEST_RESERVED_KEYS
-            }
-            manifests.append(
-                artifact_store.put(
-                    plan_id=plan_id,
-                    plan_hash=plan_hash,
-                    artifact_id=artifact_id,
-                    filename=str(artifact.get("filename") or "artifact.bin"),
-                    mime_type=str(
-                        artifact.get("mime_type") or "application/octet-stream"
-                    ),
-                    data=data,
-                    binding=binding,
-                    manifest_extra=extra,
-                )
-            )
-
-        artifact_payload = normalized.to_event_payload()
-        artifact_payload.update(
-            {
-                "type": "lab_copilot_opencloning_artifacts",
-                "plan_id": plan_id,
-                "plan_hash": plan_hash,
-                "artifacts": manifests,
-            }
-        )
-        return {
-            "ok": True,
-            "tool_name": tool_name,
-            "result": _redact_opencloning_file_content(raw),
-            "opencloning_artifacts": artifact_payload,
-        }
 
     @api.post("/audit")
     def append_audit(
@@ -1059,16 +1834,7 @@ def create_app() -> FastAPI:
     # custom-endpoint service (copilot/librechat-custom-endpoint/).  It
     # enforces the C06 tool registry — anything not in the registry is
     # rejected with tool_not_registered (C13 acceptance #4).  Routing
-    # then fans out by adapter:
-    #
-    #   elabftw.read_current_experiment
-    #     → ElabftwReadAdapter.read_current_experiment
-    #   elabftw.draft_experiment_update
-    #     → ElabftwWriteAdapter.draft_experiment_update
-    #   elabftw.amend_my_experiment_after_approval
-    #     → ElabftwWriteAdapter.amend_my_experiment_after_approval
-    #   opencloning.*, wallac.*, bentolab.*
-    #     → adapter_not_implemented (those adapters land in C16+)
+    # then fans out by adapter via the _INVOKE_DISPATCHERS table.
     #
     # Returns a uniform {ok, tool_name, result? | reason, message?}
     # shape so the custom-endpoint translator can map it into OpenAI's
@@ -1100,733 +1866,16 @@ def create_app() -> FastAPI:
                 ),
             }
 
-        # Dispatch by adapter.  Each branch reuses the same adapter
-        # call the per-tool endpoint makes so the C08/C09 invariants
-        # (token verify, identity binding, policy, approval consume,
-        # audit) are preserved exactly.
         mapped_identity = identity_mapper.map(
             keycloak_subject=principal.keycloak_subject,
             librechat_user_id=body.librechat_user_id,
         )
 
-        if tool.adapter == "elabftw":
-            # Reuse the per-tool endpoint logic by calling the
-            # underlying adapter directly.  This keeps /invoke and the
-            # per-tool endpoints in lockstep — no separate code path
-            # for the same tool.
-            try:
-                if tool.name == "elabftw.read_current_experiment":
-                    adapter = get_elabftw_read_adapter()
-                    result = adapter.read_current_experiment(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.search_my_experiments":
-                    adapter = get_elabftw_read_adapter()
-                    result = adapter.search_my_experiments(
-                        query=body.args.get("query", ""),
-                        limit=body.args.get("limit", 20),
-                        offset=body.args.get("offset", 0),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.read_experiment_by_id":
-                    adapter = get_elabftw_read_adapter()
-                    result = adapter.read_experiment_by_id(
-                        experiment_id=int(
-                            body.args.get("experiment_id", body.args.get("id", 0))
-                        ),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.search_items":
-                    adapter = get_elabftw_read_adapter()
-                    result = adapter.search_items(
-                        query=body.args.get("query", ""),
-                        limit=body.args.get("limit", 20),
-                        offset=body.args.get("offset", 0),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.read_item_by_id":
-                    adapter = get_elabftw_read_adapter()
-                    result = adapter.read_item_by_id(
-                        item_id=int(body.args.get("item_id", body.args.get("id", 0))),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.download_upload":
-                    # Download the raw content of an attached file.
-                    # The LLM calls this after seeing the uploads list
-                    # from read_current_experiment / read_experiment_by_id.
-                    upload_id = int(body.args.get("upload_id", 0))
-                    record_type = body.args.get("record_type", "experiments")
-                    record_id = int(
-                        body.args.get("record_id", body.args.get("experiment_id", 0))
-                    )
-                    if record_id == 0:
-                        # Fall back to the context token's experiment
-                        if not body.context_token:
-                            return {
-                                "ok": False,
-                                "tool_name": tool.name,
-                                "reason": "missing_record_id",
-                                "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
-                            }
-                        from .elabftw import verify_context_token
-
-                        try:
-                            claims = verify_context_token(body.context_token)
-                            record_id = claims.experiment_id
-                            record_type = (
-                                "items"
-                                if claims.record_type == "resource"
-                                else "experiments"
-                            )
-                        except Exception:
-                            return {
-                                "ok": False,
-                                "tool_name": tool.name,
-                                "reason": "invalid_context_token",
-                                "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
-                            }
-                    adapter = get_elabftw_read_adapter()
-                    if adapter.client is None:
-                        return {
-                            "ok": False,
-                            "tool_name": tool.name,
-                            "reason": "download_failed",
-                        }
-                    # If the LLM didn't specify record_type, try both.
-                    # The LLM often doesn't know if a record is an experiment
-                    # or a database resource — it just has an ID from uploads.
-                    try_record_types = [record_type]
-                    if record_type not in ("items",):
-                        try_record_types.append("items")
-                    if record_type not in ("experiments",):
-                        try_record_types.append("experiments")
-
-                    content: str | None = None
-                    last_exc: Exception | None = None
-                    for rt in try_record_types:
-                        try:
-                            content = adapter.client.get_upload_content(
-                                rt, record_id, upload_id
-                            )
-                            break
-                        except Exception as exc:
-                            last_exc = exc
-                    if content is None:
-                        return {
-                            "ok": False,
-                            "tool_name": tool.name,
-                            "reason": "download_failed",
-                            "message": str(last_exc)
-                            if last_exc
-                            else "upload not found",
-                        }
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": {
-                            "upload_id": upload_id,
-                            "content": content,
-                            "length": len(content),
-                        },
-                    }
-                elif tool.name == "elabftw.draft_experiment_update":
-                    adapter = get_elabftw_write_adapter()
-                    result = adapter.draft_experiment_update(
-                        context_token=body.context_token,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.amend_my_experiment_after_approval":
-                    import base64
-
-                    attachment_data: bytes | None = None
-                    attachment_filename = body.args.get("attachment_filename")
-                    attachment_b64 = body.args.get("attachment_b64")
-                    if attachment_b64 and attachment_filename:
-                        try:
-                            attachment_data = base64.b64decode(attachment_b64)
-                        except Exception as exc:
-                            return {
-                                "ok": False,
-                                "tool_name": tool.name,
-                                "reason": "client_error",
-                                "message": f"attachment_b64 is not valid base64: {exc}",
-                            }
-                    adapter = get_elabftw_write_adapter()
-                    result = adapter.amend_my_experiment_after_approval(
-                        context_token=body.context_token,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                        amendment_html=body.args.get("amendment_html", ""),
-                        attachment_filename=attachment_filename,
-                        attachment_data=attachment_data,
-                        attachment_comment=body.args.get("attachment_comment", ""),
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "elabftw.edit_experiment_section":
-                    adapter = get_elabftw_write_adapter()
-                    result = adapter.edit_experiment_section(
-                        context_token=body.context_token,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                else:
-                    # elabftw adapter but no known tool mapping —
-                    # shouldn't happen (registry only contains the
-                    # six elabftw tools above), but fail closed.
-                    return {
-                        "ok": False,
-                        "tool_name": tool.name,
-                        "reason": "tool_not_dispatched",
-                        "message": (
-                            f"tool {tool.name!r} is in the elabftw adapter but "
-                            "has no /invoke dispatch path"
-                        ),
-                    }
-            except ElabftwAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-
-        if tool.adapter == "opencloning":
-            try:
-                adapter = get_opencloning_adapter()
-                if tool.name == "opencloning.parse_sequence_file":
-                    result = adapter.parse_sequence_file(
-                        context_token=body.context_token,
-                        file_content=body.args.get("file_content", ""),
-                        file_format=body.args.get("file_format", "genbank"),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return _opencloning_invoke_success(
-                        tool_name=tool.name,
-                        result=result,
-                        context_token=body.context_token,
-                        request_id=body.request_id,
-                    )
-                elif tool.name == "opencloning.manual_sequence":
-                    result = adapter.manual_sequence(
-                        context_token=body.context_token,
-                        sequence=body.args.get("sequence", ""),
-                        circular=body.args.get("circular", False),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return _opencloning_invoke_success(
-                        tool_name=tool.name,
-                        result=result,
-                        context_token=body.context_token,
-                        request_id=body.request_id,
-                    )
-                elif tool.name == "opencloning.oligo_hybridization":
-                    result = adapter.oligo_hybridization(
-                        context_token=body.context_token,
-                        forward_oligo=body.args.get("forward_oligo", ""),
-                        reverse_oligo=body.args.get("reverse_oligo", ""),
-                        minimal_annealing=body.args.get("minimal_annealing", 20),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return _opencloning_invoke_success(
-                        tool_name=tool.name,
-                        result=result,
-                        context_token=body.context_token,
-                        request_id=body.request_id,
-                    )
-                elif tool.name == "opencloning.simulate_assembly":
-                    result = adapter.simulate_assembly(
-                        context_token=body.context_token,
-                        sequences=body.args.get("sequences", []),
-                        source=body.args.get(
-                            "source", {"id": 0, "type": "GibsonAssemblySource"}
-                        ),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return _opencloning_invoke_success(
-                        tool_name=tool.name,
-                        result=result,
-                        context_token=body.context_token,
-                        request_id=body.request_id,
-                    )
-                elif tool.name == "opencloning.writeback_artifact":
-                    result = adapter.writeback_artifact(
-                        context_token=body.context_token,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "opencloning.call":
-                    result = adapter.call_endpoint(
-                        context_token=body.context_token,
-                        endpoint=body.args.get("endpoint", "/"),
-                        body=body.args.get("body", {}),
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return _opencloning_invoke_success(
-                        tool_name=tool.name,
-                        result=result,
-                        context_token=body.context_token,
-                        request_id=body.request_id,
-                    )
-                elif tool.name == "opencloning.search_parts":
-                    # SynVectorDB semantic search across Addgene, iGEM,
-                    # SnapGene, and lab collections (19,850 parts).
-                    from urllib.request import urlopen as _urlopen, Request as _Request
-                    import json as _json
-
-                    query = body.args.get("query", "")
-                    retmax = int(body.args.get("retmax", 5))
-
-                    svdb_url = "https://testsdb.sjtu.bio/tools/semantic_search_cf"
-                    payload = _json.dumps({"query": query, "limit": retmax}).encode()
-                    req = _Request(svdb_url, data=payload, method="POST")
-                    req.add_header("Content-Type", "application/json")
-                    req.add_header("User-Agent", "LabCopilot/1.0")
-                    with _urlopen(req, timeout=15) as resp:
-                        data = _json.loads(resp.read())
-
-                    results = []
-                    for match in data.get("matches", []):
-                        m = match.get("metadata", {})
-                        results.append(
-                            {
-                                "uid": match.get("id", ""),
-                                "name": m.get("name", ""),
-                                "source_collection": m.get("source_collection", ""),
-                                "source_name": m.get("source_name", ""),
-                                "type": m.get("type_level_1", ""),
-                                "subtype": m.get("type_level_2", ""),
-                                "score": match.get("score", 0),
-                            }
-                        )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": {"results": results, "count": len(results)},
-                    }
-                elif tool.name == "opencloning.fetch_igem_part":
-                    # Fetch a part from the official iGEM Registry API
-                    # (api.registry.igem.org). Returns sequence + annotations
-                    # as a GenBank string for parse_sequence_file.
-                    from lab_copilot_gateway.igem_registry import (
-                        fetch_igem_part_as_genbank,
-                    )
-
-                    part_name = body.args.get("part_name", "")
-                    if not part_name:
-                        return {
-                            "ok": False,
-                            "tool_name": tool.name,
-                            "reason": "missing_arg",
-                            "message": "part_name is required",
-                        }
-                    try:
-                        genbank_str = fetch_igem_part_as_genbank(part_name)
-                    except ValueError as exc:
-                        return {
-                            "ok": False,
-                            "tool_name": tool.name,
-                            "reason": "client_error",
-                            "message": str(exc),
-                        }
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": {
-                            "part_name": part_name,
-                            "genbank": genbank_str,
-                            "file_format": "genbank",
-                        },
-                    }
-            except OpenCloningAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-            except WallacAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-            except ElabftwAdapterError as exc:
-                # Wallac adapter reuses eLabFTW's InvalidContextToken and
-                # UnmappedCaller, so those errors surface as ElabftwAdapterError
-                # subclasses. Map them to the same {ok:false, reason, message} shape.
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-
-        if tool.adapter == "wallac":
-            try:
-                adapter = get_wallac_adapter()
-                if tool.name == "wallac.get_status":
-                    result = adapter.get_status(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.call":
-                    result = adapter.call(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        method=body.args.get("method", "GET"),
-                        endpoint=body.args.get("endpoint", "/"),
-                        body=body.args.get("body"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.propose_generated_protocol":
-                    result = adapter.propose_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        protocol_spec=body.args.get("protocol_spec", {}),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.validate_generated_protocol":
-                    result = adapter.validate_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        job_item_id=body.args.get("job_item_id") or 0,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.prepare_submission_package":
-                    result = adapter.prepare_submission_package(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        protocol_spec=body.args.get("protocol_spec", {}),
-                        validation_report=body.args.get("validation_report"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.run":
-                    # Don't pass experiment_id from the context token —
-                    # the bridge creates a NEW eLabFTW experiment for the
-                    # results. Writing to the current experiment would
-                    # overwrite its body with the heatmap HTML.
-                    result = adapter.run(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        approval_id=body.approval_id or "",
-                        protocol_id=body.args.get("protocol_id") or 0,
-                        plate_id=body.args.get("plate_id"),
-                        plate_layout=body.args.get("plate_layout"),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.submit_generated_protocol":
-                    result = adapter.submit_generated_protocol(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        job_item_id=body.args.get("job_item_id") or 0,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "wallac.bridge_status":
-                    result = adapter.bridge_status(
-                        job_id=body.args.get("job_id", ""),
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                else:
-                    return {
-                        "ok": False,
-                        "tool_name": tool.name,
-                        "reason": "tool_not_dispatched",
-                        "message": (
-                            f"tool {tool.name!r} is in the wallac adapter "
-                            "but has no /invoke dispatch path"
-                        ),
-                    }
-            except WallacAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-            except ElabftwAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-
-        if tool.adapter == "bentolab":
-            try:
-                adapter = get_bentolab_adapter()
-                if tool.name == "bentolab.get_status":
-                    result = adapter.get_status(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "bentolab.validate_pcr_profile":
-                    result = adapter.validate_pcr_profile(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        profile=body.args.get("profile", {}),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "bentolab.dry_run_pcr_profile":
-                    result = adapter.dry_run_pcr_profile(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        profile=body.args.get("profile", {}),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                elif tool.name == "bentolab.submit_pcr_run":
-                    result = adapter.submit_pcr_run(
-                        context_token=body.context_token,
-                        mapped_identity=mapped_identity,
-                        approval_id=body.approval_id or "",
-                        approval_args=body.args,
-                        profile=body.args.get("profile", {}),
-                        conversation_id=body.conversation_id,
-                        request_id=body.request_id,
-                        keycloak_subject=body.keycloak_subject,
-                        librechat_user_id=body.librechat_user_id,
-                        provider=body.provider,
-                        model_id=body.model_id,
-                    )
-                    return {
-                        "ok": True,
-                        "tool_name": tool.name,
-                        "result": result.to_dict(),
-                    }
-                else:
-                    return {
-                        "ok": False,
-                        "tool_name": tool.name,
-                        "reason": "tool_not_dispatched",
-                        "message": (
-                            f"tool {tool.name!r} is in the bentolab adapter "
-                            "but has no /invoke dispatch path"
-                        ),
-                    }
-            except BentoLabAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
-            except ElabftwAdapterError as exc:
-                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
+        dispatcher = _INVOKE_DISPATCHERS.get(tool.adapter)
+        if dispatcher is not None:
+            if tool.adapter == "opencloning":
+                return dispatcher(tool, body, mapped_identity, artifact_store)
+            return dispatcher(tool, body, mapped_identity)
 
         # Adapters that don't exist yet (C19+).  Return a structured
         # error so the LibreChat side can surface a clear "this tool

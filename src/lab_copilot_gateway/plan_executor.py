@@ -126,6 +126,9 @@ class StepResult:
     error: str | None = None
     audit_action_id: str | None = None
     retryable: bool = False
+    # Internal: set when a write step fails, to skip remaining steps.
+    # Not serialized — only used within execute().
+    write_failed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -199,6 +202,116 @@ class PlanExecutor:
         self.opencloning_adapter = opencloning_adapter
         self.wallac_adapter = wallac_adapter
         self.bentolab_adapter = bentolab_adapter
+
+    def _consume_plan_approval(
+        self,
+        plan: Plan,
+        plan_hash: str,
+        approval_id: str | None,
+        autonomy_active: bool,
+    ) -> str | None:
+        """Consume plan-level approval. Returns effective_approval_id or error message.
+
+        Returns None on success (caller should check for a string error).
+        Actually: returns the effective_approval_id on success, or an error
+        string starting with "error:" on failure.
+        """
+        if autonomy_active:
+            return f"autonomous:{plan.plan_id}"
+
+        if not approval_id:
+            return "error:Approval required but no approval_id provided"
+
+        try:
+            self.approval_store.consume(
+                approval_id,
+                tool_name="plan.execute",
+                args_hash=plan_hash,
+                target_record=f"plan:{plan.plan_id}",
+            )
+            return approval_id
+        except Exception as exc:
+            return f"error:Approval consume failed: {exc}"
+
+    def _execute_single_step(
+        self,
+        *,
+        step: PlanStep,
+        step_type: str,
+        step_index: int,
+        context_token: str,
+        plan_approval_id: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+    ) -> StepResult:
+        """Execute a single plan step and return its result (never raises)."""
+        try:
+            if step_type == "read":
+                result = self._execute_read(
+                    step=step,
+                    context_token=context_token,
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            else:
+                result = self._execute_write(
+                    step=step,
+                    context_token=context_token,
+                    plan_approval_id=plan_approval_id,
+                    mapped_identity=mapped_identity,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                )
+            return StepResult(
+                step_index=step_index,
+                tool_name=step.tool_name,
+                status="success",
+                result=result,
+                audit_action_id=(
+                    result.get("audit_action_id")
+                    if step_type == "write" and isinstance(result, dict)
+                    else None
+                ),
+            )
+        except (
+            ElabftwAdapterError,
+            OpenCloningAdapterError,
+            WallacAdapterError,
+            BentoLabAdapterError,
+        ) as exc:
+            error_str = f"{exc.reason}: {exc.message}"
+            return StepResult(
+                step_index=step_index,
+                tool_name=step.tool_name,
+                status="failed",
+                error=error_str,
+                retryable=_is_retryable(exc.reason),
+                write_failed=(step_type == "write"),
+            )
+        except Exception as exc:
+            error_str = f"unexpected error: {type(exc).__name__}: {exc}"
+            return StepResult(
+                step_index=step_index,
+                tool_name=step.tool_name,
+                status="failed",
+                error=error_str,
+                retryable=True,
+                write_failed=(step_type == "write"),
+            )
 
     def execute(
         self,
@@ -276,29 +389,18 @@ class PlanExecutor:
         # 2. Consume the plan-level approval (bound to plan hash).
         # C29: Skip when autonomy bypass is active.
         if not autonomy_active:
-            if not effective_approval_id:
+            approval_result = self._consume_plan_approval(
+                plan, plan_hash, approval_id, autonomy_active
+            )
+            if approval_result.startswith("error:"):
                 return PlanExecutionResult(
                     plan_id=plan.plan_id,
                     plan_hash=plan_hash,
                     status="rejected",
                     step_results=[],
-                    summary="Approval required but no approval_id provided",
+                    summary=approval_result.removeprefix("error:"),
                 )
-            try:
-                self.approval_store.consume(
-                    effective_approval_id,
-                    tool_name="plan.execute",
-                    args_hash=plan_hash,
-                    target_record=f"plan:{plan.plan_id}",
-                )
-            except Exception as exc:
-                return PlanExecutionResult(
-                    plan_id=plan.plan_id,
-                    plan_hash=plan_hash,
-                    status="rejected",
-                    step_results=[],
-                    summary=f"Approval consume failed: {exc}",
-                )
+            effective_approval_id = approval_result
 
         # At this point effective_approval_id is guaranteed to be non-None
         # (autonomous synthetic ID or validated through the approval_id guard).
@@ -314,7 +416,6 @@ class PlanExecutor:
         write_failed = False
         for step_index, step, step_type in all_steps:
             if write_failed:
-                # Remaining steps are skipped after a write failure.
                 step_results.append(
                     StepResult(
                         step_index=step_index,
@@ -325,83 +426,23 @@ class PlanExecutor:
                 )
                 continue
 
-            try:
-                if step_type == "read":
-                    result = self._execute_read(
-                        step=step,
-                        context_token=context_token,
-                        mapped_identity=mapped_identity,
-                        conversation_id=conversation_id,
-                        request_id=request_id,
-                        keycloak_subject=keycloak_subject,
-                        librechat_user_id=librechat_user_id,
-                        provider=provider,
-                        model_id=model_id,
-                    )
-                else:
-                    result = self._execute_write(
-                        step=step,
-                        context_token=context_token,
-                        plan_approval_id=effective_approval_id,
-                        mapped_identity=mapped_identity,
-                        conversation_id=conversation_id,
-                        request_id=request_id,
-                        keycloak_subject=keycloak_subject,
-                        librechat_user_id=librechat_user_id,
-                        provider=provider,
-                        model_id=model_id,
-                    )
-                step_results.append(
-                    StepResult(
-                        step_index=step_index,
-                        tool_name=step.tool_name,
-                        status="success",
-                        result=result,
-                        # C40: extract audit_action_id from write results
-                        # (WriteResult.to_dict() includes it).
-                        audit_action_id=(
-                            result.get("audit_action_id")
-                            if step_type == "write" and isinstance(result, dict)
-                            else None
-                        ),
-                    )
-                )
-            except (
-                ElabftwAdapterError,
-                OpenCloningAdapterError,
-                WallacAdapterError,
-                BentoLabAdapterError,
-            ) as exc:
-                error_str = f"{exc.reason}: {exc.message}"
-                step_results.append(
-                    StepResult(
-                        step_index=step_index,
-                        tool_name=step.tool_name,
-                        status="failed",
-                        error=error_str,
-                        # C40: transient failures are retryable with a
-                        # fresh plan-level approval.
-                        retryable=_is_retryable(exc.reason),
-                    )
-                )
-                if step_type == "write":
-                    write_failed = True
-            except Exception as exc:
-                error_str = f"unexpected error: {type(exc).__name__}: {exc}"
-                step_results.append(
-                    StepResult(
-                        step_index=step_index,
-                        tool_name=step.tool_name,
-                        status="failed",
-                        error=error_str,
-                        # C40: unexpected errors are treated as transient
-                        # (retryable) — the caller should investigate before
-                        # retrying, but the step itself may succeed on retry.
-                        retryable=True,
-                    )
-                )
-                if step_type == "write":
-                    write_failed = True
+            step_result = self._execute_single_step(
+                step=step,
+                step_type=step_type,
+                step_index=step_index,
+                context_token=context_token,
+                plan_approval_id=effective_approval_id,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+            if step_result.write_failed:
+                write_failed = True
+            step_results.append(step_result)
 
         # 4. Build result summary.
         succeeded = sum(1 for r in step_results if r.status == "success")

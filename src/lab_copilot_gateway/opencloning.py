@@ -1069,6 +1069,160 @@ class OpenCloningAdapter:
             plan_approval_id=plan_approval_id,
         )
 
+    def _verify_identity_binding(
+        self,
+        *,
+        tool_name: str,
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Verify identity resolution and token-identity binding.
+
+        Raises UnmappedCaller or InvalidContextToken on failure (after audit).
+        """
+        if mapped_identity is None:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
+
+    def _check_policy_decision(
+        self,
+        *,
+        tool_name: str,
+        tier: int,
+        mapped_identity: MappedIdentity,
+        experiment_id: int,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        has_approval: bool = False,
+        approval_id: str | None = None,
+    ) -> None:
+        """Check policy decision. Raises PolicyDenied on denial (after audit)."""
+        policy_req = PolicyRequest(
+            tool_name=tool_name,
+            tier=tier,
+            adapter="opencloning",
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=has_approval,
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+
+        if decision.decision != "allow":
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason=decision.reason,
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                approval_id=approval_id,
+                error={
+                    "code": "POLICY_DENIED",
+                    "reason": decision.reason,
+                    "tier": decision.tier,
+                },
+            )
+            raise PolicyDenied(decision)
+
     def _execute_writeback(
         self,
         *,
@@ -1200,126 +1354,36 @@ class OpenCloningAdapter:
             }
         )
 
-        # 2. Identity resolution.
-        if mapped_identity is None:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason="unmapped_caller",
-                mapped_identity=None,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "UNMAPPED_CALLER"},
-            )
-            raise UnmappedCaller()
-
-        # 3. Token-identity binding.
-        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason="context_token_user_mismatch",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
-            )
-            raise InvalidContextToken("token user does not match resolved identity")
-
-        if (
-            claims.keycloak_subject is not None
-            and mapped_identity.keycloak_subject is not None
-        ):
-            if claims.keycloak_subject != mapped_identity.keycloak_subject:
-                self._audit(
-                    tool_name=TOOL_WRITEBACK,
-                    policy_decision="deny",
-                    reason="context_token_kc_subject_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token keycloak_subject does not match resolved identity"
-                )
-
-        if (
-            claims.librechat_user_id is not None
-            and mapped_identity.librechat_user_id is not None
-        ):
-            if claims.librechat_user_id != mapped_identity.librechat_user_id:
-                self._audit(
-                    tool_name=TOOL_WRITEBACK,
-                    policy_decision="deny",
-                    reason="context_token_lc_user_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token librechat_user_id does not match resolved identity"
-                )
+        # 2-3. Identity resolution + token-identity binding.
+        self._verify_identity_binding(
+            tool_name=TOOL_WRITEBACK,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 4. Policy decision (tier 4 write, requires approval).
-        policy_req = PolicyRequest(
+        self._check_policy_decision(
             tool_name=TOOL_WRITEBACK,
             tier=TOOL_TIER_WRITE,
-            adapter="opencloning",
-            user_id=mapped_identity.elabftw_user_id,
-            team_id=mapped_identity.elabftw_team_id,
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
             has_approval=bool(approval_id),
             approval_id=approval_id,
         )
-        decision = self.policy_engine.decide(policy_req)
-
-        if decision.decision != "allow":
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="deny",
-                reason=decision.reason,
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=approval_id,
-                error={
-                    "code": "POLICY_DENIED",
-                    "reason": decision.reason,
-                    "tier": decision.tier,
-                },
-            )
-            raise PolicyDenied(decision)
 
         # 5. Approval token consume (single-use, args-hash-bound).
         # C41: when ``plan_approval_id`` is set, the plan executor has
@@ -1641,125 +1705,34 @@ class OpenCloningAdapter:
             {**args_for_hash, "experiment_id": claims.experiment_id}
         )
 
-        # 2. Identity resolution — unmapped caller denies before any HTTP.
-        if mapped_identity is None:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="unmapped_caller",
-                mapped_identity=None,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "UNMAPPED_CALLER"},
-            )
-            raise UnmappedCaller()
-
-        # 3. Token-identity binding (three-way check).
-        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="context_token_user_mismatch",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
-            )
-            raise InvalidContextToken("token user does not match resolved identity")
-
-        if (
-            claims.keycloak_subject is not None
-            and mapped_identity.keycloak_subject is not None
-        ):
-            if claims.keycloak_subject != mapped_identity.keycloak_subject:
-                self._audit(
-                    tool_name=tool_name,
-                    policy_decision="deny",
-                    reason="context_token_kc_subject_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token keycloak_subject does not match resolved identity"
-                )
-
-        if (
-            claims.librechat_user_id is not None
-            and mapped_identity.librechat_user_id is not None
-        ):
-            if claims.librechat_user_id != mapped_identity.librechat_user_id:
-                self._audit(
-                    tool_name=tool_name,
-                    policy_decision="deny",
-                    reason="context_token_lc_user_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token librechat_user_id does not match resolved identity"
-                )
+        # 2-3. Identity resolution + token-identity binding.
+        self._verify_identity_binding(
+            tool_name=tool_name,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 4. Policy decision (tier 3 read-only, no approval needed).
-        policy_req = PolicyRequest(
+        self._check_policy_decision(
             tool_name=tool_name,
             tier=TOOL_TIER,
-            adapter="opencloning",
-            user_id=mapped_identity.elabftw_user_id,
-            team_id=mapped_identity.elabftw_team_id,
-            has_approval=False,
-            approval_id=None,
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
         )
-        decision = self.policy_engine.decide(policy_req)
-
-        if decision.decision != "allow":
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason=decision.reason,
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={
-                    "code": "POLICY_DENIED",
-                    "reason": decision.reason,
-                    "tier": decision.tier,
-                },
-            )
-            raise PolicyDenied(decision)
 
         # 5. Client-not-configured check.
         if self.client is None:
