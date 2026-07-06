@@ -110,13 +110,17 @@ def rewrite_genbank_features(
             existing_labels.add(key)
 
             seen_seqs.add(feat_seq)
+            # Mark recovered features so the OVE preview can identify the
+            # inserted sequence (instead of guessing from feature names).
+            qualifiers = dict(feat["qualifiers"])
+            qualifiers["note"] = "lab-copilot:insert"
             new_features.append(
                 {
                     "type": feat["type"],
                     "start": start,
                     "end": end,
                     "strand": strand,
-                    "qualifiers": feat["qualifiers"],
+                    "qualifiers": qualifiers,
                 }
             )
 

@@ -51,6 +51,7 @@ from lab_copilot_gateway.bentolab import (
     get_bentolab_adapter,
 )
 from lab_copilot_gateway.opencloning import (
+    OpenCloningAdapterError,
     OpenCloningResult,
     get_opencloning_adapter,
 )
@@ -1557,6 +1558,8 @@ def create_app() -> FastAPI:
                             "file_format": "genbank",
                         },
                     }
+            except OpenCloningAdapterError as exc:
+                return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
             except WallacAdapterError as exc:
                 return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
             except ElabftwAdapterError as exc:
