@@ -233,6 +233,112 @@ class PlanExecutor:
         except Exception as exc:
             return f"error:Approval consume failed: {exc}"
 
+    def _resolve_plan_approval(
+        self,
+        *,
+        plan: Plan,
+        plan_hash: str,
+        approval_id: str | None,
+    ) -> tuple[bool, str] | PlanExecutionResult:
+        """Resolve autonomy status, budget, and effective plan approval.
+
+        Returns ``(autonomy_active, effective_approval_id)`` on success,
+        or a ``PlanExecutionResult`` error on budget failure.
+        """
+        from lab_copilot_gateway.config import (
+            get_autonomy_max_steps,
+            is_autonomy_enabled,
+        )
+
+        autonomy_active = (
+            plan.risk_tier == PlanRiskTier.AUTONOMOUS and is_autonomy_enabled()
+        )
+
+        if autonomy_active:
+            max_steps = get_autonomy_max_steps()
+            total_steps = len(plan.reads) + len(plan.writes)
+            if total_steps > max_steps:
+                return PlanExecutionResult(
+                    plan_id=plan.plan_id,
+                    plan_hash=plan_hash,
+                    status="rejected",
+                    step_results=[],
+                    summary=(
+                        f"Autonomous plan exceeds budget: {total_steps} steps "
+                        f"> {max_steps} max (LAB_COPILOT_AUTONOMY_MAX_STEPS)"
+                    ),
+                )
+            return (True, f"autonomous:{plan.plan_id}")
+
+        # Non-autonomous: consume plan-level approval.
+        approval_result = self._consume_plan_approval(
+            plan, plan_hash, approval_id, autonomy_active=False
+        )
+        if approval_result.startswith("error:"):
+            return PlanExecutionResult(
+                plan_id=plan.plan_id,
+                plan_hash=plan_hash,
+                status="rejected",
+                step_results=[],
+                summary=approval_result.removeprefix("error:"),
+            )
+        return (False, approval_result)
+
+    def _execute_all_steps(
+        self,
+        *,
+        plan: Plan,
+        effective_approval_id: str,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+    ) -> list[StepResult]:
+        """Execute all plan steps, stopping writes after first failure."""
+        step_results: list[StepResult] = []
+        all_steps = [(i, step, "read") for i, step in enumerate(plan.reads)]
+        all_steps += [
+            (len(plan.reads) + i, step, "write")
+            for i, step in enumerate(plan.writes)
+        ]
+
+        write_failed = False
+        for step_index, step, step_type in all_steps:
+            if write_failed:
+                step_results.append(
+                    StepResult(
+                        step_index=step_index,
+                        tool_name=step.tool_name,
+                        status="skipped",
+                        error="skipped due to prior write failure",
+                    )
+                )
+                continue
+
+            step_result = self._execute_single_step(
+                step=step,
+                step_type=step_type,
+                step_index=step_index,
+                context_token=context_token,
+                plan_approval_id=effective_approval_id,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+            if step_result.write_failed:
+                write_failed = True
+            step_results.append(step_result)
+
+        return step_results
+
     def _execute_single_step(
         self,
         *,
@@ -353,96 +459,33 @@ class PlanExecutor:
                 summary=f"Plan validation failed: {'; '.join(exc.errors)}",
             )
 
-        # C29: Determine whether autonomy bypass applies.
-        from lab_copilot_gateway.config import (
-            get_autonomy_max_steps,
-            is_autonomy_enabled,
+        # C29: Autonomy setup and approval resolution.
+        autonomy_result = self._resolve_plan_approval(
+            plan=plan,
+            plan_hash=plan_hash,
+            approval_id=approval_id,
         )
-
-        autonomy_active = (
-            plan.risk_tier == PlanRiskTier.AUTONOMOUS and is_autonomy_enabled()
-        )
-
-        # C29: Budget check for autonomous plans.
-        if autonomy_active:
-            max_steps = get_autonomy_max_steps()
-            total_steps = len(plan.reads) + len(plan.writes)
-            if total_steps > max_steps:
-                return PlanExecutionResult(
-                    plan_id=plan.plan_id,
-                    plan_hash=plan_hash,
-                    status="rejected",
-                    step_results=[],
-                    summary=(
-                        f"Autonomous plan exceeds budget: {total_steps} steps "
-                        f"> {max_steps} max (LAB_COPILOT_AUTONOMY_MAX_STEPS)"
-                    ),
-                )
-
-        # C29: Determine the effective plan_approval_id for write steps.
-        # When autonomy is active, use a synthetic ID and skip approval consume.
-        if autonomy_active:
-            effective_approval_id = f"autonomous:{plan.plan_id}"
-        else:
-            effective_approval_id = approval_id
-
-        # 2. Consume the plan-level approval (bound to plan hash).
-        # C29: Skip when autonomy bypass is active.
-        if not autonomy_active:
-            approval_result = self._consume_plan_approval(
-                plan, plan_hash, approval_id, autonomy_active
-            )
-            if approval_result.startswith("error:"):
-                return PlanExecutionResult(
-                    plan_id=plan.plan_id,
-                    plan_hash=plan_hash,
-                    status="rejected",
-                    step_results=[],
-                    summary=approval_result.removeprefix("error:"),
-                )
-            effective_approval_id = approval_result
+        if isinstance(autonomy_result, PlanExecutionResult):
+            return autonomy_result
+        autonomy_active, effective_approval_id = autonomy_result
 
         # At this point effective_approval_id is guaranteed to be non-None
         # (autonomous synthetic ID or validated through the approval_id guard).
         assert effective_approval_id is not None
 
         # 3. Execute steps.
-        step_results: list[StepResult] = []
-        all_steps = [(i, step, "read") for i, step in enumerate(plan.reads)]
-        all_steps += [
-            (len(plan.reads) + i, step, "write") for i, step in enumerate(plan.writes)
-        ]
-
-        write_failed = False
-        for step_index, step, step_type in all_steps:
-            if write_failed:
-                step_results.append(
-                    StepResult(
-                        step_index=step_index,
-                        tool_name=step.tool_name,
-                        status="skipped",
-                        error="skipped due to prior write failure",
-                    )
-                )
-                continue
-
-            step_result = self._execute_single_step(
-                step=step,
-                step_type=step_type,
-                step_index=step_index,
-                context_token=context_token,
-                plan_approval_id=effective_approval_id,
-                mapped_identity=mapped_identity,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-            )
-            if step_result.write_failed:
-                write_failed = True
-            step_results.append(step_result)
+        step_results = self._execute_all_steps(
+            plan=plan,
+            effective_approval_id=effective_approval_id,
+            context_token=context_token,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+        )
 
         # 4. Build result summary.
         succeeded = sum(1 for r in step_results if r.status == "success")
@@ -516,85 +559,9 @@ class PlanExecutor:
             TOOL_CALL,
         }
         if step.tool_name in opencloning_tools:
-            if self.opencloning_adapter is None:
-                raise OpenCloningAdapterError(
-                    reason="opencloning_not_configured",
-                    message=(
-                        "OpenCloning adapter not configured for plan execution "
-                        "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
-                    ),
-                )
-            if step.tool_name == TOOL_PARSE:
-                result = self.opencloning_adapter.parse_sequence_file(
-                    context_token=context_token,
-                    file_content=step.args.get("file_content", ""),
-                    file_format=step.args.get("file_format", "genbank"),
-                    mapped_identity=mapped_identity,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-            elif step.tool_name == TOOL_MANUAL:
-                result = self.opencloning_adapter.manual_sequence(
-                    context_token=context_token,
-                    sequence=step.args.get("sequence", ""),
-                    circular=step.args.get("circular", False),
-                    mapped_identity=mapped_identity,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-            elif step.tool_name == TOOL_OLIGO:
-                result = self.opencloning_adapter.oligo_hybridization(
-                    context_token=context_token,
-                    forward_oligo=step.args.get("forward_oligo", ""),
-                    reverse_oligo=step.args.get("reverse_oligo", ""),
-                    minimal_annealing=step.args.get("minimal_annealing", 20),
-                    mapped_identity=mapped_identity,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-            else:  # TOOL_ASSEMBLY
-                result = self.opencloning_adapter.simulate_assembly(
-                    context_token=context_token,
-                    sequences=step.args.get("sequences", []),
-                    source=step.args.get(
-                        "source", {"id": 0, "type": "GibsonAssemblySource"}
-                    ),
-                    mapped_identity=mapped_identity,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-            return result.to_dict()
-
-        # --- OpenCloning generic call (covers all API endpoints) ---
-        if step.tool_name == TOOL_CALL:
-            if self.opencloning_adapter is None:
-                raise OpenCloningAdapterError(
-                    reason="opencloning_not_configured",
-                    message=(
-                        "OpenCloning adapter not configured for plan execution "
-                        "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
-                    ),
-                )
-            result = self.opencloning_adapter.call_endpoint(
+            return self._execute_opencloning_read(
+                step=step,
                 context_token=context_token,
-                endpoint=step.args.get("endpoint", "/"),
-                body=step.args.get("body", {}),
                 mapped_identity=mapped_identity,
                 conversation_id=conversation_id,
                 request_id=request_id,
@@ -603,44 +570,21 @@ class PlanExecutor:
                 provider=provider,
                 model_id=model_id,
             )
-            return result.to_dict()
 
         # --- Wallac reads (C42) ---
         wallac_read_tools = {TOOL_WALLAC_STATUS, TOOL_WALLAC_VALIDATE}
         if step.tool_name in wallac_read_tools:
-            if self.wallac_adapter is None:
-                raise WallacAdapterError(
-                    reason="wallac_not_configured",
-                    message=(
-                        "Wallac adapter not configured for plan execution "
-                        "(set LAB_COPILOT_WALLAC_VM_AGENT_URL)"
-                    ),
-                )
-            if step.tool_name == TOOL_WALLAC_STATUS:
-                result = self.wallac_adapter.get_status(
-                    context_token=context_token,
-                    mapped_identity=mapped_identity,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-                return result.to_dict()
-            else:  # TOOL_WALLAC_VALIDATE
-                result = self.wallac_adapter.validate_generated_protocol(
-                    context_token=context_token,
-                    mapped_identity=mapped_identity,
-                    job_item_id=step.args.get("job_item_id", 0),
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                )
-                return result.to_dict()
+            return self._execute_wallac_read(
+                step=step,
+                context_token=context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
 
         # --- BentoLab reads (C43) ---
         bentolab_read_tools = {
@@ -699,6 +643,145 @@ class PlanExecutor:
             reason="unsupported_read_tool",
             message=f"plan read step tool {step.tool_name!r} not supported by plan executor",
         )
+
+    def _execute_opencloning_read(
+        self,
+        *,
+        step: PlanStep,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+    ) -> dict[str, Any]:
+        """Execute an OpenCloning read step."""
+        if self.opencloning_adapter is None:
+            raise OpenCloningAdapterError(
+                reason="opencloning_not_configured",
+                message=(
+                    "OpenCloning adapter not configured for plan execution "
+                    "(set LAB_COPILOT_OPENCLONING_BASE_URL)"
+                ),
+            )
+        if step.tool_name == TOOL_PARSE:
+            result = self.opencloning_adapter.parse_sequence_file(
+                context_token=context_token,
+                file_content=step.args.get("file_content", ""),
+                file_format=step.args.get("file_format", "genbank"),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        elif step.tool_name == TOOL_MANUAL:
+            result = self.opencloning_adapter.manual_sequence(
+                context_token=context_token,
+                sequence=step.args.get("sequence", ""),
+                circular=step.args.get("circular", False),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        elif step.tool_name == TOOL_OLIGO:
+            result = self.opencloning_adapter.oligo_hybridization(
+                context_token=context_token,
+                forward_oligo=step.args.get("forward_oligo", ""),
+                reverse_oligo=step.args.get("reverse_oligo", ""),
+                minimal_annealing=step.args.get("minimal_annealing", 20),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        elif step.tool_name == TOOL_CALL:
+            result = self.opencloning_adapter.call_endpoint(
+                context_token=context_token,
+                endpoint=step.args.get("endpoint", "/"),
+                body=step.args.get("body", {}),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        else:  # TOOL_ASSEMBLY
+            result = self.opencloning_adapter.simulate_assembly(
+                context_token=context_token,
+                sequences=step.args.get("sequences", []),
+                source=step.args.get(
+                    "source", {"id": 0, "type": "GibsonAssemblySource"}
+                ),
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        return result.to_dict()
+
+    def _execute_wallac_read(
+        self,
+        *,
+        step: PlanStep,
+        context_token: str,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+    ) -> dict[str, Any]:
+        """Execute a Wallac read step."""
+        if self.wallac_adapter is None:
+            raise WallacAdapterError(
+                reason="wallac_not_configured",
+                message=(
+                    "Wallac adapter not configured for plan execution "
+                    "(set LAB_COPILOT_WALLAC_VM_AGENT_URL)"
+                ),
+            )
+        if step.tool_name == TOOL_WALLAC_STATUS:
+            result = self.wallac_adapter.get_status(
+                context_token=context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        else:  # TOOL_WALLAC_VALIDATE
+            result = self.wallac_adapter.validate_generated_protocol(
+                context_token=context_token,
+                mapped_identity=mapped_identity,
+                job_item_id=step.args.get("job_item_id", 0),
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+            )
+        return result.to_dict()
 
     def _execute_write(
         self,

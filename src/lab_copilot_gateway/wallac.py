@@ -1463,39 +1463,22 @@ class WallacAdapter:
         )
 
         # 4. Policy decision (tier 5 HARDWARE_EXECUTION, requires approval).
-        policy_req = PolicyRequest(
+        self._check_policy(
             tool_name=TOOL_SUBMIT,
             tier=TOOL_TIER_SUBMIT,
             adapter="wallac",
-            user_id=mapped_identity.elabftw_user_id,
-            team_id=mapped_identity.elabftw_team_id,
+            mapped_identity=mapped_identity,
+            claims=claims,
             has_approval=bool(approval_id),
             approval_id=approval_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
         )
-        decision = self.policy_engine.decide(policy_req)
-
-        if decision.decision != "allow":
-            self._audit(
-                tool_name=TOOL_SUBMIT,
-                policy_decision="deny",
-                reason=decision.reason,
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=approval_id if approval_id else None,
-                error={
-                    "code": "POLICY_DENIED",
-                    "reason": decision.reason,
-                    "tier": decision.tier,
-                },
-            )
-            raise PolicyDenied(decision)
 
         # 5. Approval token consume (single-use, args-hash-bound).
         #    Happens AFTER policy allow, BEFORE the bridge call.
@@ -1550,30 +1533,19 @@ class WallacAdapter:
             effective_approval_id = approval_id
 
         # 6. Bridge client must be configured.
-        if self.bridge_client is None:
-            self._audit(
-                tool_name=TOOL_SUBMIT,
-                policy_decision="allow",
-                reason="wallac_bridge_not_configured",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=effective_approval_id,
-                error={"code": "WALLAC_BRIDGE_NOT_CONFIGURED"},
-            )
-            raise WallacAdapterError(
-                reason="wallac_bridge_not_configured",
-                message=(
-                    "Wallac bridge client not configured "
-                    "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
-                ),
-            )
+        self._ensure_bridge_configured(
+            tool_name=TOOL_SUBMIT,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=effective_approval_id,
+        )
 
         # 7. Bridge submit call.
         try:
@@ -2026,6 +1998,101 @@ class WallacAdapter:
                 raise InvalidContextToken(
                     "token librechat_user_id does not match resolved identity"
                 )
+
+    def _ensure_bridge_configured(
+        self,
+        *,
+        tool_name: str,
+        claims: Any,
+        mapped_identity: MappedIdentity,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        approval_id: str,
+    ) -> None:
+        """Raise WallacAdapterError if the bridge client is not configured."""
+        if self.bridge_client is not None:
+            return
+        self._audit(
+            tool_name=tool_name,
+            policy_decision="allow",
+            reason="wallac_bridge_not_configured",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=approval_id,
+            error={"code": "WALLAC_BRIDGE_NOT_CONFIGURED"},
+        )
+        raise WallacAdapterError(
+            reason="wallac_bridge_not_configured",
+            message=(
+                "Wallac bridge client not configured "
+                "(set LAB_COPILOT_WALLAC_BRIDGE_URL)"
+            ),
+        )
+
+    def _check_policy(
+        self,
+        *,
+        tool_name: str,
+        tier: Tier,
+        adapter: str,
+        mapped_identity: MappedIdentity,
+        claims: Any,
+        has_approval: bool,
+        approval_id: str | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Check policy and raise PolicyDenied if not allowed."""
+        policy_req = PolicyRequest(
+            tool_name=tool_name,
+            tier=tier,
+            adapter=adapter,
+            user_id=mapped_identity.elabftw_user_id,
+            team_id=mapped_identity.elabftw_team_id,
+            has_approval=has_approval,
+            approval_id=approval_id,
+        )
+        decision = self.policy_engine.decide(policy_req)
+        if decision.decision == "allow":
+            return
+        self._audit(
+            tool_name=tool_name,
+            policy_decision="deny",
+            reason=decision.reason,
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=approval_id if approval_id else None,
+            error={
+                "code": "POLICY_DENIED",
+                "reason": decision.reason,
+                "tier": decision.tier,
+            },
+        )
+        raise PolicyDenied(decision)
 
     # --- audit writer ----------------------------------------------------
 
