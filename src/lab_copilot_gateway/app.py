@@ -1548,7 +1548,15 @@ def create_app() -> FastAPI:
                             "reason": "missing_arg",
                             "message": "part_name is required",
                         }
-                    genbank_str = fetch_igem_part_as_genbank(part_name)
+                    try:
+                        genbank_str = fetch_igem_part_as_genbank(part_name)
+                    except ValueError as exc:
+                        return {
+                            "ok": False,
+                            "tool_name": tool.name,
+                            "reason": "client_error",
+                            "message": str(exc),
+                        }
                     return {
                         "ok": True,
                         "tool_name": tool.name,
