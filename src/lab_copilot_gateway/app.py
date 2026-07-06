@@ -27,6 +27,7 @@ from lab_copilot_gateway.auth import (
 )
 from lab_copilot_gateway.audit import AuditRecord, get_audit_store
 from lab_copilot_gateway.artifact_bundle import (
+    ArtifactBundleStore,
     ArtifactContextMismatch,
     ArtifactExpired,
     ArtifactHashMismatch,
