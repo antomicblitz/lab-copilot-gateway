@@ -388,6 +388,53 @@ def _normalize_metadata(value: Any) -> dict[str, Any] | None:
     return {"_raw": str(value)}
 
 
+def _merge_provenance_into_metadata(
+    metadata: dict[str, Any] | None,
+    audit_action_id: str,
+) -> dict[str, Any]:
+    """Merge a provenance audit_action_id into the experiment metadata dict.
+
+    Normalizes the metadata, then appends (or creates) a provenance entry
+    under the ``lab_copilot_audit_action_id`` extra field key.  Returns
+    the normalized, updated metadata dict.
+    """
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {"_raw": metadata}
+
+    extra_fields = metadata.get("extra_fields") or {}
+    if not isinstance(extra_fields, dict):
+        extra_fields = {}
+
+    provenance_key = "lab_copilot_audit_action_id"
+    if provenance_key not in extra_fields:
+        extra_fields[provenance_key] = {
+            "type": "text",
+            "value": audit_action_id,
+            "description": "gateway audit action id",
+        }
+    else:
+        current_entry = extra_fields[provenance_key]
+        current_value = (
+            current_entry.get("value", "")
+            if isinstance(current_entry, dict)
+            else str(current_entry)
+        )
+        if audit_action_id not in current_value:
+            new_value = (
+                f"{current_value}; {audit_action_id}"
+                if current_value
+                else audit_action_id
+            )
+            current_entry["value"] = new_value  # type: ignore[index]
+            current_entry.setdefault("description", "gateway audit action id")
+            extra_fields[provenance_key] = current_entry
+
+    metadata["extra_fields"] = extra_fields
+    return metadata
+
+
 # --- downstream client ---------------------------------------------------
 
 
@@ -1097,68 +1144,18 @@ class ElabftwReadAdapter:
         # resolved identity.  When the token also carries keycloak_subject or
         # librechat_user_id (issued alongside the identity at C11 launcher
         # time), cross-check those too — prevents cross-user token replay.
-        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
-            self._audit(
-                policy_decision="deny",
-                reason="context_token_user_mismatch",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
-            )
-            raise InvalidContextToken("token user does not match resolved identity")
-
-        if (
-            claims.keycloak_subject is not None
-            and mapped_identity.keycloak_subject is not None
-        ):
-            if claims.keycloak_subject != mapped_identity.keycloak_subject:
-                self._audit(
-                    policy_decision="deny",
-                    reason="context_token_kc_subject_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token keycloak_subject does not match resolved identity"
-                )
-
-        if (
-            claims.librechat_user_id is not None
-            and mapped_identity.librechat_user_id is not None
-        ):
-            if claims.librechat_user_id != mapped_identity.librechat_user_id:
-                self._audit(
-                    policy_decision="deny",
-                    reason="context_token_lc_user_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token librechat_user_id does not match resolved identity"
-                )
+        self._verify_identity_binding(
+            claims=claims,
+            mapped_identity=mapped_identity,
+            tool_name=TOOL_NAME,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 4. Policy decision.  Tier 2 read with mapped caller.
         policy_req = PolicyRequest(
@@ -2023,6 +2020,85 @@ class ElabftwReadAdapter:
             require_persistence=True,
         )
         return result
+
+    def _verify_identity_binding(
+        self,
+        *,
+        claims: Any,
+        mapped_identity: MappedIdentity,
+        tool_name: str,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Verify token-identity binding (three-way check).
+
+        Raises InvalidContextToken on mismatch (after audit).
+        """
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
 
     # --- audit writer ----------------------------------------------------
 
@@ -3205,41 +3281,7 @@ class ElabftwWriteAdapter:
         existing_metadata: dict[str, Any] | None = _normalize_metadata(
             current.get("metadata")
         )
-        if existing_metadata is None:
-            existing_metadata = dict()
-        if not isinstance(existing_metadata, dict):
-            existing_metadata = {"_raw": existing_metadata}
-        extra_fields = existing_metadata.get("extra_fields") or {}
-        if not isinstance(extra_fields, dict):
-            extra_fields = {}
-
-        # Append (or create) a list of audit_action_ids under a known key.
-        provenance_key = "lab_copilot_audit_action_id"
-        if provenance_key not in extra_fields:
-            extra_fields[provenance_key] = {
-                "type": "text",
-                "value": audit_action_id,
-                "description": "gateway audit action id",
-            }
-        else:
-            # If there's already a single value, promote to a list.
-            current_entry = extra_fields[provenance_key]
-            current_value = (
-                current_entry.get("value", "")
-                if isinstance(current_entry, dict)
-                else str(current_entry)
-            )
-            if audit_action_id not in current_value:
-                new_value = (
-                    f"{current_value}; {audit_action_id}"
-                    if current_value
-                    else audit_action_id
-                )
-                current_entry["value"] = new_value  # type: ignore[index]
-                current_entry.setdefault("description", "gateway audit action id")
-                extra_fields[provenance_key] = current_entry
-
-        existing_metadata["extra_fields"] = extra_fields
+        _merge_provenance_into_metadata(existing_metadata, audit_action_id)
 
         try:
             client.patch_experiment_metadata(experiment_id, existing_metadata)

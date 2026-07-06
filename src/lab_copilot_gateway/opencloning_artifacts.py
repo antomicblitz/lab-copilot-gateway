@@ -46,6 +46,63 @@ class NormalizedOpenCloningArtifacts:
         }
 
 
+def _normalize_empty_sequences_result(
+    result: dict[str, Any],
+    warnings: list[dict[str, Any]],
+    blocking_errors: list[dict[str, Any]],
+    provenance: dict[str, Any],
+) -> NormalizedOpenCloningArtifacts:
+    """Handle OpenCloning results that have no sequences.
+
+    Determines whether the result is a valid non-sequence output (primers,
+    analysis, rename) or a genuine failure, and returns the appropriate
+    NormalizedOpenCloningArtifacts.
+    """
+    # Primer design endpoints return {primers: [...]} with no sequences.
+    if result.get("primers"):
+        return NormalizedOpenCloningArtifacts(
+            summary=f"Designed {len(result['primers'])} primers.",
+            warnings=warnings,
+            blocking_errors=blocking_errors,
+            provenance=provenance,
+        )
+    # Analysis endpoints return analysis results, not sequences.
+    analysis_keys = {
+        "melting_temperature", "tm", "gc_content",
+        "heterodimer", "self_dimer", "hairpin",
+    }
+    if any(k in result for k in analysis_keys):
+        return NormalizedOpenCloningArtifacts(
+            summary="Analysis completed.",
+            warnings=warnings,
+            blocking_errors=blocking_errors,
+            provenance=provenance,
+        )
+    # Rename returns sources but no new sequences — not a failure.
+    if result.get("sources") and any(
+        s.get("type") == "RenameSequenceSource"
+        for s in result.get("sources", [])
+        if isinstance(s, dict)
+    ):
+        return NormalizedOpenCloningArtifacts(
+            summary="Sequence renamed.",
+            warnings=warnings,
+            blocking_errors=blocking_errors,
+            provenance=provenance,
+        )
+    blocking_errors.append({
+        "severity": "blocking_error",
+        "code": "no_final_sequence",
+        "message": "OpenCloning returned no final product sequence.",
+    })
+    return NormalizedOpenCloningArtifacts(
+        summary="OpenCloning produced no final construct.",
+        warnings=warnings,
+        blocking_errors=blocking_errors,
+        provenance=provenance,
+    )
+
+
 def normalize_opencloning_artifacts(
     result: dict[str, Any],
     *,
@@ -77,58 +134,8 @@ def normalize_opencloning_artifacts(
     }
 
     if not sequences:
-        # Primer design endpoints return {primers: [...]} with no sequences.
-        # This is an intermediate step, not a failure — don't block.
-        if result.get("primers"):
-            return NormalizedOpenCloningArtifacts(
-                summary=f"Designed {len(result['primers'])} primers.",
-                warnings=warnings,
-                blocking_errors=blocking_errors,
-                provenance=provenance,
-            )
-        # Analysis endpoints (primer_details, primer_heterodimer) return
-        # analysis results, not sequences. Don't treat as a failure.
-        if any(
-            k in result
-            for k in (
-                "melting_temperature",
-                "tm",
-                "gc_content",
-                "heterodimer",
-                "self_dimer",
-                "hairpin",
-            )
-        ):
-            return NormalizedOpenCloningArtifacts(
-                summary="Analysis completed.",
-                warnings=warnings,
-                blocking_errors=blocking_errors,
-                provenance=provenance,
-            )
-        # Rename returns sources but no new sequences — not a failure.
-        if result.get("sources") and any(
-            s.get("type") == "RenameSequenceSource"
-            for s in result.get("sources", [])
-            if isinstance(s, dict)
-        ):
-            return NormalizedOpenCloningArtifacts(
-                summary="Sequence renamed.",
-                warnings=warnings,
-                blocking_errors=blocking_errors,
-                provenance=provenance,
-            )
-        blocking_errors.append(
-            {
-                "severity": "blocking_error",
-                "code": "no_final_sequence",
-                "message": "OpenCloning returned no final product sequence.",
-            }
-        )
-        return NormalizedOpenCloningArtifacts(
-            summary="OpenCloning produced no final construct.",
-            warnings=warnings,
-            blocking_errors=blocking_errors,
-            provenance=provenance,
+        return _normalize_empty_sequences_result(
+            result, warnings, blocking_errors, provenance
         )
 
     if len(sequences) > 1:

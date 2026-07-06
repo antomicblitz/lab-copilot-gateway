@@ -615,6 +615,50 @@ TOOL_TIER = Tier.VALIDATION_DRY_RUN
 TOOL_TIER_WRITE = Tier.BOUNDED_WRITES
 
 
+def _parse_artifact_reference(
+    approval_args: dict[str, Any],
+    artifact_content: str | None,
+) -> dict[str, Any] | None:
+    """Parse artifact reference from approval_args, validating required fields.
+
+    Raises OpenCloningAdapterError if neither content nor valid reference is found.
+    Returns None if artifact_content is not None (legacy inline path).
+    Returns the reference dict if artifact_id is present and valid.
+    """
+    if artifact_content is not None:
+        return None
+    if approval_args.get("artifact_id"):
+        artifact_reference = {
+            "artifact_id": approval_args.get("artifact_id"),
+            "plan_id": approval_args.get("plan_id"),
+            "plan_hash": approval_args.get("plan_hash"),
+            "expected_sha256": approval_args.get("artifact_sha256"),
+            "expected_size_bytes": approval_args.get("artifact_size_bytes"),
+        }
+        required_fields = {
+            "artifact_id",
+            "plan_id",
+            "plan_hash",
+            "expected_sha256",
+            "expected_size_bytes",
+        }
+        missing = [
+            key
+            for key, value in artifact_reference.items()
+            if key in required_fields and (value is None or value == "")
+        ]
+        if missing:
+            raise OpenCloningAdapterError(
+                reason="missing_artifact_reference",
+                message=f"artifact bundle reference missing required fields: {missing}",
+            )
+        return artifact_reference
+    raise OpenCloningAdapterError(
+        reason="missing_artifact_payload",
+        message="writeback requires artifact_content or a complete artifact bundle reference",
+    )
+
+
 @dataclass
 class OpenCloningAdapter:
     """Orchestrates OpenCloning calls through the gateway-enforced path.
@@ -976,38 +1020,9 @@ class OpenCloningAdapter:
         artifact_comment = approval_args.get(
             "artifact_comment", "OpenCloning design artifact"
         )
-        artifact_reference = None
-        if artifact_content is None and approval_args.get("artifact_id"):
-            artifact_reference = {
-                "artifact_id": approval_args.get("artifact_id"),
-                "plan_id": approval_args.get("plan_id"),
-                "plan_hash": approval_args.get("plan_hash"),
-                "expected_sha256": approval_args.get("artifact_sha256"),
-                "expected_size_bytes": approval_args.get("artifact_size_bytes"),
-            }
-            missing = [
-                key
-                for key, value in artifact_reference.items()
-                if key
-                in {
-                    "artifact_id",
-                    "plan_id",
-                    "plan_hash",
-                    "expected_sha256",
-                    "expected_size_bytes",
-                }
-                and (value is None or value == "")
-            ]
-            if missing:
-                raise OpenCloningAdapterError(
-                    reason="missing_artifact_reference",
-                    message=f"artifact bundle reference missing required fields: {missing}",
-                )
-        elif artifact_content is None:
-            raise OpenCloningAdapterError(
-                reason="missing_artifact_payload",
-                message="writeback requires artifact_content or a complete artifact bundle reference",
-            )
+        artifact_reference = _parse_artifact_reference(
+            approval_args, artifact_content
+        )
 
         # The artifact content is the hash-bound payload.  Convert to bytes
         # for the eLabFTW upload_attachment call.

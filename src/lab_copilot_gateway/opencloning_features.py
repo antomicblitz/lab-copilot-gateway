@@ -147,6 +147,11 @@ def _extract_origin_sequence(genbank: str) -> str:
     return re.sub(r"[^A-Za-z]", "", origin_match.group(1)).upper()
 
 
+def _is_features_section_boundary(line: str) -> bool:
+    """Check if a line marks the end of the FEATURES section."""
+    return line.startswith("ORIGIN") or line.startswith("//")
+
+
 def _parse_features(genbank: str) -> list[dict[str, Any]]:
     """Parse FEATURES section into structured dicts.
 
@@ -161,7 +166,7 @@ def _parse_features(genbank: str) -> list[dict[str, Any]]:
         if line.startswith("FEATURES"):
             in_features = True
             continue
-        if in_features and (line.startswith("ORIGIN") or line.startswith("//")):
+        if in_features and _is_features_section_boundary(line):
             break
         if not in_features:
             continue
@@ -170,27 +175,41 @@ def _parse_features(genbank: str) -> list[dict[str, Any]]:
         if feat_match:
             if current:
                 features.append(current)
-            ftype = feat_match.group(1)
-            location_str = feat_match.group(2).strip()
-            start, end, strand = _parse_location(location_str)
-            current = {
-                "type": ftype,
-                "start": start,
-                "end": end,
-                "strand": strand,
-                "location_str": location_str,
-                "qualifiers": {},
-            }
-        elif current and re.match(r"^\s+/", line):
-            qual_match = re.match(r"^\s+/(\w+)=(.*)$", line)
-            if qual_match:
-                key = qual_match.group(1)
-                val = qual_match.group(2).strip().strip('"')
-                current["qualifiers"][key] = val
+            current = _parse_feature_match(feat_match)
+        elif current:
+            _parse_feature_qualifier(current, line)
 
     if current:
         features.append(current)
     return features
+
+
+def _parse_feature_match(match: re.Match[str]) -> dict[str, Any]:
+    """Parse a feature type/location match into a structured dict."""
+    ftype = match.group(1)
+    location_str = match.group(2).strip()
+    start, end, strand = _parse_location(location_str)
+    return {
+        "type": ftype,
+        "start": start,
+        "end": end,
+        "strand": strand,
+        "location_str": location_str,
+        "qualifiers": {},
+    }
+
+
+def _parse_feature_qualifier(
+    current: dict[str, Any], line: str
+) -> None:
+    """Parse a qualifier line (/key=value) into the current feature dict."""
+    if not re.match(r"^\s+/", line):
+        return
+    qual_match = re.match(r"^\s+/(\w+)=(.*)$", line)
+    if qual_match:
+        key = qual_match.group(1)
+        val = qual_match.group(2).strip().strip('"')
+        current["qualifiers"][key] = val
 
 
 def _parse_location(location_str: str) -> tuple[int, int, int]:
@@ -340,6 +359,30 @@ def _find_in_product(feat_seq: str, product_seq: str) -> tuple[int, int, int] | 
 # ---------------------------------------------------------------------------
 
 
+def _format_qualifier_lines(key: str, val: str) -> list[str]:
+    """Format a GenBank qualifier value, wrapping long values."""
+    lines: list[str] = []
+    val_str = f'/{key}="{val}"'
+    if len(val_str) <= 68:
+        lines.append(f"                     {val_str}")
+        return lines
+    # Wrap long qualifier values.
+    prefix = f'/{key}="'
+    suffix = '"'
+    inner = val
+    first_line_len = 68 - len(prefix)
+    lines.append(f"                     {prefix}{inner[:first_line_len]}")
+    inner = inner[first_line_len:]
+    while inner:
+        chunk = inner[:58]
+        inner = inner[58:]
+        if not inner:
+            lines.append(f"                     {chunk}{suffix}")
+        else:
+            lines.append(f"                     {chunk}")
+    return lines
+
+
 def _format_feature(feature: dict[str, Any]) -> str:
     """Format a feature dict as GenBank feature lines."""
     ftype = feature["type"]
@@ -365,25 +408,7 @@ def _format_feature(feature: dict[str, Any]) -> str:
     for key in ("product", "note", "codon_start", "translation"):
         val = qualifiers.get(key)
         if val and key not in ("label", "gene"):
-            # Handle long values (wrap at 58 chars, GenBank convention).
-            val_str = f'/{key}="{val}"'
-            if len(val_str) <= 68:
-                lines.append(f"                     {val_str}")
-            else:
-                # Wrap long qualifier values.
-                prefix = f'/{key}="'
-                suffix = '"'
-                inner = val
-                first_line_len = 68 - len(prefix)
-                lines.append(f"                     {prefix}{inner[:first_line_len]}")
-                inner = inner[first_line_len:]
-                while inner:
-                    chunk = inner[:58]
-                    inner = inner[58:]
-                    if not inner:
-                        lines.append(f"                     {chunk}{suffix}")
-                    else:
-                        lines.append(f"                     {chunk}")
+            lines.extend(_format_qualifier_lines(key, val))
     return "\n".join(lines)
 
 

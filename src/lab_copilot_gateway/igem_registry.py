@@ -150,6 +150,40 @@ def _format_sequence(sequence: str) -> str:
     return "\n".join(lines)
 
 
+def _build_feature_lines(annotations: list[dict[str, Any]]) -> list[str]:
+    """Build the GenBank FEATURES section from iGEM annotations."""
+    feature_lines: list[str] = ["FEATURES             Location/Qualifiers"]
+    for ann in annotations:
+        gb_type = _annotation_to_genbank_type(ann)
+        locations = _normalize_annotation_locations(ann)
+        strand = ann.get("strand", "forward")
+        label = ann.get("label", "")
+
+        for loc in locations:
+            start = loc.get("start", 0)
+            end = loc.get("end", 0)
+            if start is None or end is None or start == end:
+                continue
+            location_str = _format_location(start, end, strand)
+            feature_lines.append(f"     {gb_type:<16} {location_str}")
+            if label:
+                safe_label = label.replace('"', "'")
+                feature_lines.append(f'                     /label="{safe_label}"')
+    return feature_lines
+
+
+def _normalize_annotation_locations(ann: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize annotation locations, handling top-level start/end fallback."""
+    locations = ann.get("locations", [])
+    if not locations:
+        start = ann.get("start", 0)
+        end = ann.get("end", 0)
+        if start is None or end is None or start == end:
+            return []
+        return [{"start": start, "end": end}]
+    return locations
+
+
 def _to_genbank(
     part_name: str,
     sequence: str,
@@ -163,45 +197,15 @@ def _to_genbank(
     OpenCloning's ``/read_from_file`` endpoint accepts.
     """
     seq_len = len(sequence)
-    # LOCUS line: name padded to 16 chars, length right-justified.
     locus_name = part_name[:16] if part_name else "igem_part"
     locus_line = (
         f"LOCUS       {locus_name:<16} {seq_len:>11} bp    DNA     "
         f"linear   UNK 01-JAN-1980"
     )
 
-    # FEATURES section.
-    feature_lines: list[str] = ["FEATURES             Location/Qualifiers"]
-    for ann in annotations:
-        gb_type = _annotation_to_genbank_type(ann)
-        locations = ann.get("locations", [])
-        if not locations:
-            # Some annotations have start/end at top level.
-            start = ann.get("start", 0)
-            end = ann.get("end", 0)
-            if start is None or end is None or start == end:
-                continue
-            locations = [{"start": start, "end": end}]
-
-        strand = ann.get("strand", "forward")
-        label = ann.get("label", "")
-
-        for loc in locations:
-            start = loc.get("start", 0)
-            end = loc.get("end", 0)
-            if start is None or end is None or start == end:
-                continue
-            location_str = _format_location(start, end, strand)
-            feature_lines.append(f"     {gb_type:<16} {location_str}")
-            if label:
-                # Escape quotes in label.
-                safe_label = label.replace('"', "'")
-                feature_lines.append(f'                     /label="{safe_label}"')
-
-    # ORIGIN section.
+    feature_lines = _build_feature_lines(annotations)
     origin_block = _format_sequence(sequence)
 
-    # Assemble.
     parts = [
         locus_line,
         *feature_lines,

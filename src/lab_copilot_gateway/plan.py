@@ -309,40 +309,43 @@ def validate_plan(plan: Plan) -> list[str]:
     """
     errors: list[str] = []
 
-    # 1. plan_id
     if not plan.plan_id or not plan.plan_id.strip():
         errors.append("plan_id must be non-empty")
-
-    # 2. intent
     if not plan.intent or not plan.intent.strip():
         errors.append("intent must be non-empty")
-
-    # 3. summary
     if not plan.summary or not plan.summary.strip():
         errors.append("summary must be non-empty")
 
-    # 4. anchor
-    anchor = plan.anchor
-    if not isinstance(anchor, dict):
-        errors.append("anchor must be a dict")
-    else:
-        for key in ("system", "record_type", "record_id"):
-            if not anchor.get(key):
-                errors.append(f"anchor.{key} must be non-empty")
-
-    # 5. Steps must have tool_name. Writes must also have record_id.
+    _validate_anchor(plan.anchor, errors)
     _validate_steps(plan.reads, "reads", errors)
     _validate_steps(plan.writes, "writes", errors, require_record_id=True)
-
-    # 7. Hardware/autonomous plans must specify rollback
-    if plan.risk_tier >= PlanRiskTier.HARDWARE and not plan.rollback:
-        errors.append(f"risk_tier {plan.risk_tier.label} requires a rollback strategy")
-
-    # 8. Plans with writes must require approval
-    if plan.writes and not plan.approval_required:
-        errors.append("plans with writes must have approval_required=True")
+    _validate_rollback_and_approval(plan, errors)
 
     return errors
+
+
+def _validate_anchor(
+    anchor: dict[str, object], errors: list[str]
+) -> None:
+    """Validate the anchor dict has required fields."""
+    if not isinstance(anchor, dict):
+        errors.append("anchor must be a dict")
+        return
+    for key in ("system", "record_type", "record_id"):
+        if not anchor.get(key):
+            errors.append(f"anchor.{key} must be non-empty")
+
+
+def _validate_rollback_and_approval(
+    plan: Plan, errors: list[str]
+) -> None:
+    """Validate hardware rollback and write approval requirements."""
+    if plan.risk_tier >= PlanRiskTier.HARDWARE and not plan.rollback:
+        errors.append(
+            f"risk_tier {plan.risk_tier.label} requires a rollback strategy"
+        )
+    if plan.writes and not plan.approval_required:
+        errors.append("plans with writes must have approval_required=True")
 
 
 def validate_or_raise(plan: Plan) -> None:

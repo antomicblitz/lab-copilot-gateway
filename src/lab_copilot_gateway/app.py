@@ -645,21 +645,22 @@ def _invoke_elabftw_tool(
         return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
 
-def _invoke_elabftw_download_upload(
-    tool: Any,
+def _resolve_download_record_id(
     body: InvokeBody,
-) -> dict[str, object]:
-    """Handle elabftw.download_upload tool invocation."""
-    upload_id = int(body.args.get("upload_id", 0))
-    record_type = body.args.get("record_type", "experiments")
+) -> tuple[int, str, dict[str, object] | None]:
+    """Resolve record_id and record_type for download_upload.
+
+    Returns (record_id, record_type, error_dict).  If error_dict is not None,
+    the caller should return it as the error response.
+    """
     record_id = int(
         body.args.get("record_id", body.args.get("experiment_id", 0))
     )
+    record_type = body.args.get("record_type", "experiments")
     if record_id == 0:
         if not body.context_token:
-            return {
+            return 0, "", {
                 "ok": False,
-                "tool_name": tool.name,
                 "reason": "missing_record_id",
                 "message": "Provide record_id (experiment or item id), or call read_current_experiment first.",
             }
@@ -672,12 +673,25 @@ def _invoke_elabftw_download_upload(
                 else "experiments"
             )
         except Exception:
-            return {
+            return 0, "", {
                 "ok": False,
-                "tool_name": tool.name,
                 "reason": "invalid_context_token",
                 "message": "Could not resolve experiment id from context token. Provide record_id explicitly.",
             }
+    return record_id, record_type, None
+
+
+def _invoke_elabftw_download_upload(
+    tool: Any,
+    body: InvokeBody,
+) -> dict[str, object]:
+    """Handle elabftw.download_upload tool invocation."""
+    upload_id = int(body.args.get("upload_id", 0))
+    record_id, record_type, error = _resolve_download_record_id(body)
+    if error:
+        error["tool_name"] = tool.name
+        return error
+
     adapter = get_elabftw_read_adapter()
     if adapter.client is None:
         return {

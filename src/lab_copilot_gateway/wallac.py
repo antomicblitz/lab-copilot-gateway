@@ -1825,71 +1825,18 @@ class WallacAdapter:
             raise UnmappedCaller()
 
         # 3. Token-identity binding (three-way check).
-        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="context_token_user_mismatch",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
-            )
-            raise InvalidContextToken("token user does not match resolved identity")
-
-        if (
-            claims.keycloak_subject is not None
-            and mapped_identity.keycloak_subject is not None
-        ):
-            if claims.keycloak_subject != mapped_identity.keycloak_subject:
-                self._audit(
-                    tool_name=tool_name,
-                    policy_decision="deny",
-                    reason="context_token_kc_subject_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token keycloak_subject does not match resolved identity"
-                )
-
-        if (
-            claims.librechat_user_id is not None
-            and mapped_identity.librechat_user_id is not None
-        ):
-            if claims.librechat_user_id != mapped_identity.librechat_user_id:
-                self._audit(
-                    tool_name=tool_name,
-                    policy_decision="deny",
-                    reason="context_token_lc_user_mismatch",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
-                )
-                raise InvalidContextToken(
-                    "token librechat_user_id does not match resolved identity"
-                )
+        self._verify_identity_binding(
+            claims=claims,
+            mapped_identity=mapped_identity,
+            tool_name=tool_name,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 4. Policy decision (tier from override or default).
         effective_tier = tier_override if tier_override is not None else TOOL_TIER
@@ -2048,6 +1995,90 @@ class WallacAdapter:
             result=result,
             audit_action_id=action_id,
         )
+
+    def _verify_identity_binding(
+        self,
+        *,
+        claims: Any,
+        mapped_identity: MappedIdentity,
+        tool_name: str,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> None:
+        """Verify token-identity binding (three-way check).
+
+        Raises InvalidContextToken on mismatch (after audit).
+        """
+        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="context_token_user_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+            )
+            raise InvalidContextToken("token user does not match resolved identity")
+
+        if (
+            claims.keycloak_subject is not None
+            and mapped_identity.keycloak_subject is not None
+        ):
+            if claims.keycloak_subject != mapped_identity.keycloak_subject:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_kc_subject_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_KC_SUBJECT_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token keycloak_subject does not match resolved identity"
+                )
+
+        if (
+            claims.librechat_user_id is not None
+            and mapped_identity.librechat_user_id is not None
+        ):
+            if claims.librechat_user_id != mapped_identity.librechat_user_id:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_lc_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    error={"code": "CONTEXT_TOKEN_LC_USER_MISMATCH"},
+                )
+                raise InvalidContextToken(
+                    "token librechat_user_id does not match resolved identity"
+                )
 
     # --- audit writer ----------------------------------------------------
 

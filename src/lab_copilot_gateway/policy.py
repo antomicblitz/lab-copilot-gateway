@@ -182,7 +182,13 @@ class PolicyEngine:
             matched.append("all")
             return matched
 
-        # Tier-based categories.
+        matched.extend(self._matched_tier_categories(req))
+        matched.extend(self._matched_adapter_categories(req))
+        return matched
+
+    def _matched_tier_categories(self, req: PolicyRequest) -> list[str]:
+        """Check tier-based kill switch categories."""
+        matched: list[str] = []
         if self.kill_categories.get("mutating", False) and req.tier >= int(
             Tier.BOUNDED_WRITES
         ):
@@ -195,9 +201,11 @@ class PolicyEngine:
             Tier.CLOSED_LOOP_AUTONOMY
         ):
             matched.append("autonomy")
+        return matched
 
-        # Adapter-specific categories.  Use the explicit ``adapter`` field
-        # if provided; otherwise extract the first segment of the tool name.
+    def _matched_adapter_categories(self, req: PolicyRequest) -> list[str]:
+        """Check adapter-specific kill switch categories."""
+        matched: list[str] = []
         adapter = req.adapter
         if adapter is None and "." in req.tool_name:
             adapter = req.tool_name.split(".", 1)[0]
