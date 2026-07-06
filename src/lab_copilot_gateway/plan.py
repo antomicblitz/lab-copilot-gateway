@@ -281,6 +281,27 @@ def compute_plan_hash(plan: Plan) -> str:
 # --- validation --------------------------------------------------------------
 
 
+def _validate_steps(
+    steps: list[PlanStep],
+    group_name: str,
+    errors: list[str],
+    *,
+    require_record_id: bool = False,
+) -> None:
+    """Validate steps have tool_name and no forbidden fields. Optionally require record_id."""
+    for i, step in enumerate(steps):
+        if not step.tool_name or not step.tool_name.strip():
+            errors.append(f"{group_name}[{i}].tool_name must be non-empty")
+        if require_record_id and not step.record_id:
+            errors.append(f"{group_name}[{i}].record_id must be non-empty")
+        for forbidden in _FORBIDDEN_RAW_ENDPOINT_FIELDS:
+            if forbidden in step.args:
+                errors.append(
+                    f"{group_name}[{i}].args contains forbidden "
+                    f"raw-endpoint field {forbidden!r}"
+                )
+
+
 def validate_plan(plan: Plan) -> list[str]:
     """Validate a plan.  Returns a list of error strings (empty = valid).
 
@@ -317,27 +338,9 @@ def validate_plan(plan: Plan) -> list[str]:
             if not anchor.get(key):
                 errors.append(f"anchor.{key} must be non-empty")
 
-    # 5. Write steps must have tool_name and record_id
-    for i, step in enumerate(plan.writes):
-        if not step.tool_name or not step.tool_name.strip():
-            errors.append(f"writes[{i}].tool_name must be non-empty")
-        if not step.record_id:
-            errors.append(f"writes[{i}].record_id must be non-empty")
-
-    # Also check reads have tool_name
-    for i, step in enumerate(plan.reads):
-        if not step.tool_name or not step.tool_name.strip():
-            errors.append(f"reads[{i}].tool_name must be non-empty")
-
-    # 6. No forbidden raw-endpoint fields in any step's args
-    for group_name, steps in (("reads", plan.reads), ("writes", plan.writes)):
-        for i, step in enumerate(steps):
-            for forbidden in _FORBIDDEN_RAW_ENDPOINT_FIELDS:
-                if forbidden in step.args:
-                    errors.append(
-                        f"{group_name}[{i}].args contains forbidden "
-                        f"raw-endpoint field {forbidden!r}"
-                    )
+    # 5. Steps must have tool_name. Writes must also have record_id.
+    _validate_steps(plan.reads, "reads", errors)
+    _validate_steps(plan.writes, "writes", errors, require_record_id=True)
 
     # 7. Hardware/autonomous plans must specify rollback
     if plan.risk_tier >= PlanRiskTier.HARDWARE and not plan.rollback:
