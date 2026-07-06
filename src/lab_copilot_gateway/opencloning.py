@@ -412,6 +412,22 @@ class HttpOpenCloningClient:
         return resp.json()
 
 
+def _inject_one_sequence(
+    seq: Any, store: dict[str, dict[str, Any]]
+) -> None:
+    """Inject file_content into a single sequence dict if needed."""
+    if not isinstance(seq, dict):
+        return
+    fc = seq.get("file_content")
+    if fc is None or (isinstance(fc, dict) and fc.get("redacted")):
+        seq_id = str(seq.get("id", ""))
+        stored = store.get(seq_id)
+        if stored and "file_content" in stored:
+            seq["file_content"] = stored["file_content"]
+        elif fc is not None:
+            del seq["file_content"]
+
+
 def _inject_file_content_from_store(
     body: dict[str, Any], store: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
@@ -435,17 +451,7 @@ def _inject_file_content_from_store(
     """
 
     def _inject_one(seq: Any) -> None:
-        """Inject file_content into a single sequence dict if needed."""
-        if not isinstance(seq, dict):
-            return
-        fc = seq.get("file_content")
-        if fc is None or (isinstance(fc, dict) and fc.get("redacted")):
-            seq_id = str(seq.get("id", ""))
-            stored = store.get(seq_id)
-            if stored and "file_content" in stored:
-                seq["file_content"] = stored["file_content"]
-            elif fc is not None:
-                del seq["file_content"]
+        _inject_one_sequence(seq, store)
 
     # Top-level sequences array (used by /pcr, /gibson_assembly, /restriction, etc.)
     sequences = body.get("sequences")
@@ -493,8 +499,19 @@ def _rewrite_opencloning_result_ids(
     must keep source ids aligned with their output sequence ids so OpenCloning's
     frontend can reconstruct the graph.
     """
-    id_map: dict[str, int] = {}
+    next_id, id_map = _rewrite_sequence_ids(result, store, next_id)
+    if id_map:
+        _rewrite_source_ids(result, id_map)
+    return next_id
 
+
+def _rewrite_sequence_ids(
+    result: dict[str, Any],
+    store: dict[str, dict[str, Any]],
+    next_id: int,
+) -> tuple[int, dict[str, int]]:
+    """Assign gateway-unique ids to sequences and store them."""
+    id_map: dict[str, int] = {}
     for seq in result.get("sequences", []):
         if not isinstance(seq, dict) or "file_content" not in seq:
             continue
@@ -504,31 +521,39 @@ def _rewrite_opencloning_result_ids(
         next_id += 1
         new_id = next_id
         id_map[old_id] = new_id
-
         stored = dict(seq)
         stored["original_id"] = old_id
         store[str(new_id)] = stored
         seq["id"] = new_id
+    return next_id, id_map
 
-    if not id_map:
-        return next_id
 
+def _rewrite_source_ids(
+    result: dict[str, Any], id_map: dict[str, int]
+) -> None:
+    """Rewrite source ids and input sequence references using id_map."""
     for src in result.get("sources", []):
         if not isinstance(src, dict):
             continue
         src_id = str(src.get("id", ""))
         if src_id in id_map:
             src["id"] = id_map[src_id]
-        inputs = src.get("input")
-        if isinstance(inputs, list):
-            for item in inputs:
-                if not isinstance(item, dict):
-                    continue
-                seq_ref = str(item.get("sequence", ""))
-                if seq_ref in id_map:
-                    item["sequence"] = id_map[seq_ref]
+        _rewrite_source_inputs(src, id_map)
 
-    return next_id
+
+def _rewrite_source_inputs(
+    src: dict[str, Any], id_map: dict[str, int]
+) -> None:
+    """Rewrite sequence references in a source's input list."""
+    inputs = src.get("input")
+    if not isinstance(inputs, list):
+        return
+    for item in inputs:
+        if not isinstance(item, dict):
+            continue
+        seq_ref = str(item.get("sequence", ""))
+        if seq_ref in id_map:
+            item["sequence"] = id_map[seq_ref]
 
 
 def _generic_sequence_name(name: Any) -> bool:
