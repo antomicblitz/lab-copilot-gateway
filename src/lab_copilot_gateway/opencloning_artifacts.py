@@ -428,6 +428,14 @@ def _genbank_feature_count(file_content: str) -> int:
     return count
 
 
+def _parse_genbank_feature_line(match: re.Match[str]) -> dict[str, str]:
+    """Parse a GenBank feature type/location line into a dict."""
+    ftype = match.group(1)
+    location = match.group(2).strip()
+    strand = "reverse" if "complement" in location else "forward"
+    return {"type": ftype, "location": location, "strand": strand, "label": ""}
+
+
 def _genbank_features(file_content: str) -> list[dict[str, str]]:
     """Extract feature types, locations, and labels from a GenBank file.
 
@@ -441,38 +449,44 @@ def _genbank_features(file_content: str) -> list[dict[str, str]]:
         if line.startswith("FEATURES"):
             in_features = True
             continue
-        if in_features and (line.startswith("ORIGIN") or line.startswith("//")):
+        if in_features and _is_genbank_section_boundary(line):
             break
         if not in_features:
             continue
-        # Feature lines start at column 5 with a type name.
         feat_match = re.match(r"^\s{5}(\S+)\s+(.+)$", line)
         if feat_match:
             if current:
                 features.append(current)
-            ftype = feat_match.group(1)
-            location = feat_match.group(2).strip()
-            strand = "reverse" if "complement" in location else "forward"
-            current = {
-                "type": ftype,
-                "location": location,
-                "strand": strand,
-                "label": "",
-            }
-        elif current and re.match(r"^\s+/", line):
-            qual_match = re.match(r"^\s+/(\w+)=(.*)$", line)
-            if qual_match and qual_match.group(1) == "label":
-                current["label"] = qual_match.group(2).strip().strip('"')
-            elif qual_match and qual_match.group(1) == "gene":
-                if not current["label"]:
-                    current["label"] = qual_match.group(2).strip().strip('"')
-            elif qual_match and qual_match.group(1) == "product":
-                if not current["label"]:
-                    current["label"] = qual_match.group(2).strip().strip('"')
+            current = _parse_genbank_feature_line(feat_match)
+        elif current:
+            _genbank_feature_qualifier(current, line)
     if current:
         features.append(current)
-    # Limit to 50 features to keep the manifest compact.
     return features[:50]
+
+
+def _is_genbank_section_boundary(line: str) -> bool:
+    """Check if a line marks the end of the FEATURES section."""
+    return line.startswith("ORIGIN") or line.startswith("//")
+
+
+def _genbank_feature_qualifier(
+    current: dict[str, str], line: str
+) -> None:
+    """Parse a qualifier line, extracting label/gene/product."""
+    if not re.match(r"^\s+/", line):
+        return
+    qual_match = re.match(r"^\s+/(\w+)=(.*)$", line)
+    if not qual_match:
+        return
+    key = qual_match.group(1)
+    val = qual_match.group(2).strip().strip('"')
+    if key == "label":
+        current["label"] = val
+    elif key == "gene" and not current["label"]:
+        current["label"] = val
+    elif key == "product" and not current["label"]:
+        current["label"] = val
 
 
 def _int_or_none(value: Any) -> int | None:

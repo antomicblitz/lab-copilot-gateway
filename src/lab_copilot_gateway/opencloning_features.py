@@ -48,6 +48,55 @@ _MAX_NEW_FEATURES = 50
 _COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
 
+def _extract_features_from_template(
+    *,
+    template_content: str,
+    final_seq: str,
+    existing_labels: set[tuple[str, int, int]],
+    new_features: list[dict[str, Any]],
+    seen_seqs: set[str],
+) -> None:
+    """Extract matching features from a template and add to new_features."""
+    tmpl_seq = _extract_origin_sequence(template_content)
+    if not tmpl_seq:
+        return
+
+    tmpl_features = _parse_features(template_content)
+
+    for feat in tmpl_features:
+        if len(new_features) >= _MAX_NEW_FEATURES:
+            break
+        if feat["type"].lower() not in _FEATURE_TYPES_OF_INTEREST:
+            continue
+
+        feat_seq = _extract_feature_sequence(feat, tmpl_seq)
+        if not feat_seq or len(feat_seq) < _MIN_FEATURE_LEN:
+            continue
+        if feat_seq in seen_seqs:
+            continue
+
+        match = _find_in_product(feat_seq, final_seq)
+        if match is None:
+            continue
+
+        start, end, strand = match
+        key = (feat["type"], start, end)
+        if key in existing_labels:
+            continue
+        existing_labels.add(key)
+
+        seen_seqs.add(feat_seq)
+        qualifiers = dict(feat["qualifiers"])
+        qualifiers["note"] = "lab-copilot:insert"
+        new_features.append({
+            "type": feat["type"],
+            "start": start,
+            "end": end,
+            "strand": strand,
+            "qualifiers": qualifiers,
+        })
+
+
 def rewrite_genbank_features(
     final_genbank: str,
     template_sequences: Sequence[dict[str, Any]],
@@ -77,52 +126,13 @@ def rewrite_genbank_features(
         if not isinstance(fc, str) or fc == final_genbank:
             continue
 
-        tmpl_seq = _extract_origin_sequence(fc)
-        if not tmpl_seq:
-            continue
-
-        tmpl_features = _parse_features(fc)
-
-        for feat in tmpl_features:
-            if len(new_features) >= _MAX_NEW_FEATURES:
-                break
-            if feat["type"].lower() not in _FEATURE_TYPES_OF_INTEREST:
-                continue
-
-            feat_seq = _extract_feature_sequence(feat, tmpl_seq)
-            if not feat_seq or len(feat_seq) < _MIN_FEATURE_LEN:
-                continue
-
-            # Skip if we've already matched this exact sequence.
-            if feat_seq in seen_seqs:
-                continue
-
-            match = _find_in_product(feat_seq, final_seq)
-            if match is None:
-                continue
-
-            start, end, strand = match
-
-            # Skip duplicates (same type at same position).
-            key = (feat["type"], start, end)
-            if key in existing_labels:
-                continue
-            existing_labels.add(key)
-
-            seen_seqs.add(feat_seq)
-            # Mark recovered features so the OVE preview can identify the
-            # inserted sequence (instead of guessing from feature names).
-            qualifiers = dict(feat["qualifiers"])
-            qualifiers["note"] = "lab-copilot:insert"
-            new_features.append(
-                {
-                    "type": feat["type"],
-                    "start": start,
-                    "end": end,
-                    "strand": strand,
-                    "qualifiers": qualifiers,
-                }
-            )
+        _extract_features_from_template(
+            template_content=fc,
+            final_seq=final_seq,
+            existing_labels=existing_labels,
+            new_features=new_features,
+            seen_seqs=seen_seqs,
+        )
 
     if not new_features:
         return final_genbank
@@ -251,60 +261,64 @@ def _extract_feature_sequence(feat: dict[str, Any], template_seq: str) -> str:
     if not loc:
         return ""
 
-    # Determine complement.
     is_complement = loc.startswith("complement(")
     inner = loc[len("complement(") :] if is_complement else loc
     inner = inner.rstrip(")")
 
-    # Parse all location parts.
-    parts: list[tuple[int, int]] = []
-    if inner.startswith("join("):
-        inner = inner[len("join(") :].rstrip(")")
-        for part_str in inner.split(","):
-            part_str = part_str.strip()
-            nums = [int(n) for n in re.findall(r"\d+", part_str)]
-            if len(nums) >= 2:
-                parts.append((nums[0], nums[1]))
-            elif len(nums) == 1:
-                parts.append((nums[0], nums[0]))
-    else:
-        nums = [int(n) for n in re.findall(r"\d+", inner)]
-        if len(nums) >= 2:
-            parts.append((nums[0], nums[1]))
-        elif len(nums) == 1:
-            parts.append((nums[0], nums[0]))
-
+    parts = _parse_location_parts(inner)
     if not parts:
         return ""
 
-    seq_len = len(template_seq)
-
-    # Extract and concatenate each part.
-    chunks: list[str] = []
-    for start, end in parts:
-        if start <= end:
-            # Normal: within the same strand.
-            if end > seq_len:
-                return ""  # malformed
-            chunks.append(template_seq[start - 1 : end])
-        else:
-            # Spans the origin (circular): start > end.
-            # E.g., join(9700..9752,1..100) with parts (9700,9752) and (1,100).
-            # The wrapping part has start > end only when the origin-spanning
-            # segment is encoded as a single part like 9700..100.  In practice
-            # join() with two separate parts handles this (see above).
-            # Handle the edge case anyway.
-            if start > seq_len:
-                return ""
-            chunks.append(template_seq[start - 1 : seq_len])
-            chunks.append(template_seq[0:end])
-
-    result = "".join(chunks)
-
+    result = _extract_parts_sequence(parts, template_seq)
     if is_complement:
         result = _reverse_complement(result)
 
     return result
+
+
+def _parse_location_parts(inner: str) -> list[tuple[int, int]]:
+    """Parse a GenBank location string (without complement wrapper) into parts."""
+    parts: list[tuple[int, int]] = []
+    if inner.startswith("join("):
+        inner = inner[len("join(") :].rstrip(")")
+        for part_str in inner.split(","):
+            part = _parse_single_location(part_str.strip())
+            if part:
+                parts.append(part)
+    else:
+        part = _parse_single_location(inner)
+        if part:
+            parts.append(part)
+    return parts
+
+
+def _parse_single_location(part_str: str) -> tuple[int, int] | None:
+    """Parse a single location part (e.g. '100..500') into (start, end)."""
+    nums = [int(n) for n in re.findall(r"\d+", part_str)]
+    if len(nums) >= 2:
+        return (nums[0], nums[1])
+    if len(nums) == 1:
+        return (nums[0], nums[0])
+    return None
+
+
+def _extract_parts_sequence(
+    parts: list[tuple[int, int]], template_seq: str
+) -> str:
+    """Extract and concatenate nucleotide chunks from location parts."""
+    seq_len = len(template_seq)
+    chunks: list[str] = []
+    for start, end in parts:
+        if start <= end:
+            if end > seq_len:
+                return ""
+            chunks.append(template_seq[start - 1 : end])
+        else:
+            if start > seq_len:
+                return ""
+            chunks.append(template_seq[start - 1 : seq_len])
+            chunks.append(template_seq[0:end])
+    return "".join(chunks)
 
 
 def _reverse_complement(seq: str) -> str:
