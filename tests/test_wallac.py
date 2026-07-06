@@ -1198,17 +1198,20 @@ def test_submit_elabftw_provenance_written(
         job_item_id=99,
     )
 
-    # eLabFTW experiment 42 should have provenance metadata
+    # eLabFTW experiment 42 should have provenance metadata in the validated
+    # {type, value, description} object format.
     exp = stub_elabftw.get_experiment(42)
     assert exp["metadata"] is not None
     meta = exp["metadata"]
     extra = meta.get("extra_fields", {})
-    assert extra.get("wallac_job_id") == 1
-    assert extra.get("wallac_job_status") == "submitted"
-    assert extra.get("wallac_bridge_audit_action_id") == "bridge-audit-1"
-    assert extra.get("wallac_submit_tool") == TOOL_SUBMIT
-    assert extra.get("wallac_gateway_audit_action_id") is not None
-    assert result.audit_action_id == extra["wallac_gateway_audit_action_id"]
+    assert extra.get("wallac_job_id", {}).get("value") == "1"
+    assert extra.get("wallac_job_status", {}).get("value") == "submitted"
+    assert extra.get("wallac_bridge_audit_action_id", {}).get("value") == "bridge-audit-1"
+    assert extra.get("wallac_submit_tool", {}).get("value") == TOOL_SUBMIT
+    assert extra.get("wallac_gateway_audit_action_id", {}).get("value") is not None
+    assert (
+        result.audit_action_id == extra["wallac_gateway_audit_action_id"]["value"]
+    )
 
 
 # --- result package includes audit ID (acceptance check) --------------------

@@ -391,12 +391,15 @@ def _normalize_metadata(value: Any) -> dict[str, Any] | None:
 def _merge_provenance_into_metadata(
     metadata: dict[str, Any] | None,
     audit_action_id: str,
+    extra_values: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Merge a provenance audit_action_id into the experiment metadata dict.
 
     Normalizes the metadata, then appends (or creates) a provenance entry
-    under the ``lab_copilot_audit_action_id`` extra field key.  Returns
-    the normalized, updated metadata dict.
+    under the ``lab_copilot_audit_action_id`` extra field key.  Optional
+    ``extra_values`` are stored as additional text extra fields (e.g.
+    tool name, upload id, job id).  Returns the normalized, updated
+    metadata dict.
     """
     if metadata is None:
         metadata = {}
@@ -430,6 +433,13 @@ def _merge_provenance_into_metadata(
             current_entry["value"] = new_value  # type: ignore[index]
             current_entry.setdefault("description", "gateway audit action id")
             extra_fields[provenance_key] = current_entry
+
+    for key, value in (extra_values or {}).items():
+        extra_fields[key] = {
+            "type": "text",
+            "value": value,
+            "description": f"lab copilot {key}",
+        }
 
     metadata["extra_fields"] = extra_fields
     return metadata

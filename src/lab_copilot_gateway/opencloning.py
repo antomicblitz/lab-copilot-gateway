@@ -52,6 +52,7 @@ from lab_copilot_gateway.elabftw import (
     ElabftwClient,
     InvalidContextToken,
     UnmappedCaller,
+    _merge_provenance_into_metadata,
     verify_context_token,
 )
 from lab_copilot_gateway.identity import MappedIdentity
@@ -1782,15 +1783,28 @@ class OpenCloningAdapter:
 
         assert self.elabftw_client is not None
         try:
+            # Read existing metadata so we don't clobber it; then merge the
+            # lab-copilot provenance extra fields in the eLabFTW-valid
+            # {type, value, description} object format.
+            if rt_param == "items":
+                current_record = self.elabftw_client.get_item(int(claims.experiment_id))
+            else:
+                current_record = self.elabftw_client.get_experiment(
+                    int(claims.experiment_id)
+                )
+            existing_metadata = current_record.get("metadata") or {}
+            updated_metadata = _merge_provenance_into_metadata(
+                existing_metadata,
+                action_id,
+                {
+                    "lab_copilot_audit_id": action_id,
+                    "lab_copilot_tool": TOOL_WRITEBACK,
+                    "lab_copilot_upload_id": str(upload_id),
+                },
+            )
             self.elabftw_client.patch_experiment_metadata(
                 experiment_id=claims.experiment_id,
-                metadata={
-                    "extra_fields": {
-                        "lab_copilot_audit_id": action_id,
-                        "lab_copilot_tool": TOOL_WRITEBACK,
-                        "lab_copilot_upload_id": upload_id,
-                    }
-                },
+                metadata=updated_metadata,
                 record_type=rt_param,
             )
         except Exception:

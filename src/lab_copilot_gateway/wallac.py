@@ -56,6 +56,7 @@ from lab_copilot_gateway.elabftw import (
     ElabftwClient,
     InvalidContextToken,
     UnmappedCaller,
+    _merge_provenance_into_metadata,
     verify_context_token,
 )
 from lab_copilot_gateway.identity import MappedIdentity
@@ -1586,19 +1587,31 @@ class WallacAdapter:
         # 9. eLabFTW provenance writeback (best-effort, non-fatal).
         if self.elabftw_client is not None:
             try:
+                record_id = int(claims.experiment_id)
+                if claims.record_type == "resource":
+                    current_record = self.elabftw_client.get_item(record_id)
+                    rt_param = "items"
+                else:
+                    current_record = self.elabftw_client.get_experiment(record_id)
+                    rt_param = "experiments"
+                existing_metadata = current_record.get("metadata") or {}
+                updated_metadata = _merge_provenance_into_metadata(
+                    existing_metadata,
+                    action_id,
+                    {
+                        "wallac_job_id": str(bridge_result.get("job_id") or ""),
+                        "wallac_job_status": str(bridge_result.get("status") or ""),
+                        "wallac_bridge_audit_action_id": str(
+                            bridge_result.get("audit_action_id") or ""
+                        ),
+                        "wallac_submit_tool": TOOL_SUBMIT,
+                        "wallac_gateway_audit_action_id": action_id,
+                    },
+                )
                 self.elabftw_client.patch_experiment_metadata(
                     experiment_id=claims.experiment_id,
-                    metadata={
-                        "extra_fields": {
-                            "wallac_job_id": bridge_result.get("job_id"),
-                            "wallac_job_status": bridge_result.get("status"),
-                            "wallac_bridge_audit_action_id": bridge_result.get(
-                                "audit_action_id"
-                            ),
-                            "wallac_submit_tool": TOOL_SUBMIT,
-                            "wallac_gateway_audit_action_id": action_id,
-                        }
-                    },
+                    metadata=updated_metadata,
+                    record_type=rt_param,
                 )
             except Exception:
                 # Provenance write failure is not fatal — the job was

@@ -861,12 +861,18 @@ def test_writeback_attaches_artifact_to_experiment(
     assert uploads[0]["real_name"] == "construct.gb"
     assert uploads[0]["comment"] == "OpenCloning design artifact"
 
-    # Verify provenance was written to metadata.
+    # Verify provenance was written to metadata in the eLabFTW-valid
+    # {type, value, description} object format.
     metadata = elabftw_stub.seeds[42]["metadata"]
     assert "extra_fields" in metadata
     assert "lab_copilot_audit_id" in metadata["extra_fields"]
     assert (
-        metadata["extra_fields"]["lab_copilot_tool"] == "opencloning.writeback_artifact"
+        metadata["extra_fields"]["lab_copilot_tool"]["value"]
+        == "opencloning.writeback_artifact"
+    )
+    assert (
+        metadata["extra_fields"]["lab_copilot_audit_id"]["value"]
+        == metadata["extra_fields"]["lab_copilot_audit_action_id"]["value"]
     )
 
     # Verify audit row.
@@ -1144,7 +1150,10 @@ def test_writeback_audit_id_in_provenance(
 
     # The audit_action_id should be in the experiment's metadata.
     metadata = elabftw_stub.seeds[42]["metadata"]
-    assert metadata["extra_fields"]["lab_copilot_audit_id"] == result.audit_action_id
+    assert (
+        metadata["extra_fields"]["lab_copilot_audit_id"]["value"]
+        == result.audit_action_id
+    )
 
 
 # --- writeback: client error ------------------------------------------------
