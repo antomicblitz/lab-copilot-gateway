@@ -59,6 +59,7 @@ from lab_copilot_gateway.opencloning import (
     get_opencloning_adapter,
 )
 from lab_copilot_gateway.opencloning_artifacts import normalize_opencloning_artifacts
+from lab_copilot_gateway.opencloning_previews import get_preview_store
 from lab_copilot_gateway.wallac import (
     WallacAdapter,
     WallacAdapterError,
@@ -443,6 +444,17 @@ def _opencloning_invoke_success(
     plan_hash = compute_args_hash(
         {"tool_name": tool_name, "audit_action_id": result.audit_action_id}
     )
+
+    # Capture preview refs for OVE: store sequence GenBank/Fasta payloads
+    # in the short-lived preview store so the widget can fetch them on-demand.
+    token_hash = hashlib.sha256(context_token.encode()).hexdigest()
+    preview_refs = _capture_opencloning_preview_refs(
+        raw_result,
+        run_id=plan_id,
+        step_id=result.audit_action_id,
+        context_token_hash=token_hash,
+    )
+
     normalized = normalize_opencloning_artifacts(
         raw_result,
         plan_id=plan_id,
@@ -498,12 +510,57 @@ def _opencloning_invoke_success(
             "artifacts": manifests,
         }
     )
+
+    redacted_result = _redact_opencloning_file_content(raw)
+    # Annotate each sequence in the redacted result with its preview_ref
+    # so the widget can pass it to the fetch endpoint.
+    _inject_preview_refs_into_result(redacted_result, preview_refs)
+
     return {
         "ok": True,
         "tool_name": tool_name,
-        "result": _redact_opencloning_file_content(raw),
+        "result": redacted_result,
         "opencloning_artifacts": artifact_payload,
     }
+
+
+def _capture_opencloning_preview_refs(
+    raw_result: dict[str, Any],
+    run_id: str,
+    step_id: str,
+    context_token_hash: str,
+) -> dict[int, str]:
+    """Store OpenCloning sequence payloads in the preview store.
+
+    Delegates to the adapter's ``capture_preview_refs`` method to
+    extract file_content from each sequence and store it in the
+    short-lived preview store.
+    """
+    adapter = get_opencloning_adapter()
+    return adapter.capture_preview_refs(
+        result=raw_result,
+        run_id=run_id,
+        step_id=step_id,
+        context_token_hash=context_token_hash,
+    )
+
+
+def _inject_preview_refs_into_result(value: Any, preview_refs: dict[int, str]) -> None:
+    """Mutate a result dict to carry preview_ref on each sequence."""
+    if isinstance(value, dict):
+        sequences = value.get("sequences")
+        if isinstance(sequences, list):
+            for seq in sequences:
+                if not isinstance(seq, dict):
+                    continue
+                seq_id = seq.get("id")
+                if seq_id is not None and seq_id in preview_refs:
+                    seq["preview_ref"] = preview_refs[seq_id]
+        for v in value.values():
+            _inject_preview_refs_into_result(v, preview_refs)
+    elif isinstance(value, list):
+        for item in value:
+            _inject_preview_refs_into_result(item, preview_refs)
 
 
 def _invoke_elabftw_tool(
@@ -1331,8 +1388,37 @@ def create_app() -> FastAPI:
     _register_invoke_route(api, identity_mapper, artifact_store)
     _register_plan_route(api, identity_mapper)
     _register_bentolab_route(api, identity_mapper)
+    _register_opencloning_preview_routes(api)
 
     return api
+
+
+def _register_opencloning_preview_routes(api: FastAPI) -> None:
+    """Register /v1/opencloning/previews/{preview_ref} route."""
+
+    @api.get("/v1/opencloning/previews/{preview_ref}")
+    def fetch_opencloning_preview(
+        preview_ref: str,
+        x_lab_copilot_context_token: str = Header(...),
+    ) -> dict[str, object]:
+        store = get_preview_store()
+        token_hash = hashlib.sha256(x_lab_copilot_context_token.encode()).hexdigest()
+        payload = store.fetch(preview_ref, token_hash)
+        if payload is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Preview not found or expired",
+            )
+        return {
+            "preview_ref": payload.preview_ref,
+            "run_id": payload.run_id,
+            "step_id": payload.step_id,
+            "sequence_id": payload.sequence_id,
+            "file_format": payload.file_format,
+            "file_content": payload.file_content,
+            "sequence_length": payload.sequence_length,
+            "is_circular": payload.is_circular,
+        }
 
 
 def _register_config_routes(api: FastAPI, service_name: str) -> None:

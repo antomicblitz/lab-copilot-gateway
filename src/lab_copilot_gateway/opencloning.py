@@ -1048,7 +1048,66 @@ class OpenCloningAdapter:
 
         return result
 
-    # --- C17: writeback artifact to eLabFTW -------------------------------
+    # --- C17a: capture preview refs ---------------------------------------
+
+    def capture_preview_refs(
+        self,
+        result: dict[str, Any],
+        run_id: str,
+        step_id: str,
+        context_token_hash: str,
+    ) -> dict[int, str]:
+        """Store sequence file_content in the preview store.
+
+        Iterates ``result["sequences"]`` and stores each sequence with
+        ``file_content`` in the short-lived preview store.  Returns a
+        mapping ``{sequence_id: preview_ref}`` that callers can use to
+        annotate manifests or redacted responses.
+
+        Returns an empty dict if the result has no sequences with
+        downloadable content.
+        """
+        from lab_copilot_gateway.opencloning_previews import get_preview_store
+
+        store = get_preview_store()
+        preview_map: dict[int, str] = {}
+
+        sequences = result.get("sequences")
+        if not isinstance(sequences, list):
+            return preview_map
+
+        for seq in sequences:
+            if not isinstance(seq, dict):
+                continue
+            file_content = seq.get("file_content")
+            if not isinstance(file_content, str) or not file_content:
+                continue
+
+            seq_id = seq.get("id")
+            if seq_id is None:
+                continue
+
+            file_format = str(seq.get("sequence_file_format") or "genbank").lower()
+            is_circular = seq.get("circular")
+            is_circular_val: bool | None = (
+                is_circular if isinstance(is_circular, bool) else None
+            )
+
+            preview_ref = store.store(
+                run_id=run_id,
+                step_id=step_id,
+                context_token_hash=context_token_hash,
+                sequence_id=int(seq_id) if seq_id else None,
+                file_format=file_format,
+                file_content=file_content,
+                is_circular=is_circular_val,
+            )
+
+            preview_map[int(seq_id)] = preview_ref
+
+        return preview_map
+
+    # --- C17b: writeback artifact to eLabFTW ------------------------------
 
     def writeback_artifact(
         self,
