@@ -495,6 +495,26 @@ _CATALOG: tuple[Tool, ...] = (
             "Args: part_name (str, e.g. 'BBa_J23105', 'BBa_E1010')."
         ),
     ),
+    # --- Protocol lookup (Slice 7) ----------------------------------------
+    Tool(
+        name="opencloning.lookup_protocol",
+        tier=Tier.VALIDATION_DRY_RUN,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description="Search approved eLabFTW protocol entries for PCR/assembly conditions. "
+        "Returns protocol-backed reagent recommendations, annealing temperatures, "
+        "cycle counts, and incubation conditions.",
+    ),
+    Tool(
+        name="protocols.validate_corpus",
+        tier=Tier.VALIDATION_DRY_RUN,
+        adapter="opencloning",
+        requires_approval=False,
+        mutability="read",
+        description="Validate protocol entries for missing fields, duplicates, and "
+        "deprecated entries. Admin diagnostic tool.",
+    ),
 )
 
 

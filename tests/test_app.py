@@ -170,7 +170,7 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["approval_backend"] == "db"
     assert body["dependencies"]["approval_db"] == "memory"
     # C06 curated tool catalog.
-    assert body["dependencies"]["tool_count"] == 29  # noqa: PLR2004 — V1 catalog size is a contract
+    assert body["dependencies"]["tool_count"] == 31  # noqa: PLR2004 — V1 catalog size is a contract
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -198,7 +198,7 @@ def test_tools_registry_returns_curated_catalog() -> None:
 
     assert response.status_code == 200
     tools = response.json()["tools"]
-    assert len(tools) == 29  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(tools) == 31  # noqa: PLR2004 — V1 catalog size is a contract
 
     required_fields = {
         "name",
@@ -245,6 +245,8 @@ def test_tools_registry_returns_curated_catalog() -> None:
         "opencloning.call",
         "opencloning.search_parts",
         "opencloning.fetch_igem_part",
+        "opencloning.lookup_protocol",
+        "protocols.validate_corpus",
         "wallac.get_status",
         "wallac.call",
         "wallac.run",
@@ -1617,7 +1619,7 @@ def test_invoke_does_not_modify_registry() -> None:
     after = client.get("/tools").json()["tools"]
     assert before == after
     health = client.get("/health").json()
-    assert health["dependencies"]["tool_count"] == 29  # noqa: PLR2004
+    assert health["dependencies"]["tool_count"] == 31  # noqa: PLR2004
 
 
 def test_invoke_amend_missing_approval_id_denies() -> None:
@@ -1663,7 +1665,7 @@ def test_invoke_health_reflects_tool_count() -> None:
     the custom-endpoint service can discover whether /invoke is wired
     to a non-empty registry."""
     body = make_client().get("/health").json()
-    assert body["dependencies"]["tool_count"] == 29  # noqa: PLR2004
+    assert body["dependencies"]["tool_count"] == 31  # noqa: PLR2004
 
 
 # ============================================================================
