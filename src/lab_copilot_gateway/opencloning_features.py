@@ -22,6 +22,12 @@ Approach (sequence-based, not coordinate-based):
 This is robust because a CDS's nucleotide sequence is unique enough to match
 exactly.  Parts that were removed (e.g., mScarlet replaced by EGFP) will not
 match and will not be erroneously annotated.
+
+Dedup is label-aware: when a template feature matches a position already
+occupied by a generic annotation (e.g., plannotate's /label=\"CDS\"), the
+template's descriptive label (e.g., /label=\"EGFP\") is still added.  When
+the existing feature already has a descriptive label, the template feature
+is skipped as a true duplicate.
 """
 
 from __future__ import annotations
@@ -48,11 +54,30 @@ _MAX_NEW_FEATURES = 50
 _COMPLEMENT = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
 
+def _has_descriptive_label(feat: dict[str, Any]) -> bool:
+    """Check if a feature has a descriptive /label, /gene, or /product qualifier.
+
+    A value is "descriptive" when it is non-empty AND not just the feature
+    type name (case-insensitive).  For example, /label="EGFP" on a CDS is
+    descriptive; /label="CDS" on a CDS is generic.
+    """
+    feat_type = feat.get("type", "").lower()
+    quals = feat.get("qualifiers", {})
+    for key in ("label", "gene", "product"):
+        val = quals.get(key)
+        if val:
+            stripped = val.strip()
+            if stripped.lower() != feat_type:
+                return True
+    return False
+
+
 def _extract_features_from_template(
     *,
     template_content: str,
     final_seq: str,
     existing_labels: set[tuple[str, int, int]],
+    existing_by_key: dict[tuple[str, int, int], dict[str, Any]],
     new_features: list[dict[str, Any]],
     seen_seqs: set[str],
 ) -> None:
@@ -82,7 +107,13 @@ def _extract_features_from_template(
         start, end, strand = match
         key = (feat["type"], start, end)
         if key in existing_labels:
-            continue
+            # The existing feature at this position might have a generic label
+            # from plannotate (e.g., /label="CDS" on a CDS feature).
+            # If the existing feature has a descriptive label, skip (unique).
+            # Otherwise, allow the template's descriptive label to override.
+            existing_feat = existing_by_key.get(key)
+            if existing_feat is not None and _has_descriptive_label(existing_feat):
+                continue
         existing_labels.add(key)
 
         seen_seqs.add(feat_seq)
@@ -97,6 +128,17 @@ def _extract_features_from_template(
                 "qualifiers": qualifiers,
             }
         )
+        # Update the lookup to prevent cascading overrides from other templates.
+        template_label = (
+            feat.get("qualifiers", {}).get("label")
+            or feat.get("qualifiers", {}).get("gene")
+            or feat.get("qualifiers", {}).get("product")
+            or feat["type"]
+        )
+        existing_by_key[key] = {
+            "type": feat["type"],
+            "qualifiers": {"label": template_label},
+        }
 
 
 def rewrite_genbank_features(
@@ -117,6 +159,10 @@ def rewrite_genbank_features(
 
     existing = _parse_features(final_genbank)
     existing_labels = {(f["type"], f["start"], f["end"]) for f in existing}
+    # Lookup dict to check if existing features have descriptive labels.
+    existing_by_key: dict[tuple[str, int, int], dict[str, Any]] = {
+        (f["type"], f["start"], f["end"]): f for f in existing
+    }
 
     new_features: list[dict[str, Any]] = []
     seen_seqs: set[str] = set()
@@ -132,6 +178,7 @@ def rewrite_genbank_features(
             template_content=fc,
             final_seq=final_seq,
             existing_labels=existing_labels,
+            existing_by_key=existing_by_key,
             new_features=new_features,
             seen_seqs=seen_seqs,
         )

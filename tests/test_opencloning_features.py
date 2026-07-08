@@ -220,6 +220,57 @@ def test_circular_wrap_around() -> None:
     assert '/label="origin_span"' in result
 
 
+# --- Label-aware dedup tests -------------------------------------------------
+
+
+def test_adds_descriptive_label_alongside_generic() -> None:
+    """When an existing feature has only a generic label (e.g., plannotate's
+    /label='CDS'), a template feature with a descriptive label at the same
+    position is added alongside — the original is preserved, the new one
+    overlays the descriptive name on the same coordinates.
+    """
+    # Final GenBank with generic /label="CDS" at EGFP's position (25..64).
+    features = (
+        "     promoter        1..24\n"
+        '                     /label="test promoter"\n'
+        "     CDS             25..64\n"
+        '                     /label="CDS"\n'
+    )
+    final_with_generic = _genbank(
+        "name", _FINAL_LEN, "circular", features, _wrap_origin(_FINAL_SEQ)
+    )
+    result = rewrite_genbank_features(
+        final_with_generic, [_make_template(_egfp_template())]
+    )
+
+    # The template's descriptive label should appear.
+    assert '/label="EGFP"' in result
+    assert '/product="enhanced GFP"' in result
+    # The original generic CDS is still in the output (it's part of the
+    # original GenBank, not removed), but the descriptive one is added too.
+    assert result.count("CDS") >= 1
+
+
+def test_descriptive_label_blocks_override() -> None:
+    """When the existing feature already has a descriptive label, a template
+    feature at the same position should NOT be added (no duplicate)."""
+    features = (
+        "     promoter        1..24\n"
+        '                     /label="test promoter"\n'
+        "     CDS             25..64\n"
+        '                     /label="EGFP"\n'
+    )
+    final_with_egfp = _genbank(
+        "name", _FINAL_LEN, "circular", features, _wrap_origin(_FINAL_SEQ)
+    )
+    result = rewrite_genbank_features(
+        final_with_egfp, [_make_template(_egfp_template())]
+    )
+
+    assert result.count("CDS") == 1
+    assert result.count('/label="EGFP"') == 1
+
+
 # --- PCR feature-loss detection tests ---------------------------------------
 
 
