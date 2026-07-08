@@ -202,9 +202,7 @@ def test_provenance_operation_label_appears_only_once() -> None:
     the widget's provenance section, causing user-visible duplication.
     """
     result = {
-        "sequences": [
-            {"id": 0, "type": "TextFileSequence", "file_content": GENBANK}
-        ],
+        "sequences": [{"id": 0, "type": "TextFileSequence", "file_content": GENBANK}],
         "sources": [
             {
                 "id": 0,

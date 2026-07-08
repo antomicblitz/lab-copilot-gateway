@@ -1206,12 +1206,12 @@ def test_submit_elabftw_provenance_written(
     extra = meta.get("extra_fields", {})
     assert extra.get("wallac_job_id", {}).get("value") == "1"
     assert extra.get("wallac_job_status", {}).get("value") == "submitted"
-    assert extra.get("wallac_bridge_audit_action_id", {}).get("value") == "bridge-audit-1"
+    assert (
+        extra.get("wallac_bridge_audit_action_id", {}).get("value") == "bridge-audit-1"
+    )
     assert extra.get("wallac_submit_tool", {}).get("value") == TOOL_SUBMIT
     assert extra.get("wallac_gateway_audit_action_id", {}).get("value") is not None
-    assert (
-        result.audit_action_id == extra["wallac_gateway_audit_action_id"]["value"]
-    )
+    assert result.audit_action_id == extra["wallac_gateway_audit_action_id"]["value"]
 
 
 # --- result package includes audit ID (acceptance check) --------------------
