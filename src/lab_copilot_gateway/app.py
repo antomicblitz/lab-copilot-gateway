@@ -59,6 +59,7 @@ from lab_copilot_gateway.opencloning import (
     get_opencloning_adapter,
 )
 from lab_copilot_gateway.opencloning_artifacts import normalize_opencloning_artifacts
+from lab_copilot_gateway.protocol_lookup import ProtocolLookupService
 from lab_copilot_gateway.wallac import (
     WallacAdapter,
     WallacAdapterError,
@@ -927,6 +928,10 @@ def _invoke_opencloning_tool(
             return _invoke_opencloning_search_parts(tool, body)
         elif tool.name == "opencloning.fetch_igem_part":
             return _invoke_opencloning_fetch_igem(tool, body)
+        elif tool.name == "opencloning.lookup_protocol":
+            return _invoke_opencloning_lookup_protocol(tool, body, adapter)
+        elif tool.name == "protocols.validate_corpus":
+            return _invoke_opencloning_validate_corpus(tool, body, adapter)
         else:
             return {
                 "ok": False,
@@ -1333,6 +1338,56 @@ def create_app() -> FastAPI:
     _register_bentolab_route(api, identity_mapper)
 
     return api
+
+
+def _invoke_opencloning_lookup_protocol(
+    tool: Any,
+    body: InvokeBody,
+    adapter: OpenCloningAdapter,
+) -> dict[str, object]:
+    """Handle opencloning.lookup_protocol — protocol lookup from eLabFTW."""
+    elabftw_client = adapter.elabftw_client
+    if elabftw_client is None:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "no_elabftw_client",
+            "message": "eLabFTW client is not configured for protocol lookup",
+        }
+    service = ProtocolLookupService(elabftw_client)
+    result = service.lookup(
+        method_type=body.args.get("method_type", ""),
+        reagent_name=body.args.get("reagent_name"),
+        aliases=body.args.get("aliases"),
+    )
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": result.to_dict(),
+    }
+
+
+def _invoke_opencloning_validate_corpus(
+    tool: Any,
+    body: InvokeBody,
+    adapter: OpenCloningAdapter,
+) -> dict[str, object]:
+    """Handle protocols.validate_corpus — validate protocol entries."""
+    elabftw_client = adapter.elabftw_client
+    if elabftw_client is None:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "no_elabftw_client",
+            "message": "eLabFTW client is not configured for protocol validation",
+        }
+    service = ProtocolLookupService(elabftw_client)
+    issues = service.validate_corpus()
+    return {
+        "ok": True,
+        "tool_name": tool.name,
+        "result": {"issues": issues, "count": len(issues)},
+    }
 
 
 def _register_config_routes(api: FastAPI, service_name: str) -> None:
