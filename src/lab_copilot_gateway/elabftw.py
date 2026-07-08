@@ -568,13 +568,20 @@ class StubElabftwClient:
 
     seeds: dict[int, dict[str, Any]] = field(default_factory=dict)
     _next_id: int = 1000  # auto-increment for created experiments
+    # Test introspection: counts of how many times each method was called.
+    # Tests use these to assert "no HTTP call was made" without depending on
+    # stub-mismatch side effects (e.g. KeyError) that could change shape.
+    get_experiment_calls: int = 0
+    get_item_calls: int = 0
 
     def get_experiment(self, experiment_id: int) -> dict[str, Any]:
+        self.get_experiment_calls += 1
         if experiment_id not in self.seeds:
             raise KeyError(f"experiment {experiment_id} not found in stub")
         return dict(self.seeds[experiment_id])
 
     def get_item(self, item_id: int) -> dict[str, Any]:
+        self.get_item_calls += 1
         if item_id not in self.seeds:
             raise KeyError(f"item {item_id} not found in stub")
         return dict(self.seeds[item_id])
@@ -1222,7 +1229,39 @@ class ElabftwReadAdapter:
                 message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
             )
 
-        # 6. Make the call.  Dispatch to the right endpoint based on
+        # 6. experiment_id 0 means "no experiment context" (see
+        # elabftw_mint_context_token comment).  eLabFTW's REST API treats
+        # /experiments/0 as an unfiltered list and returns a JSON array,
+        # not a single record — calling .get("title") on that crashes
+        # the gateway with AttributeError.  Fail fast with a structured
+        # error so the orchestrator and LLM see a clean reason rather
+        # than a 500.
+        if claims.experiment_id == 0:
+            self._audit(
+                policy_decision="deny",
+                reason="no_experiment_context",
+                mapped_identity=mapped_identity,
+                experiment_id=claims.experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "NO_EXPERIMENT_CONTEXT"},
+            )
+            raise ElabftwAdapterError(
+                reason="no_experiment_context",
+                message=(
+                    "No experiment context — open the chat on a specific "
+                    "experiment page so the widget can mint a token with "
+                    "a valid experiment_id. (experiment_id=0 means the "
+                    "launcher could not detect an experiment on this page.)"
+                ),
+            )
+
+        # 7. Make the call.  Dispatch to the right endpoint based on
         # record_type: "resource" → /api/v2/items/{id}, default → /api/v2/experiments/{id}.
         try:
             if claims.record_type == "resource":
@@ -1607,7 +1646,37 @@ class ElabftwReadAdapter:
                 message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
             )
 
-        # 4. Make the call.
+        # 4. Validate id.  Same eLabFTW "id=0 returns a list" trap as
+        # read_current_experiment — see the matching comment there.
+        # The LLM can omit the id (the dispatcher defaults to 0), so
+        # we have to defend here, not at the dispatcher.
+        if experiment_id <= 0:
+            self._audit(
+                policy_decision="deny",
+                reason="no_experiment_context",
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                tool_name=TOOL_NAME_READ_BY_ID,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "NO_EXPERIMENT_CONTEXT"},
+            )
+            raise ElabftwAdapterError(
+                reason="no_experiment_context",
+                message=(
+                    f"No valid experiment_id — received {experiment_id!r}; "
+                    "the LLM must call read_experiment_by_id with a positive "
+                    "integer id, or read_current_experiment on a page with a "
+                    "detectable experiment."
+                ),
+            )
+
+        # 5. Make the call.
         try:
             payload = self.client.get_experiment(experiment_id)
         except Exception as exc:
@@ -1951,6 +2020,32 @@ class ElabftwReadAdapter:
             raise ElabftwAdapterError(
                 reason="elabftw_not_configured",
                 message="eLabFTW client not configured (set LAB_COPILOT_ELABFTW_BASE_URL and LAB_COPILOT_ELABFTW_API_KEY)",
+            )
+
+        # Validate id.  Same eLabFTW "id=0 returns a list" trap as
+        # read_current_experiment — see the matching comment there.
+        if item_id <= 0:
+            self._audit(
+                policy_decision="deny",
+                reason="no_experiment_context",
+                mapped_identity=mapped_identity,
+                experiment_id=item_id,
+                tool_name=TOOL_NAME_READ_ITEM,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={"code": "NO_EXPERIMENT_CONTEXT"},
+            )
+            raise ElabftwAdapterError(
+                reason="no_experiment_context",
+                message=(
+                    f"No valid item_id — received {item_id!r}; "
+                    "the LLM must call read_item_by_id with a positive integer id."
+                ),
             )
 
         try:

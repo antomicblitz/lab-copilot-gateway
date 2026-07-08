@@ -407,6 +407,106 @@ def test_audit_persistence_failure_blocks_successful_read(
     failing_store.close()
 
 
+def test_experiment_id_zero_denies_with_no_context_reason(
+    audit: AuditStore,
+    stub_client: StubElabftwClient,
+    policy: PolicyEngine,
+) -> None:
+    """Regression: experiment_id 0 means "no experiment context" (see
+    elabftw_mint_context_token comment).  eLabFTW's REST API treats
+    /experiments/0 as an unfiltered list and returns a JSON array, not a
+    single record — calling .get("title") on that crashes the gateway
+    with AttributeError.  The adapter must fail fast with a structured
+    no_experiment_context error before reaching the eLabFTW client,
+    and must NOT call the downstream client (which would 500).
+    """
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+    )
+    token = _token(claims=_claims(experiment_id=0))
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.read_current_experiment(
+            context_token=token,
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "no_experiment_context"
+    assert "experiment_id=0" in exc.value.message
+    # Stub client must NOT have been called.
+    assert stub_client.get_experiment_calls == 0
+    assert stub_client.get_item_calls == 0
+
+
+def test_experiment_id_zero_audit_records_deny_with_no_context(
+    audit: AuditStore,
+    stub_client: StubElabftwClient,
+    policy: PolicyEngine,
+) -> None:
+    """Regression: experiment_id 0 must persist a deny audit record
+    (code NO_EXPERIMENT_CONTEXT) so the failure is observable in the
+    audit log even though the downstream client was never called."""
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+    )
+    token = _token(claims=_claims(experiment_id=0))
+    with pytest.raises(ElabftwAdapterError):
+        adapter.read_current_experiment(
+            context_token=token,
+            mapped_identity=_identity(),
+        )
+    assert audit.count() == 1
+    row = audit.get(_last_action_id(audit))
+    assert row is not None
+    assert row["policy_decision"] == "deny"
+    assert "NO_EXPERIMENT_CONTEXT" in (row["error_json"] or "")
+
+
+def test_read_experiment_by_id_zero_denies_with_no_context(
+    audit: AuditStore,
+    stub_client: StubElabftwClient,
+    policy: PolicyEngine,
+) -> None:
+    """Regression: read_experiment_by_id with id=0 (the dispatcher default
+    when the LLM omits the arg) must also deny with no_experiment_context.
+    Same eLabFTW 'id=0 returns a list' trap as read_current_experiment."""
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.read_experiment_by_id(
+            experiment_id=0,
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "no_experiment_context"
+    assert stub_client.get_experiment_calls == 0
+
+
+def test_read_item_by_id_zero_denies_with_no_context(
+    audit: AuditStore,
+    stub_client: StubElabftwClient,
+    policy: PolicyEngine,
+) -> None:
+    """Regression: read_item_by_id with id=0 (the dispatcher default when
+    the LLM omits item_id) must also deny with no_experiment_context."""
+    adapter = ElabftwReadAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+    )
+    with pytest.raises(ElabftwAdapterError) as exc:
+        adapter.read_item_by_id(
+            item_id=0,
+            mapped_identity=_identity(),
+        )
+    assert exc.value.reason == "no_experiment_context"
+    assert stub_client.get_item_calls == 0
+
+
 # --- Metadata normalization -----------------------------------------------
 
 
