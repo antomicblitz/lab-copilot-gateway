@@ -546,17 +546,24 @@ def _capture_opencloning_preview_refs(
     )
 
 
+def _inject_preview_refs_into_sequences(
+    sequences: Any, preview_refs: dict[int, str]
+) -> None:
+    """Inject preview_ref into each sequence dict in a list."""
+    if not isinstance(sequences, list):
+        return
+    for seq in sequences:
+        if not isinstance(seq, dict):
+            continue
+        seq_id = seq.get("id")
+        if seq_id is not None and seq_id in preview_refs:
+            seq["preview_ref"] = preview_refs[seq_id]
+
+
 def _inject_preview_refs_into_result(value: Any, preview_refs: dict[int, str]) -> None:
     """Mutate a result dict to carry preview_ref on each sequence."""
     if isinstance(value, dict):
-        sequences = value.get("sequences")
-        if isinstance(sequences, list):
-            for seq in sequences:
-                if not isinstance(seq, dict):
-                    continue
-                seq_id = seq.get("id")
-                if seq_id is not None and seq_id in preview_refs:
-                    seq["preview_ref"] = preview_refs[seq_id]
+        _inject_preview_refs_into_sequences(value.get("sequences"), preview_refs)
         for v in value.values():
             _inject_preview_refs_into_result(v, preview_refs)
     elif isinstance(value, list):
@@ -851,6 +858,161 @@ def _invoke_elabftw_amend(
     }
 
 
+def _dispatch_opencloning_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+    artifact_store: ArtifactBundleStore,
+    adapter: Any,
+) -> dict[str, object]:
+    """Dispatch a single opencloning tool by name (no exception handling)."""
+    if tool.name == "opencloning.parse_sequence_file":
+        result = adapter.parse_sequence_file(
+            context_token=body.context_token,
+            file_content=body.args.get("file_content", ""),
+            file_format=body.args.get("file_format", "genbank"),
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return _opencloning_invoke_success(
+            tool_name=tool.name,
+            result=result,
+            context_token=body.context_token,
+            request_id=body.request_id,
+            artifact_store=artifact_store,
+        )
+    elif tool.name == "opencloning.manual_sequence":
+        result = adapter.manual_sequence(
+            context_token=body.context_token,
+            sequence=body.args.get("sequence", ""),
+            circular=body.args.get("circular", False),
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return _opencloning_invoke_success(
+            tool_name=tool.name,
+            result=result,
+            context_token=body.context_token,
+            request_id=body.request_id,
+            artifact_store=artifact_store,
+        )
+    elif tool.name == "opencloning.oligo_hybridization":
+        result = adapter.oligo_hybridization(
+            context_token=body.context_token,
+            forward_oligo=body.args.get("forward_oligo", ""),
+            reverse_oligo=body.args.get("reverse_oligo", ""),
+            minimal_annealing=body.args.get("minimal_annealing", 20),
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return _opencloning_invoke_success(
+            tool_name=tool.name,
+            result=result,
+            context_token=body.context_token,
+            request_id=body.request_id,
+            artifact_store=artifact_store,
+        )
+    elif tool.name == "opencloning.simulate_assembly":
+        result = adapter.simulate_assembly(
+            context_token=body.context_token,
+            sequences=body.args.get("sequences", []),
+            source=body.args.get("source", {"id": 0, "type": "GibsonAssemblySource"}),
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return _opencloning_invoke_success(
+            tool_name=tool.name,
+            result=result,
+            context_token=body.context_token,
+            request_id=body.request_id,
+            artifact_store=artifact_store,
+        )
+    elif tool.name == "opencloning.writeback_artifact":
+        result = adapter.writeback_artifact(
+            context_token=body.context_token,
+            approval_id=body.approval_id or "",
+            approval_args=body.args,
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        response: dict[str, object] = {
+            "ok": True,
+            "tool_name": tool.name,
+            "result": result.to_dict(),
+        }
+        # Surface the validation bundle at the top level so the
+        # orchestrator can emit it as an SSE event
+        # (lab_copilot_validation_bundle) and the widget can display
+        # validation status on the approval card.
+        bundle = result.result.get("validation_bundle")
+        if isinstance(bundle, dict):
+            response["validation_bundle"] = bundle
+        return response
+    elif tool.name == "opencloning.call":
+        result = adapter.call_endpoint(
+            context_token=body.context_token,
+            endpoint=body.args.get("endpoint", "/"),
+            body=body.args.get("body", {}),
+            mapped_identity=mapped_identity,
+            conversation_id=body.conversation_id,
+            request_id=body.request_id,
+            keycloak_subject=body.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+            provider=body.provider,
+            model_id=body.model_id,
+        )
+        return _opencloning_invoke_success(
+            tool_name=tool.name,
+            result=result,
+            context_token=body.context_token,
+            request_id=body.request_id,
+            artifact_store=artifact_store,
+        )
+    elif tool.name == "opencloning.search_parts":
+        return _invoke_opencloning_search_parts(tool, body)
+    elif tool.name == "opencloning.fetch_igem_part":
+        return _invoke_opencloning_fetch_igem(tool, body)
+    elif tool.name == "opencloning.lookup_protocol":
+        return _invoke_opencloning_lookup_protocol(tool, body, adapter)
+    elif tool.name == "protocols.validate_corpus":
+        return _invoke_opencloning_validate_corpus(tool, body, adapter)
+    else:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "tool_not_dispatched",
+            "message": (
+                f"tool {tool.name!r} is in the opencloning adapter but "
+                "has no /invoke dispatch path"
+            ),
+        }
+
+
 def _invoke_opencloning_tool(
     tool: Any,
     body: InvokeBody,
@@ -860,153 +1022,9 @@ def _invoke_opencloning_tool(
     """Dispatch an opencloning adapter tool invocation."""
     try:
         adapter = get_opencloning_adapter()
-        if tool.name == "opencloning.parse_sequence_file":
-            result = adapter.parse_sequence_file(
-                context_token=body.context_token,
-                file_content=body.args.get("file_content", ""),
-                file_format=body.args.get("file_format", "genbank"),
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            return _opencloning_invoke_success(
-                tool_name=tool.name,
-                result=result,
-                context_token=body.context_token,
-                request_id=body.request_id,
-                artifact_store=artifact_store,
-            )
-        elif tool.name == "opencloning.manual_sequence":
-            result = adapter.manual_sequence(
-                context_token=body.context_token,
-                sequence=body.args.get("sequence", ""),
-                circular=body.args.get("circular", False),
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            return _opencloning_invoke_success(
-                tool_name=tool.name,
-                result=result,
-                context_token=body.context_token,
-                request_id=body.request_id,
-                artifact_store=artifact_store,
-            )
-        elif tool.name == "opencloning.oligo_hybridization":
-            result = adapter.oligo_hybridization(
-                context_token=body.context_token,
-                forward_oligo=body.args.get("forward_oligo", ""),
-                reverse_oligo=body.args.get("reverse_oligo", ""),
-                minimal_annealing=body.args.get("minimal_annealing", 20),
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            return _opencloning_invoke_success(
-                tool_name=tool.name,
-                result=result,
-                context_token=body.context_token,
-                request_id=body.request_id,
-                artifact_store=artifact_store,
-            )
-        elif tool.name == "opencloning.simulate_assembly":
-            result = adapter.simulate_assembly(
-                context_token=body.context_token,
-                sequences=body.args.get("sequences", []),
-                source=body.args.get(
-                    "source", {"id": 0, "type": "GibsonAssemblySource"}
-                ),
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            return _opencloning_invoke_success(
-                tool_name=tool.name,
-                result=result,
-                context_token=body.context_token,
-                request_id=body.request_id,
-                artifact_store=artifact_store,
-            )
-        elif tool.name == "opencloning.writeback_artifact":
-            result = adapter.writeback_artifact(
-                context_token=body.context_token,
-                approval_id=body.approval_id or "",
-                approval_args=body.args,
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            response: dict[str, object] = {
-                "ok": True,
-                "tool_name": tool.name,
-                "result": result.to_dict(),
-            }
-            # Surface the validation bundle at the top level so the
-            # orchestrator can emit it as an SSE event
-            # (lab_copilot_validation_bundle) and the widget can display
-            # validation status on the approval card.
-            bundle = result.result.get("validation_bundle")
-            if isinstance(bundle, dict):
-                response["validation_bundle"] = bundle
-            return response
-        elif tool.name == "opencloning.call":
-            result = adapter.call_endpoint(
-                context_token=body.context_token,
-                endpoint=body.args.get("endpoint", "/"),
-                body=body.args.get("body", {}),
-                mapped_identity=mapped_identity,
-                conversation_id=body.conversation_id,
-                request_id=body.request_id,
-                keycloak_subject=body.keycloak_subject,
-                librechat_user_id=body.librechat_user_id,
-                provider=body.provider,
-                model_id=body.model_id,
-            )
-            return _opencloning_invoke_success(
-                tool_name=tool.name,
-                result=result,
-                context_token=body.context_token,
-                request_id=body.request_id,
-                artifact_store=artifact_store,
-            )
-        elif tool.name == "opencloning.search_parts":
-            return _invoke_opencloning_search_parts(tool, body)
-        elif tool.name == "opencloning.fetch_igem_part":
-            return _invoke_opencloning_fetch_igem(tool, body)
-        elif tool.name == "opencloning.lookup_protocol":
-            return _invoke_opencloning_lookup_protocol(tool, body, adapter)
-        elif tool.name == "protocols.validate_corpus":
-            return _invoke_opencloning_validate_corpus(tool, body, adapter)
-        else:
-            return {
-                "ok": False,
-                "tool_name": tool.name,
-                "reason": "tool_not_dispatched",
-                "message": (
-                    f"tool {tool.name!r} is in the opencloning adapter but "
-                    "has no /invoke dispatch path"
-                ),
-            }
+        return _dispatch_opencloning_tool(
+            tool, body, mapped_identity, artifact_store, adapter
+        )
     except OpenCloningAdapterError as exc:
         return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
     except WallacAdapterError as exc:
@@ -1801,52 +1819,7 @@ def _register_elabftw_routes(api: FastAPI, identity_mapper: IdentityMapper) -> N
         }
 
     # --- C__FIX2__: create experiment endpoint (widget-initiated) ---------
-    @api.post("/elabftw/create_experiment")
-    def elabftw_create_experiment(
-        body: ElabftwCreateBody,
-        principal: AuthenticatedPrincipal = Depends(verified_principal),
-    ) -> dict[str, object]:
-        """Create a new eLabFTW experiment and return its ID.
-
-        Called by the Lab Copilot widget when the user wants to save
-        an OpenCloning result but no experiment is currently open (the
-        writeback tool was requested with experiment_id=0).  The widget
-        creates a fresh experiment, re-mints the context token for it,
-        then re-triggers the writeback tool in the orchestrator so the
-        approval goes through with a valid target.
-
-        Uses the write adapter's eLabFTW client to POST to the upstream
-        API.  The caller's identity is resolved via the identity mapper.
-        """
-        mapped = identity_mapper.map(
-            keycloak_subject=principal.keycloak_subject,
-            librechat_user_id=body.librechat_user_id,
-        )
-        if mapped is None:
-            return {
-                "ok": False,
-                "reason": "unmapped_caller",
-                "message": "caller did not resolve to a mapped eLabFTW identity",
-            }
-        adapter = get_elabftw_write_adapter()
-        if adapter.client is None:
-            return {
-                "ok": False,
-                "reason": "no_elabftw_client",
-                "message": "eLabFTW client is not configured",
-            }
-        try:
-            new_id = adapter.client.create_experiment(title=body.title or None)
-        except Exception as exc:
-            return {
-                "ok": False,
-                "reason": "create_failed",
-                "message": f"eLabFTW experiment creation failed: {exc}",
-            }
-        return {
-            "ok": True,
-            "experiment_id": new_id,
-        }
+    _register_elabftw_create_route(api, identity_mapper)
 
     @api.post("/elabftw/draft_experiment_update")
     def elabftw_draft_experiment_update(
@@ -1901,6 +1874,59 @@ def _register_elabftw_routes(api: FastAPI, identity_mapper: IdentityMapper) -> N
         except ElabftwAdapterError as exc:
             return {"ok": False, **exc.to_dict()}
         return {"ok": True, "write": result.to_dict()}
+
+
+def _register_elabftw_create_route(
+    api: FastAPI, identity_mapper: IdentityMapper
+) -> None:
+    """Register the create_experiment route (separated to reduce complexity)."""
+
+    @api.post("/elabftw/create_experiment")
+    def elabftw_create_experiment(
+        body: ElabftwCreateBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        """Create a new eLabFTW experiment and return its ID.
+
+        Called by the Lab Copilot widget when the user wants to save
+        an OpenCloning result but no experiment is currently open (the
+        writeback tool was requested with experiment_id=0).  The widget
+        creates a fresh experiment, re-mints the context token for it,
+        then re-triggers the writeback tool in the orchestrator so the
+        approval goes through with a valid target.
+
+        Uses the write adapter's eLabFTW client to POST to the upstream
+        API.  The caller's identity is resolved via the identity mapper.
+        """
+        mapped = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        if mapped is None:
+            return {
+                "ok": False,
+                "reason": "unmapped_caller",
+                "message": "caller did not resolve to a mapped eLabFTW identity",
+            }
+        adapter = get_elabftw_write_adapter()
+        if adapter.client is None:
+            return {
+                "ok": False,
+                "reason": "no_elabftw_client",
+                "message": "eLabFTW client is not configured",
+            }
+        try:
+            new_id = adapter.client.create_experiment(title=body.title or None)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "create_failed",
+                "message": f"eLabFTW experiment creation failed: {exc}",
+            }
+        return {
+            "ok": True,
+            "experiment_id": new_id,
+        }
 
 
 def _register_elabftw_amend_route(

@@ -127,6 +127,19 @@ def _extract_ids_from_sequences(sequences: Any) -> list[str]:
     return ids
 
 
+def _extract_seq_ids_from_inputs(inputs: Any) -> list[str]:
+    """Extract sequence IDs from a single source's input list."""
+    if not isinstance(inputs, list):
+        return []
+    ids: list[str] = []
+    for inp in inputs:
+        if isinstance(inp, dict):
+            seq_ref = inp.get("sequence")
+            if seq_ref is not None:
+                ids.append(str(seq_ref))
+    return ids
+
+
 def _extract_input_seq_ids(sources: Any) -> list[str]:
     """Extract input sequence IDs from OpenCloning source objects.
 
@@ -138,13 +151,7 @@ def _extract_input_seq_ids(sources: Any) -> list[str]:
     for src in sources:
         if not isinstance(src, dict):
             continue
-        inputs = src.get("input")
-        if isinstance(inputs, list):
-            for inp in inputs:
-                if isinstance(inp, dict):
-                    seq_ref = inp.get("sequence")
-                    if seq_ref is not None:
-                        ids.append(str(seq_ref))
+        ids.extend(_extract_seq_ids_from_inputs(src.get("input")))
     return ids
 
 
@@ -265,6 +272,67 @@ def extract_sequence_import(
     )
 
 
+def _extract_seq_id_from_nested(obj: Any) -> str | None:
+    """Extract a sequence ID from a dict containing a 'sequence' key."""
+    if not isinstance(obj, dict):
+        return None
+    seq = obj.get("sequence")
+    if isinstance(seq, dict) and seq.get("id") is not None:
+        return str(seq["id"])
+    return None
+
+
+def _extract_primer_template_refs(request_body: dict[str, Any]) -> list[str]:
+    """Extract template sequence IDs from a primer design request body."""
+    template_refs = _extract_ids_from_sequences(request_body.get("sequences"))
+    # Also check pcr_templates (used by primer_design endpoints).
+    pcr_templates = request_body.get("pcr_templates")
+    if isinstance(pcr_templates, list):
+        for tmpl in pcr_templates:
+            seq_id = _extract_seq_id_from_nested(tmpl)
+            if seq_id is not None:
+                template_refs.append(seq_id)
+    # Single pcr_template.
+    seq_id = _extract_seq_id_from_nested(request_body.get("pcr_template"))
+    if seq_id is not None:
+        template_refs.append(seq_id)
+    # Homologous recombination target.
+    seq_id = _extract_seq_id_from_nested(
+        request_body.get("homologous_recombination_target")
+    )
+    if seq_id is not None:
+        template_refs.append(seq_id)
+    return template_refs
+
+
+def _check_primer_tm_mismatch(
+    primers: Any,
+) -> dict[str, str] | None:
+    """Return a warning dict if primer Tm values differ by more than 5°C."""
+    if not isinstance(primers, list) or len(primers) < 2:
+        return None
+    tm_values: list[float] = []
+    for p in primers:
+        if isinstance(p, dict):
+            raw_tm = p.get("tm") or p.get("melting_temperature")
+            if raw_tm is not None:
+                try:
+                    tm_values.append(float(raw_tm))
+                except (ValueError, TypeError):
+                    pass
+    if len(tm_values) >= 2 and max(tm_values) - min(tm_values) > 5:
+        return {
+            "severity": "warning",
+            "code": "primer_tm_mismatch",
+            "message": (
+                f"Primer melting temperatures differ by "
+                f"{max(tm_values) - min(tm_values):.1f}°C "
+                f"(recommended ≤ 5°C)."
+            ),
+        }
+    return None
+
+
 def extract_primer_design(
     endpoint: str,
     request_body: dict[str, Any],
@@ -282,53 +350,13 @@ def extract_primer_design(
             if isinstance(p, dict) and p.get("id") is not None
         ]
     )
-    template_refs = _extract_ids_from_sequences(request_body.get("sequences"))
-    # Also check pcr_templates (used by primer_design endpoints).
-    pcr_templates = request_body.get("pcr_templates")
-    if isinstance(pcr_templates, list):
-        for tmpl in pcr_templates:
-            if isinstance(tmpl, dict):
-                seq = tmpl.get("sequence")
-                if isinstance(seq, dict) and seq.get("id") is not None:
-                    template_refs.append(str(seq["id"]))
-    # Single pcr_template.
-    pcr_template = request_body.get("pcr_template")
-    if isinstance(pcr_template, dict):
-        seq = pcr_template.get("sequence")
-        if isinstance(seq, dict) and seq.get("id") is not None:
-            template_refs.append(str(seq["id"]))
-    # Homologous recombination target.
-    hr_target = request_body.get("homologous_recombination_target")
-    if isinstance(hr_target, dict):
-        seq = hr_target.get("sequence")
-        if isinstance(seq, dict) and seq.get("id") is not None:
-            template_refs.append(str(seq["id"]))
+    template_refs = _extract_primer_template_refs(request_body)
 
     # Generate warning for primers with high Tm differences or other issues.
     warnings = list(_extract_warnings(result))
-    primers = result.get("primers") or []
-    if isinstance(primers, list) and len(primers) >= 2:
-        tm_values: list[float] = []
-        for p in primers:
-            if isinstance(p, dict):
-                raw_tm = p.get("tm") or p.get("melting_temperature")
-                if raw_tm is not None:
-                    try:
-                        tm_values.append(float(raw_tm))
-                    except (ValueError, TypeError):
-                        pass
-        if len(tm_values) >= 2 and max(tm_values) - min(tm_values) > 5:
-            warnings.append(
-                {
-                    "severity": "warning",
-                    "code": "primer_tm_mismatch",
-                    "message": (
-                        f"Primer melting temperatures differ by "
-                        f"{max(tm_values) - min(tm_values):.1f}°C "
-                        f"(recommended ≤ 5°C)."
-                    ),
-                }
-            )
+    tm_warning = _check_primer_tm_mismatch(result.get("primers"))
+    if tm_warning is not None:
+        warnings.append(tm_warning)
 
     return StepManifest(
         operation_type="primer_design",
@@ -340,6 +368,66 @@ def extract_primer_design(
         warnings=warnings,
         errors=_extract_errors(result),
     )
+
+
+def _format_pcr_location(loc: dict[str, Any], template_index: int) -> str | None:
+    """Format a PCR template location as a region ref string."""
+    parts: list[str] = []
+    start = loc.get("start")
+    end = loc.get("end")
+    strand = loc.get("strand")
+    if start is not None:
+        parts.append(f"start={start}")
+    if end is not None:
+        parts.append(f"end={end}")
+    if strand:
+        parts.append(f"strand={strand}")
+    if parts:
+        return f"template-{template_index}:{','.join(parts)}"
+    return None
+
+
+def _extract_region_from_template(tmpl: Any, index: int) -> str | None:
+    """Extract a region ref from a single PCR template."""
+    if not isinstance(tmpl, dict):
+        return None
+    loc = tmpl.get("location")
+    if not isinstance(loc, dict):
+        return None
+    return _format_pcr_location(loc, index)
+
+
+def _extract_pcr_region_refs(request_body: dict[str, Any]) -> list[str]:
+    """Extract region references from a PCR request body."""
+    region_refs: list[str] = []
+    pcr_templates = request_body.get("pcr_templates")
+    if isinstance(pcr_templates, list):
+        for i, tmpl in enumerate(pcr_templates):
+            ref = _extract_region_from_template(tmpl, i)
+            if ref is not None:
+                region_refs.append(ref)
+    return region_refs
+
+
+def _extract_pcr_primer_refs(result: dict[str, Any]) -> list[str]:
+    """Extract primer references from a PCR result."""
+    primers = result.get("primers")
+    if not isinstance(primers, list):
+        primers = result.get("products")
+    if not isinstance(primers, list):
+        return []
+    primer_refs: list[str] = []
+    for p in primers:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("id")
+        if pid is not None:
+            primer_refs.append(str(pid))
+            continue
+        pname = p.get("name", "")
+        if pname:
+            primer_refs.append(pname)
+    return primer_refs
 
 
 def extract_pcr(
@@ -359,41 +447,11 @@ def extract_pcr(
     # Template refs are the input sequences to the PCR source.
     template_refs = list(input_seq_ids)
 
-    # Region refs from the request body — PCR typically specifies
-    # a region on the template in pcr_templates or via source inputs.
-    region_refs: list[str] = []
-    pcr_templates = request_body.get("pcr_templates")
-    if isinstance(pcr_templates, list):
-        for i, tmpl in enumerate(pcr_templates):
-            if isinstance(tmpl, dict):
-                loc = tmpl.get("location")
-                if isinstance(loc, dict):
-                    parts: list[str] = []
-                    start = loc.get("start")
-                    end = loc.get("end")
-                    strand = loc.get("strand")
-                    if start is not None:
-                        parts.append(f"start={start}")
-                    if end is not None:
-                        parts.append(f"end={end}")
-                    if strand:
-                        parts.append(f"strand={strand}")
-                    if parts:
-                        region_refs.append(f"template-{i}:{','.join(parts)}")
+    # Region refs from the request body.
+    region_refs = _extract_pcr_region_refs(request_body)
 
     # Primer refs from the result.
-    primers = result.get("primers") or result.get("products") or []
-    primer_refs: list[str] = []
-    if isinstance(primers, list):
-        for p in primers:
-            if isinstance(p, dict):
-                pid = p.get("id")
-                if pid is not None:
-                    primer_refs.append(str(pid))
-                else:
-                    pname = p.get("name", "")
-                    if pname:
-                        primer_refs.append(pname)
+    primer_refs = _extract_pcr_primer_refs(result)
 
     warnings = list(_extract_warnings(result))
 
@@ -417,6 +475,42 @@ def extract_pcr(
     )
 
 
+def _extract_enzymes_from_sources(sources: Any) -> list[str]:
+    """Extract enzyme names from restriction source objects."""
+    if not isinstance(sources, list):
+        return []
+    enzymes: list[str] = []
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        if src.get("type") != "RestrictionSource":
+            continue
+        raw_enzymes = src.get("enzymes")
+        if not isinstance(raw_enzymes, list):
+            raw_enzymes = src.get("enzyme_names")
+        if isinstance(raw_enzymes, list):
+            enzymes.extend(str(e) for e in raw_enzymes)
+    return enzymes
+
+
+def _extract_enzymes_from_result(result: dict[str, Any]) -> list[str]:
+    """Extract enzyme names from the result dict directly."""
+    raw_enzymes = result.get("enzymes")
+    if not isinstance(raw_enzymes, list):
+        raw_enzymes = result.get("enzyme_names")
+    if isinstance(raw_enzymes, list):
+        return [str(e) for e in raw_enzymes]
+    return []
+
+
+def _extract_restriction_enzymes(result: dict[str, Any]) -> list[str]:
+    """Extract enzyme names from a restriction digest result."""
+    enzymes = _extract_enzymes_from_sources(result.get("sources"))
+    if not enzymes:
+        enzymes = _extract_enzymes_from_result(result)
+    return enzymes
+
+
 def extract_restriction_digest(
     endpoint: str,
     request_body: dict[str, Any],
@@ -433,19 +527,7 @@ def extract_restriction_digest(
     if not input_refs:
         input_refs = _extract_ids_from_sequences(request_body.get("sequences"))
 
-    # Extract enzyme names from the result.
-    enzymes: list[str] = []
-    for src in result.get("sources") or []:
-        if isinstance(src, dict) and src.get("type") == "RestrictionSource":
-            raw_enzymes = src.get("enzymes") or src.get("enzyme_names") or []
-            if isinstance(raw_enzymes, list):
-                enzymes.extend(str(e) for e in raw_enzymes)
-
-    # Also check for enzymes in the result itself.
-    if not enzymes:
-        raw_enzymes = result.get("enzymes") or result.get("enzyme_names") or []
-        if isinstance(raw_enzymes, list):
-            enzymes = [str(e) for e in raw_enzymes]
+    enzymes = _extract_restriction_enzymes(result)
 
     warnings = list(_extract_warnings(result))
     if not enzymes:

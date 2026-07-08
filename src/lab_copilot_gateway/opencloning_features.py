@@ -72,6 +72,73 @@ def _has_descriptive_label(feat: dict[str, Any]) -> bool:
     return False
 
 
+def _try_add_feature_from_template(
+    feat: dict[str, Any],
+    tmpl_seq: str,
+    final_seq: str,
+    existing_labels: set[tuple[str, int, int]],
+    existing_by_key: dict[tuple[str, int, int], dict[str, Any]],
+    new_features: list[dict[str, Any]],
+    seen_seqs: set[str],
+) -> bool:
+    """Try to add a single feature from a template.
+
+    Returns ``True`` to continue iterating, ``False`` if the feature
+    cap has been reached (caller should ``break``).
+    """
+    if len(new_features) >= _MAX_NEW_FEATURES:
+        return False
+    if feat["type"].lower() not in _FEATURE_TYPES_OF_INTEREST:
+        return True
+
+    feat_seq = _extract_feature_sequence(feat, tmpl_seq)
+    if not feat_seq or len(feat_seq) < _MIN_FEATURE_LEN:
+        return True
+    if feat_seq in seen_seqs:
+        return True
+
+    match = _find_in_product(feat_seq, final_seq)
+    if match is None:
+        return True
+
+    start, end, strand = match
+    key = (feat["type"], start, end)
+    if key in existing_labels:
+        # The existing feature at this position might have a generic label
+        # from plannotate (e.g., /label="CDS" on a CDS feature).
+        # If the existing feature has a descriptive label, skip (unique).
+        # Otherwise, allow the template's descriptive label to override.
+        existing_feat = existing_by_key.get(key)
+        if existing_feat is not None and _has_descriptive_label(existing_feat):
+            return True
+    existing_labels.add(key)
+
+    seen_seqs.add(feat_seq)
+    qualifiers = dict(feat["qualifiers"])
+    qualifiers["note"] = "lab-copilot:insert"
+    new_features.append(
+        {
+            "type": feat["type"],
+            "start": start,
+            "end": end,
+            "strand": strand,
+            "qualifiers": qualifiers,
+        }
+    )
+    # Update the lookup to prevent cascading overrides from other templates.
+    template_label = (
+        feat.get("qualifiers", {}).get("label")
+        or feat.get("qualifiers", {}).get("gene")
+        or feat.get("qualifiers", {}).get("product")
+        or feat["type"]
+    )
+    existing_by_key[key] = {
+        "type": feat["type"],
+        "qualifiers": {"label": template_label},
+    }
+    return True
+
+
 def _extract_features_from_template(
     *,
     template_content: str,
@@ -89,56 +156,16 @@ def _extract_features_from_template(
     tmpl_features = _parse_features(template_content)
 
     for feat in tmpl_features:
-        if len(new_features) >= _MAX_NEW_FEATURES:
+        if not _try_add_feature_from_template(
+            feat,
+            tmpl_seq,
+            final_seq,
+            existing_labels,
+            existing_by_key,
+            new_features,
+            seen_seqs,
+        ):
             break
-        if feat["type"].lower() not in _FEATURE_TYPES_OF_INTEREST:
-            continue
-
-        feat_seq = _extract_feature_sequence(feat, tmpl_seq)
-        if not feat_seq or len(feat_seq) < _MIN_FEATURE_LEN:
-            continue
-        if feat_seq in seen_seqs:
-            continue
-
-        match = _find_in_product(feat_seq, final_seq)
-        if match is None:
-            continue
-
-        start, end, strand = match
-        key = (feat["type"], start, end)
-        if key in existing_labels:
-            # The existing feature at this position might have a generic label
-            # from plannotate (e.g., /label="CDS" on a CDS feature).
-            # If the existing feature has a descriptive label, skip (unique).
-            # Otherwise, allow the template's descriptive label to override.
-            existing_feat = existing_by_key.get(key)
-            if existing_feat is not None and _has_descriptive_label(existing_feat):
-                continue
-        existing_labels.add(key)
-
-        seen_seqs.add(feat_seq)
-        qualifiers = dict(feat["qualifiers"])
-        qualifiers["note"] = "lab-copilot:insert"
-        new_features.append(
-            {
-                "type": feat["type"],
-                "start": start,
-                "end": end,
-                "strand": strand,
-                "qualifiers": qualifiers,
-            }
-        )
-        # Update the lookup to prevent cascading overrides from other templates.
-        template_label = (
-            feat.get("qualifiers", {}).get("label")
-            or feat.get("qualifiers", {}).get("gene")
-            or feat.get("qualifiers", {}).get("product")
-            or feat["type"]
-        )
-        existing_by_key[key] = {
-            "type": feat["type"],
-            "qualifiers": {"label": template_label},
-        }
 
 
 def rewrite_genbank_features(

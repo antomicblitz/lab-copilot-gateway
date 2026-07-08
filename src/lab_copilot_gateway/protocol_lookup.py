@@ -110,6 +110,58 @@ class ProtocolLookupService:
         self._client = elabftw_client
         self._category_name = category_name
 
+    def _build_no_approved_result(
+        self,
+        method_type: str,
+        reagent_name: str | None,
+        all_entries: list[dict[str, Any]],
+    ) -> ProtocolLookupResult:
+        """Build a fallback result when no approved entries are found."""
+        msgs: list[str] = []
+        if not all_entries:
+            msgs.append(
+                f"No approved protocol entries found for method_type={method_type!r}"
+            )
+        else:
+            msgs.append(
+                f"No approved entries found — all {len(all_entries)} "
+                "entries have non-approved status"
+            )
+        result = ProtocolLookupResult(
+            query_method=method_type,
+            query_reagent=reagent_name,
+            matches=[],
+            best_match=None,
+            fallback_used=True,
+            warnings=msgs,
+        )
+        # Include the unapproved entries as debug info (with match_confidence
+        # set to "method_only" so the caller can see them).
+        for e in all_entries:
+            result.matches.append(self._entry_to_match(e, "method_only", []))
+        return result
+
+    def _select_best_match(
+        self,
+        approved: list[dict[str, Any]],
+        reagent_name: str | None,
+        user_aliases: list[str],
+    ) -> tuple[list[ProtocolMatch], ProtocolMatch | None]:
+        """Score and rank approved entries, returning matches and best match."""
+        matches: list[ProtocolMatch] = []
+        best: ProtocolMatch | None = None
+
+        for entry in approved:
+            matched_conf, match_warnings = self._score_match(
+                entry, reagent_name, user_aliases
+            )
+            pm = self._entry_to_match(entry, matched_conf, match_warnings)
+            matches.append(pm)
+            if best is None:
+                best = pm
+
+        return matches, best
+
     def lookup(
         self,
         method_type: str,
@@ -163,47 +215,13 @@ class ProtocolLookupService:
         approved = [e for e in all_entries if self._is_approved(e)]
 
         if not approved:
-            msgs: list[str] = []
-            if not all_entries:
-                msgs.append(
-                    f"No approved protocol entries found for method_type={method_type!r}"
-                )
-            else:
-                msgs.append(
-                    f"No approved entries found — all {len(all_entries)} "
-                    "entries have non-approved status"
-                )
-            result = ProtocolLookupResult(
-                query_method=method_type,
-                query_reagent=reagent_name,
-                matches=[],
-                best_match=None,
-                fallback_used=True,
-                warnings=msgs,
+            return self._build_no_approved_result(
+                method_type, reagent_name, all_entries
             )
-            # Include the unapproved entries as debug info (with match_confidence
-            # set to "method_only" so the caller can see them).
-            for e in all_entries:
-                result.matches.append(self._entry_to_match(e, "method_only", []))
-            return result
 
         # Score and rank approved entries.
         user_aliases = aliases or []
-        matches: list[ProtocolMatch] = []
-        best: ProtocolMatch | None = None
-
-        for entry in approved:
-            matched_conf, match_warnings = self._score_match(
-                entry, reagent_name, user_aliases
-            )
-            pm = self._entry_to_match(entry, matched_conf, match_warnings)
-            matches.append(pm)
-            if matched_conf == "exact" and best is None:
-                best = pm
-            elif matched_conf == "alias" and best is None:
-                best = pm
-            elif matched_conf == "method_only" and best is None:
-                best = pm
+        matches, best = self._select_best_match(approved, reagent_name, user_aliases)
 
         fallback_used = not matches or not any(
             m.match_confidence in ("exact", "alias") for m in matches
@@ -244,33 +262,57 @@ class ProtocolLookupService:
         seen_titles: dict[str, int] = {}
 
         for item in all_items:
-            pid = int(item.get("id", 0))
-            title = str(item.get("title", ""))
-            entry = self._parse_item(item)
+            self._validate_corpus_item(item, seen_aliases, seen_titles, issues)
 
-            # Even if entry is None (no method_type), check whether the item
-            # has extra_fields at all — that signals a protocol-like item
-            # that is missing required fields.
-            if entry is None:
-                metadata = _normalize_metadata(item.get("metadata"))
-                if metadata and isinstance(metadata.get("extra_fields"), dict):
-                    ef = metadata["extra_fields"]
-                    missing = sorted(k for k in _ALL_REQUIRED if k not in ef)
-                    if missing:
-                        issues.append(
-                            {
-                                "item_id": str(pid),
-                                "severity": "error",
-                                "message": (
-                                    f"Missing required field(s): {missing} "
-                                    f"(title: {title})"
-                                ),
-                            }
-                        )
-                continue
+        return issues
 
-            # Check required fields.
-            missing = sorted(k for k in _ALL_REQUIRED if not entry.get(k))
+    def _validate_corpus_item(
+        self,
+        item: dict[str, Any],
+        seen_aliases: dict[str, int],
+        seen_titles: dict[str, int],
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Validate a single corpus item, appending issues to the list."""
+        pid = int(item.get("id", 0))
+        title = str(item.get("title", ""))
+        entry = self._parse_item(item)
+
+        # Even if entry is None (no method_type), check whether the item
+        # has extra_fields at all — that signals a protocol-like item
+        # that is missing required fields.
+        if entry is None:
+            self._check_unparsed_item_fields(item, pid, title, issues)
+            return
+
+        # Check required fields.
+        self._check_required_fields(entry, pid, title, issues)
+
+        # Check for non-approved statuses and deprecated entries.
+        self._check_entry_status(entry, pid, title, issues)
+
+        # Check for duplicate aliases.
+        self._check_duplicate_aliases(entry, pid, title, seen_aliases, issues)
+
+        # Check for duplicate titles.
+        self._check_duplicate_title(title, pid, seen_titles, issues)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_unparsed_item_fields(
+        item: dict[str, Any],
+        pid: int,
+        title: str,
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Check for protocol-like items that are missing required fields."""
+        metadata = _normalize_metadata(item.get("metadata"))
+        if metadata and isinstance(metadata.get("extra_fields"), dict):
+            ef = metadata["extra_fields"]
+            missing = sorted(k for k in _ALL_REQUIRED if k not in ef)
             if missing:
                 issues.append(
                     {
@@ -282,76 +324,116 @@ class ProtocolLookupService:
                     }
                 )
 
-            # Check for non-approved statuses.
-            status = str(entry.get(_STATUS, "")).strip().lower()
-            if status and status != "approved":
+    @staticmethod
+    def _check_required_fields(
+        entry: dict[str, Any],
+        pid: int,
+        title: str,
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Check that all required fields are present in the entry."""
+        missing = sorted(k for k in _ALL_REQUIRED if not entry.get(k))
+        if missing:
+            issues.append(
+                {
+                    "item_id": str(pid),
+                    "severity": "error",
+                    "message": (
+                        f"Missing required field(s): {missing} (title: {title})"
+                    ),
+                }
+            )
+
+    @staticmethod
+    def _check_entry_status(
+        entry: dict[str, Any],
+        pid: int,
+        title: str,
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Check for non-approved and deprecated entry statuses."""
+        status = str(entry.get(_STATUS, "")).strip().lower()
+        if status and status != "approved":
+            issues.append(
+                {
+                    "item_id": str(pid),
+                    "severity": "warning",
+                    "message": (
+                        f"Entry has status={status!r} — "
+                        f"not selectable by copilot (title: {title})"
+                    ),
+                }
+            )
+
+        # Flag deprecated entries that still match common queries.
+        if status == "deprecated":
+            reagent = entry.get(_REAGENT, "")
+            aliases_str = entry.get(_ALIASES, "")
+            if reagent or aliases_str:
                 issues.append(
                     {
                         "item_id": str(pid),
                         "severity": "warning",
                         "message": (
-                            f"Entry has status={status!r} — "
-                            f"not selectable by copilot (title: {title})"
+                            f"Deprecated entry may match common queries "
+                            f"(reagent: {reagent!r}, aliases: {aliases_str!r}) "
+                            f"(title: {title})"
                         ),
                     }
                 )
 
-            # Flag deprecated entries that still match common queries.
-            if status == "deprecated":
-                reagent = entry.get(_REAGENT, "")
-                aliases_str = entry.get(_ALIASES, "")
-                if reagent or aliases_str:
-                    issues.append(
-                        {
-                            "item_id": str(pid),
-                            "severity": "warning",
-                            "message": (
-                                f"Deprecated entry may match common queries "
-                                f"(reagent: {reagent!r}, aliases: {aliases_str!r}) "
-                                f"(title: {title})"
-                            ),
-                        }
-                    )
+    @staticmethod
+    def _check_duplicate_aliases(
+        entry: dict[str, Any],
+        pid: int,
+        title: str,
+        seen_aliases: dict[str, int],
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Check for duplicate reagent aliases across entries."""
+        aliases_raw = entry.get(_ALIASES, "")
+        alias_list = [a.strip() for a in aliases_raw.split(",") if a.strip()]
+        for alias in alias_list:
+            alias_lower = alias.lower()
+            if alias_lower in seen_aliases:
+                other_pid = seen_aliases[alias_lower]
+                issues.append(
+                    {
+                        "item_id": str(pid),
+                        "severity": "warning",
+                        "message": (
+                            f"Duplicate alias {alias!r} also used in "
+                            f"item #{other_pid} (title: {title})"
+                        ),
+                    }
+                )
+            else:
+                seen_aliases[alias_lower] = pid
 
-            # Check for duplicate aliases.
-            aliases_raw = entry.get(_ALIASES, "")
-            alias_list = [a.strip() for a in aliases_raw.split(",") if a.strip()]
-            for alias in alias_list:
-                alias_lower = alias.lower()
-                if alias_lower in seen_aliases:
-                    other_pid = seen_aliases[alias_lower]
-                    issues.append(
-                        {
-                            "item_id": str(pid),
-                            "severity": "warning",
-                            "message": (
-                                f"Duplicate alias {alias!r} also used in "
-                                f"item #{other_pid} (title: {title})"
-                            ),
-                        }
-                    )
-                else:
-                    seen_aliases[alias_lower] = pid
-
-            # Check for duplicate titles.
-            title_lower = title.lower().strip()
-            if title_lower:
-                if title_lower in seen_titles:
-                    other_pid = seen_titles[title_lower]
-                    issues.append(
-                        {
-                            "item_id": str(pid),
-                            "severity": "warning",
-                            "message": (
-                                f"Duplicate title matches item #{other_pid} "
-                                f"(title: {title})"
-                            ),
-                        }
-                    )
-                else:
-                    seen_titles[title_lower] = pid
-
-        return issues
+    @staticmethod
+    def _check_duplicate_title(
+        title: str,
+        pid: int,
+        seen_titles: dict[str, int],
+        issues: list[dict[str, str]],
+    ) -> None:
+        """Check for duplicate entry titles."""
+        title_lower = title.lower().strip()
+        if title_lower:
+            if title_lower in seen_titles:
+                other_pid = seen_titles[title_lower]
+                issues.append(
+                    {
+                        "item_id": str(pid),
+                        "severity": "warning",
+                        "message": (
+                            f"Duplicate title matches item #{other_pid} "
+                            f"(title: {title})"
+                        ),
+                    }
+                )
+            else:
+                seen_titles[title_lower] = pid
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -438,6 +520,37 @@ class ProtocolLookupService:
         return status == "approved" and bool(approved_flag)
 
     @staticmethod
+    def _match_reagent_or_aliases(
+        reagent_name: str,
+        user_aliases: list[str],
+        entry_reagent: str,
+        entry_aliases: list[str],
+    ) -> str | None:
+        """Check if reagent_name or user aliases match the entry.
+
+        Returns ``"exact"``, ``"alias"``, or ``None`` (no match).
+        """
+        cleaned_reagent = reagent_name.strip().lower()
+
+        # 1. Exact match against reagent_product_name.
+        if entry_reagent == cleaned_reagent:
+            return "exact"
+
+        # 2. Reagent name matches an alias in the entry.
+        if cleaned_reagent in entry_aliases:
+            return "alias"
+
+        # 3. One of the user-supplied aliases matches.
+        for ua in user_aliases:
+            ua_lower = ua.strip().lower()
+            if ua_lower == entry_reagent:
+                return "alias"
+            if ua_lower in entry_aliases:
+                return "alias"
+
+        return None
+
+    @staticmethod
     def _score_match(
         entry: dict[str, Any],
         reagent_name: str | None,
@@ -451,27 +564,16 @@ class ProtocolLookupService:
 
         if reagent_name:
             entry_reagent = entry.get(_REAGENT, "").strip().lower()
-            cleaned_reagent = reagent_name.strip().lower()
-
-            # 1. Exact match against reagent_product_name.
-            if entry_reagent == cleaned_reagent:
-                return "exact", match_warnings
-
-            # 2. Reagent name matches an alias in the entry.
             entry_aliases_str = entry.get(_ALIASES, "")
             entry_aliases = [
                 a.strip().lower() for a in entry_aliases_str.split(",") if a.strip()
             ]
-            if cleaned_reagent in entry_aliases:
-                return "alias", match_warnings
 
-            # 3. One of the user-supplied aliases matches.
-            for ua in user_aliases:
-                ua_lower = ua.strip().lower()
-                if ua_lower == entry_reagent:
-                    return "alias", match_warnings
-                if ua_lower in entry_aliases:
-                    return "alias", match_warnings
+            matched = ProtocolLookupService._match_reagent_or_aliases(
+                reagent_name, user_aliases, entry_reagent, entry_aliases
+            )
+            if matched is not None:
+                return matched, match_warnings
 
             match_warnings.append(
                 f"No exact or alias match for {reagent_name!r} — "

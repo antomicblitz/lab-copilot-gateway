@@ -1341,6 +1341,114 @@ class WallacAdapter:
             )
         return self.bridge_client.submit_job(job_item_id)
 
+    def _consume_submit_approval(
+        self,
+        approval_id: str,
+        approval_args: dict[str, Any],
+        job_item_id: int,
+        plan_approval_id: str | None,
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> str:
+        """Consume the approval token and return the effective approval_id.
+
+        C42: when ``plan_approval_id`` is set, the plan executor has
+        already consumed the plan-level approval.  Skip the per-step
+        consume and use the plan approval_id in audit records.
+        """
+        if plan_approval_id:
+            return plan_approval_id
+        if self.approval_store is not None:
+            try:
+                self.approval_store.consume(
+                    approval_id,
+                    tool_name=TOOL_SUBMIT,
+                    args_hash=compute_args_hash(approval_args),
+                    target_record=f"wallac:job:{job_item_id}",
+                )
+                return approval_id
+            except Exception as exc:
+                from lab_copilot_gateway.approval import ApprovalError
+
+                reason_code = "approval_consume_failed"
+                error_payload: dict[str, Any] = {
+                    "code": "APPROVAL_CONSUME_FAILED",
+                    "exception": type(exc).__name__,
+                }
+                if isinstance(exc, ApprovalError):
+                    reason_code = f"approval_denied:{exc.reason}"
+                    error_payload["approval_reason"] = exc.reason
+                    error_payload["approval_id"] = exc.approval_id
+                self._audit(
+                    tool_name=TOOL_SUBMIT,
+                    policy_decision="deny",
+                    reason=reason_code,
+                    mapped_identity=mapped_identity,
+                    experiment_id=claims.experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=tool_args_hash,
+                    approval_id=approval_id,
+                    error=error_payload,
+                )
+                raise WallacAdapterError(
+                    reason=reason_code,
+                    message=f"approval token consume failed: {exc}",
+                ) from exc
+        return approval_id
+
+    def _writeback_submit_provenance(
+        self,
+        claims: Any,
+        bridge_result: dict[str, Any],
+        action_id: str,
+    ) -> None:
+        """Write provenance metadata to eLabFTW (best-effort, non-fatal)."""
+        if self.elabftw_client is None:
+            return
+        try:
+            record_id = int(claims.experiment_id)
+            if claims.record_type == "resource":
+                current_record = self.elabftw_client.get_item(record_id)
+                rt_param = "items"
+            else:
+                current_record = self.elabftw_client.get_experiment(record_id)
+                rt_param = "experiments"
+            existing_metadata = current_record.get("metadata") or {}
+            updated_metadata = _merge_provenance_into_metadata(
+                existing_metadata,
+                action_id,
+                {
+                    "wallac_job_id": str(bridge_result.get("job_id") or ""),
+                    "wallac_job_status": str(bridge_result.get("status") or ""),
+                    "wallac_bridge_audit_action_id": str(
+                        bridge_result.get("audit_action_id") or ""
+                    ),
+                    "wallac_submit_tool": TOOL_SUBMIT,
+                    "wallac_gateway_audit_action_id": action_id,
+                },
+            )
+            self.elabftw_client.patch_experiment_metadata(
+                experiment_id=claims.experiment_id,
+                metadata=updated_metadata,
+                record_type=rt_param,
+            )
+        except Exception:
+            # Provenance write failure is not fatal — the job was
+            # already submitted to the bridge.
+            pass
+
     def _execute_submit(
         self,
         *,
@@ -1483,55 +1591,21 @@ class WallacAdapter:
 
         # 5. Approval token consume (single-use, args-hash-bound).
         #    Happens AFTER policy allow, BEFORE the bridge call.
-        # C42: when ``plan_approval_id`` is set, the plan executor has
-        # already consumed the plan-level approval (bound to the plan hash,
-        # which covers all step args).  Skip the per-step consume and use
-        # the plan approval_id in audit records.
-        if plan_approval_id:
-            effective_approval_id = plan_approval_id
-        elif self.approval_store is not None:
-            try:
-                self.approval_store.consume(
-                    approval_id,
-                    tool_name=TOOL_SUBMIT,
-                    args_hash=compute_args_hash(approval_args),
-                    target_record=f"wallac:job:{job_item_id}",
-                )
-                effective_approval_id = approval_id
-            except Exception as exc:
-                from lab_copilot_gateway.approval import ApprovalError
-
-                reason_code = "approval_consume_failed"
-                error_payload: dict[str, Any] = {
-                    "code": "APPROVAL_CONSUME_FAILED",
-                    "exception": type(exc).__name__,
-                }
-                if isinstance(exc, ApprovalError):
-                    reason_code = f"approval_denied:{exc.reason}"
-                    error_payload["approval_reason"] = exc.reason
-                    error_payload["approval_id"] = exc.approval_id
-                self._audit(
-                    tool_name=TOOL_SUBMIT,
-                    policy_decision="deny",
-                    reason=reason_code,
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    approval_id=approval_id,
-                    error=error_payload,
-                )
-                raise WallacAdapterError(
-                    reason=reason_code,
-                    message=f"approval token consume failed: {exc}",
-                ) from exc
-        else:
-            effective_approval_id = approval_id
+        effective_approval_id = self._consume_submit_approval(
+            approval_id,
+            approval_args,
+            job_item_id,
+            plan_approval_id,
+            claims,
+            mapped_identity,
+            conversation_id,
+            request_id,
+            keycloak_subject,
+            librechat_user_id,
+            provider,
+            model_id,
+            tool_args_hash,
+        )
 
         # 6. Bridge client must be configured.
         self._ensure_bridge_configured(
@@ -1585,38 +1659,7 @@ class WallacAdapter:
         action_id = f"{self.action_id_prefix}-submit-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
 
         # 9. eLabFTW provenance writeback (best-effort, non-fatal).
-        if self.elabftw_client is not None:
-            try:
-                record_id = int(claims.experiment_id)
-                if claims.record_type == "resource":
-                    current_record = self.elabftw_client.get_item(record_id)
-                    rt_param = "items"
-                else:
-                    current_record = self.elabftw_client.get_experiment(record_id)
-                    rt_param = "experiments"
-                existing_metadata = current_record.get("metadata") or {}
-                updated_metadata = _merge_provenance_into_metadata(
-                    existing_metadata,
-                    action_id,
-                    {
-                        "wallac_job_id": str(bridge_result.get("job_id") or ""),
-                        "wallac_job_status": str(bridge_result.get("status") or ""),
-                        "wallac_bridge_audit_action_id": str(
-                            bridge_result.get("audit_action_id") or ""
-                        ),
-                        "wallac_submit_tool": TOOL_SUBMIT,
-                        "wallac_gateway_audit_action_id": action_id,
-                    },
-                )
-                self.elabftw_client.patch_experiment_metadata(
-                    experiment_id=claims.experiment_id,
-                    metadata=updated_metadata,
-                    record_type=rt_param,
-                )
-            except Exception:
-                # Provenance write failure is not fatal — the job was
-                # already submitted to the bridge.
-                pass
+        self._writeback_submit_provenance(claims, bridge_result, action_id)
 
         # 10. Success audit.
 

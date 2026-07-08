@@ -539,6 +539,39 @@ def build_validation_bundle(
 # --- detection helpers ------------------------------------------------------
 
 
+def _collect_input_seq_refs(inputs: Any) -> set[Any]:
+    """Collect sequence references from a source's input list."""
+    if not isinstance(inputs, list):
+        return set()
+    refs: set[Any] = set()
+    for inp in inputs:
+        if isinstance(inp, dict):
+            seq_ref = inp.get("sequence")
+            if seq_ref is not None:
+                refs.add(seq_ref)
+    return refs
+
+
+def _collect_source_input_ids(sources: list[dict[str, Any]]) -> set[Any]:
+    """Collect all sequence IDs referenced as source inputs."""
+    input_ids: set[Any] = set()
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        input_ids.update(_collect_input_seq_refs(src.get("input")))
+    return input_ids
+
+
+def _find_last_seq_with_content(
+    sequences: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Find the last sequence in the list that has file_content."""
+    for seq in reversed(sequences):
+        if isinstance(seq, dict) and seq.get("file_content"):
+            return seq
+    return sequences[-1] if sequences and isinstance(sequences[-1], dict) else None
+
+
 def _find_final_construct(
     sequences: list[dict[str, Any]], sources: list[dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -554,17 +587,7 @@ def _find_final_construct(
         return None
 
     # Collect all ids referenced as source inputs.
-    input_ids: set[Any] = set()
-    for src in sources:
-        if not isinstance(src, dict):
-            continue
-        inputs = src.get("input")
-        if isinstance(inputs, list):
-            for inp in inputs:
-                if isinstance(inp, dict):
-                    seq_ref = inp.get("sequence")
-                    if seq_ref is not None:
-                        input_ids.add(seq_ref)
+    input_ids = _collect_source_input_ids(sources)
 
     # Leaf sequences: not referenced as an input by any source.
     leaves = [
@@ -581,10 +604,7 @@ def _find_final_construct(
         return leaves[-1]
 
     # Fallback: last sequence with file_content.
-    for seq in reversed(sequences):
-        if isinstance(seq, dict) and seq.get("file_content"):
-            return seq
-    return sequences[-1] if sequences and isinstance(sequences[-1], dict) else None
+    return _find_last_seq_with_content(sequences)
 
 
 def _has_genbank_artifact(artifacts: dict[str, Any] | None) -> bool:
@@ -643,6 +663,22 @@ def _detect_annotation(
     return False, False
 
 
+def _genbank_has_feature_lines(file_content: str) -> bool:
+    """Check if a GenBank file_content string has at least one feature line."""
+    in_features = False
+    for line in file_content.splitlines():
+        if line.startswith("FEATURES"):
+            in_features = True
+            continue
+        if in_features:
+            if line.startswith("ORIGIN") or line.startswith("//"):
+                break
+            # Feature lines start with 5 spaces followed by a non-space char.
+            if len(line) > 5 and line[:5] == " " * 5 and line[5] != " ":
+                return True
+    return False
+
+
 def _sequence_has_features(seq: dict[str, Any]) -> bool:
     """Check if a sequence has annotated features.
 
@@ -657,19 +693,7 @@ def _sequence_has_features(seq: dict[str, Any]) -> bool:
     file_content = seq.get("file_content")
     if not isinstance(file_content, str):
         return False
-    # Simple check: FEATURES section with at least one feature line.
-    in_features = False
-    for line in file_content.splitlines():
-        if line.startswith("FEATURES"):
-            in_features = True
-            continue
-        if in_features:
-            if line.startswith("ORIGIN") or line.startswith("//"):
-                break
-            # Feature lines start with 5 spaces followed by a non-space char.
-            if len(line) > 5 and line[:5] == " " * 5 and line[5] != " ":
-                return True
-    return False
+    return _genbank_has_feature_lines(file_content)
 
 
 def _count_primers_with_details(primers: list[dict[str, Any]]) -> int:

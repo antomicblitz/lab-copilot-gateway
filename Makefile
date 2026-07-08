@@ -3,7 +3,7 @@
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "%-18s %s\n", $$1, $$2}'
 
-check: lint typecheck format-check mdlint test ## Run all local quality gates
+check: lint typecheck format-check complexity mdlint test ## Run all local quality gates
 
 lint: ## Lint Python code
 	uv run ruff check .
