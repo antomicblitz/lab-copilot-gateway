@@ -1274,6 +1274,67 @@ def test_elabftw_mint_token_binds_to_resolved_user_not_request() -> None:
         assert out["reason"] == "unmapped_caller"
 
 
+# C__FIX2__ — POST /elabftw/create_experiment widget endpoint
+# ============================================================================
+#
+# Called by the Lab Copilot widget when a writeback approval arrives
+# with no experiment open (experiment_id=0).  Creates a new eLabFTW
+# experiment and returns its ID so the widget can re-mint the context
+# token and re-trigger the writeback with a valid target.
+
+
+def test_elabftw_create_experiment_succeeds_for_mapped_user() -> None:
+    """Mapped user → 200 ok with the new experiment ID."""
+    _register_mapped_user()
+
+    client = make_client()
+    r = client.post(
+        "/elabftw/create_experiment",
+        json={
+            "keycloak_subject": "kc-mint-1",
+            "title": "Test construct",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    # The stub client seeds experiments from ID 100, so any creation
+    # returns an ID >= the _next_id counter (starts at some value).
+    assert isinstance(out["experiment_id"], int)
+    assert out["experiment_id"] > 0
+
+
+def test_elabftw_create_experiment_denies_unmapped_caller() -> None:
+    """Unmapped caller → 200 with ok=false and reason=unmapped_caller."""
+    # Do NOT call _register_mapped_user() — leave the mapper empty.
+    client = make_client()
+    r = client.post(
+        "/elabftw/create_experiment",
+        json={"keycloak_subject": "kc-no-mapping"},
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is False
+    assert out["reason"] == "unmapped_caller"
+
+
+def test_create_experiment_defaults_title_when_none_supplied() -> None:
+    """No title → still creates with title=None (eLabFTW defaults to empty)."""
+    _register_mapped_user()
+
+    client = make_client()
+    r = client.post(
+        "/elabftw/create_experiment",
+        json={
+            "keycloak_subject": "kc-mint-1",
+        },
+    )
+    assert r.status_code == 200
+    out = r.json()
+    assert out["ok"] is True
+    assert isinstance(out["experiment_id"], int)
+
+
 # --- POST /invoke (C13 — LibreChat tool surface) --------------------------
 #
 # /invoke is the single dispatch entry point used by the LibreChat

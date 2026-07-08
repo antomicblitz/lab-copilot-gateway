@@ -214,6 +214,20 @@ class ElabftwMintBody(BaseModel):
     record_type: str = "experiment"  # "experiment" or "resource" (database item)
 
 
+class ElabftwCreateBody(BaseModel):
+    """Request body for POST /elabftw/create_experiment (C__FIX2__).
+
+    Caller identifies itself via ``keycloak_subject``/``librechat_user_id``.
+    The gateway resolves the identity via the mapper, then creates a new
+    eLabFTW experiment with the given ``title`` (defaults to empty string
+    so the user can name it later).
+    """
+
+    keycloak_subject: str | None = None
+    librechat_user_id: str | None = None
+    title: str | None = None
+
+
 class ElabftwDraftBody(BaseModel):
     """Request body for POST /elabftw/draft_experiment_update (C09).
 
@@ -1635,6 +1649,54 @@ def _register_elabftw_routes(api: FastAPI, identity_mapper: IdentityMapper) -> N
             "expires_at": expires_at,
             "experiment_id": body.experiment_id,
             "mapped_elabftw_user_id": mapped.elabftw_user_id,
+        }
+
+    # --- C__FIX2__: create experiment endpoint (widget-initiated) ---------
+    @api.post("/elabftw/create_experiment")
+    def elabftw_create_experiment(
+        body: ElabftwCreateBody,
+        principal: AuthenticatedPrincipal = Depends(verified_principal),
+    ) -> dict[str, object]:
+        """Create a new eLabFTW experiment and return its ID.
+
+        Called by the Lab Copilot widget when the user wants to save
+        an OpenCloning result but no experiment is currently open (the
+        writeback tool was requested with experiment_id=0).  The widget
+        creates a fresh experiment, re-mints the context token for it,
+        then re-triggers the writeback tool in the orchestrator so the
+        approval goes through with a valid target.
+
+        Uses the write adapter's eLabFTW client to POST to the upstream
+        API.  The caller's identity is resolved via the identity mapper.
+        """
+        mapped = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
+        if mapped is None:
+            return {
+                "ok": False,
+                "reason": "unmapped_caller",
+                "message": "caller did not resolve to a mapped eLabFTW identity",
+            }
+        adapter = get_elabftw_write_adapter()
+        if adapter.client is None:
+            return {
+                "ok": False,
+                "reason": "no_elabftw_client",
+                "message": "eLabFTW client is not configured",
+            }
+        try:
+            new_id = adapter.client.create_experiment(title=body.title or None)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "create_failed",
+                "message": f"eLabFTW experiment creation failed: {exc}",
+            }
+        return {
+            "ok": True,
+            "experiment_id": new_id,
         }
 
     @api.post("/elabftw/draft_experiment_update")
