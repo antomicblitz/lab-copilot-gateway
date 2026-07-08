@@ -551,6 +551,57 @@ def _rewrite_source_inputs(src: dict[str, Any], id_map: dict[str, int]) -> None:
             item["sequence"] = id_map[seq_ref]
 
 
+def _strip_self_references(sources: list[dict[str, Any]]) -> None:
+    """Convert sources with self-referencing inputs to DatabaseSource.
+
+    OpenCloning's /pcr endpoint returns sources whose inputs include the PCR
+    product itself (describing primer-binding regions as fragments of the
+    product). This creates a cycle (source → output sequence → source input)
+    that causes /validate to reject the history JSON with 422 and triggers
+    infinite recursion in the frontend's graph traversal.
+
+    Instead of stripping individual self-referencing inputs (which leaves PCR
+    sources with fewer inputs than the frontend expects), we convert the
+    entire source to a DatabaseSource — the same approach the OpenCloning
+    frontend uses when loading history files with missing ancestor sequences
+    (see useLoadDatabaseFile.js). DatabaseSource has no inputs, so the
+    frontend renders it as a leaf node without trying to traverse inputs.
+    """
+    for i, src in enumerate(sources):
+        if not isinstance(src, dict):
+            continue
+        src_id = src.get("id")
+        inputs = src.get("input")
+        if not isinstance(inputs, list) or src_id is None:
+            continue
+        has_self_ref = any(
+            isinstance(inp, dict) and inp.get("sequence") == src_id for inp in inputs
+        )
+        if has_self_ref:
+            sources[i] = {
+                "id": src_id,
+                "type": "DatabaseSource",
+                "input": [],
+                "output_name": src.get("output_name"),
+                # database_id is required and must be an integer for
+                # DatabaseSource. Use src_id as a placeholder — the
+                # sequence is already in the history JSON, so the
+                # frontend uses the local copy.
+                "database_id": src_id,
+            }
+
+
+def _strip_sequence_names(sequences: list[dict[str, Any]]) -> None:
+    """Strip the 'name' field from each sequence dict in-place.
+
+    TextFileSequence has ``extra='forbid'`` in its schema, so passing any
+    unrecognised field (including ``name``, which is already encoded in the
+    GenBank LOCUS line of ``file_content``) causes ``/validate`` to return 422.
+    """
+    for seq in sequences:
+        seq.pop("name", None)
+
+
 def _generic_sequence_name(name: Any) -> bool:
     value = str(name or "").strip().lower()
     return value in {"", "name", "sequence", "untitled", "untitled_sequence"}
@@ -707,6 +758,7 @@ class OpenCloningAdapter:
     _strategy_sequences: list[dict[str, Any]] = field(default_factory=list)
     _strategy_sources: list[dict[str, Any]] = field(default_factory=list)
     _strategy_primers: list[dict[str, Any]] = field(default_factory=list)
+    _primer_counter: int = 0
 
     # --- public API: four C16 tool entrypoints --------------------------
 
@@ -1366,7 +1418,13 @@ class OpenCloningAdapter:
                 isinstance(primer, dict)
                 and primer.get("name") not in existing_primer_names
             ):
-                self._strategy_primers.append(dict(primer))
+                # Assign a unique sequential ID — OpenCloning's primer design
+                # endpoints return id=0 for all new primers, which causes
+                # validation failures when the history JSON is reloaded.
+                self._primer_counter += 1
+                primer_copy = dict(primer)
+                primer_copy["id"] = self._primer_counter
+                self._strategy_primers.append(primer_copy)
                 existing_primer_names.add(primer.get("name"))
 
     def _resolve_artifact_bundle(
@@ -1747,6 +1805,16 @@ class OpenCloningAdapter:
                 "sources": self._strategy_sources,
                 "primers": self._strategy_primers,
             }
+
+            # Strip self-referencing inputs from sources (PCR sources that
+            # reference their own output create cycles that /validate rejects).
+            _strip_self_references(strategy["sources"])
+
+            # Strip the 'name' field from sequences — it's not part of the
+            # TextFileSequence schema (extra='forbid') and causes /validate
+            # to reject the history JSON. The name is already in the LOCUS
+            # line of the GenBank file_content.
+            _strip_sequence_names(strategy["sequences"])
 
             # Add version info (best-effort)
             try:

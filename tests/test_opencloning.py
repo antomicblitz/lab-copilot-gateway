@@ -54,6 +54,8 @@ from lab_copilot_gateway.opencloning import (
     _default_client_from_env,
     _infer_extension,
     _rewrite_opencloning_result_ids,
+    _strip_self_references,
+    _strip_sequence_names,
     get_opencloning_adapter,
     reset_opencloning_adapter,
 )
@@ -402,6 +404,144 @@ def test_rewrite_opencloning_result_ids_keeps_history_graph_consistent() -> None
     assert result["sources"][0]["id"] == 11
     assert result["sources"][0]["input"] == [{"sequence": 11}, {"sequence": 9}]
     assert store["11"]["original_id"] == "0"
+
+
+# --- self-referencing source stripping ---------------------------------------
+
+
+def test_strip_self_references_converts_self_referencing_pcr_source_to_database() -> (
+    None
+):
+    """PCR sources that reference their own output must be converted to DatabaseSource.
+
+    Without this conversion, /validate rejects the history JSON with 422
+    and the OpenCloning frontend's graph traversal recurses infinitely.
+    """
+    sources = [
+        {
+            "id": 5,
+            "type": "PCRSource",
+            "input": [{"sequence": 5, "type": "SourceInput"}],  # self-references id 5
+            "output_name": "pUC19_fwd",
+        },
+        {
+            "id": 6,
+            "type": "GibsonAssemblySource",
+            "input": [{"sequence": 3}, {"sequence": 4}],  # normal source
+            "output_name": "pUC19-EGFP",
+        },
+    ]
+    _strip_self_references(sources)
+
+    # Self-referencing source converted to DatabaseSource
+    assert sources[0]["type"] == "DatabaseSource"
+    assert sources[0]["input"] == []
+    assert sources[0]["database_id"] == 5
+    assert sources[0]["output_name"] == "pUC19_fwd"
+
+    # Normal source unchanged
+    assert sources[1]["type"] == "GibsonAssemblySource"
+    assert sources[1]["input"] == [{"sequence": 3}, {"sequence": 4}]
+
+
+def test_strip_self_references_preserves_normal_sources() -> None:
+    """Sources without self-referencing inputs must be unchanged."""
+    sources = [
+        {
+            "id": 0,
+            "type": "GibsonAssemblySource",
+            "input": [{"sequence": 1}, {"sequence": 2}],
+        },
+    ]
+    original = [dict(s) for s in sources]  # deep copy
+    _strip_self_references(sources)
+    assert sources == original
+
+
+def test_strip_self_references_skips_non_dict_entries() -> None:
+    """Non-dict entries in sources list must be left unchanged."""
+    sources: list[dict[str, object]] = [
+        {"id": 1, "type": "PCRSource", "input": [{"sequence": 1}]},
+        "not_a_dict",
+        None,  # type: ignore[list-item]
+    ]
+    _strip_self_references(sources)  # type: ignore[arg-type]
+
+    assert sources[0]["type"] == "DatabaseSource"
+    assert sources[1] == "not_a_dict"
+    assert sources[2] is None
+
+
+# --- primer counter ----------------------------------------------------------
+
+
+def test_primer_counter_assigns_sequential_ids() -> None:
+    """Each primer must get a unique sequential id, not the API's default id=0."""
+    adapter = OpenCloningAdapter.__new__(OpenCloningAdapter)
+    adapter._primer_counter = 0
+    adapter._strategy_sequences = []
+    adapter._strategy_sources = []
+    adapter._strategy_primers = []
+    adapter.client = None  # not used in this test path
+
+    primer1_result = {
+        "sequences": [],
+        "sources": [],
+        "primers": [{"id": 0, "name": "fwd1", "sequence": "ATGC"}],
+    }
+    primer2_result = {
+        "sequences": [],
+        "sources": [],
+        "primers": [{"id": 0, "name": "fwd2", "sequence": "GCAT"}],
+    }
+    adapter._accumulate_strategy_data(primer1_result)
+    adapter._accumulate_strategy_data(primer2_result)
+
+    assert len(adapter._strategy_primers) == 2
+    assert adapter._strategy_primers[0]["id"] == 1
+    assert adapter._strategy_primers[1]["id"] == 2
+
+
+# --- name field stripping ----------------------------------------------------
+
+
+def test_strip_sequence_names_removes_name_field() -> None:
+    """The 'name' field on sequences must be stripped before history JSON upload.
+
+    TextFileSequence has extra='forbid' in the schema, and 'name' is already
+    in the LOCUS line of the GenBank file_content.
+    """
+    sequences = [
+        {
+            "id": 0,
+            "type": "TextFileSequence",
+            "name": "pUC19",
+            "file_content": "LOCUS pUC19\n//",
+        },
+        {
+            "id": 1,
+            "type": "TextFileSequence",
+            "name": "EGFP",
+            "file_content": "LOCUS EGFP\n//",
+        },
+    ]
+    _strip_sequence_names(sequences)
+
+    assert "name" not in sequences[0]
+    assert "name" not in sequences[1]
+    # Other fields preserved
+    assert sequences[0]["type"] == "TextFileSequence"
+    assert sequences[0]["id"] == 0
+
+
+def test_strip_sequence_names_preserves_sequences_without_name() -> None:
+    """Sequences without a 'name' field must not be affected."""
+    sequences = [
+        {"id": 0, "type": "TextFileSequence", "file_content": "LOCUS pUC19\n//"},
+    ]
+    _strip_sequence_names(sequences)
+    assert "name" not in sequences[0]  # still absent
+    assert sequences[0]["id"] == 0
 
 
 # --- unmapped caller --------------------------------------------------------
