@@ -345,10 +345,10 @@ def _normalize_blocking_errors(raw: Any) -> list[dict[str, str]]:
 def _provenance_steps(
     operation_label: str, sources: list[Any], sequences: list[Any]
 ) -> list[str]:
+    # Reason: operation_label parameter kept for API stability (see _build_provenance)
     steps = []
     if sources:
         steps.append(f"Processed {len(sources)} OpenCloning source(s)")
-    steps.append(operation_label)
     if sequences:
         steps.append(f"Produced {len(sequences)} final sequence(s)")
     return steps

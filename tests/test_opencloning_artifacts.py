@@ -192,4 +192,43 @@ def test_normalize_validation_warnings_are_non_blocking_with_final_product() -> 
             "message": "Overlap is shorter than recommended.",
         }
     ]
+
+
+def test_provenance_operation_label_appears_only_once() -> None:
+    """The operation_label must not be duplicated in opencloning_steps.
+
+    Regression for C79: the operation_label was being shown both as a
+    numbered step AND as the value of the `operation` metadata key in
+    the widget's provenance section, causing user-visible duplication.
+    """
+    result = {
+        "sequences": [
+            {"id": 0, "type": "TextFileSequence", "file_content": GENBANK}
+        ],
+        "sources": [
+            {
+                "id": 0,
+                "type": "GibsonAssemblySource",
+                "input": [
+                    {"type": "SourceInput", "sequence": 0},
+                    {"type": "SourceInput", "sequence": 1},
+                ],
+                "output_name": "pDemo",
+            }
+        ],
+    }
+    normalized = normalize_opencloning_artifacts(
+        result,
+        plan_id="invoke-test",
+        plan_hash="abc123",
+        operation_label="opencloning.call",
+    )
+    prov = normalized.provenance
+    # operation_label must NOT appear as a step
+    assert "opencloning.call" not in prov["opencloning_steps"]
+    # operation_label MUST still appear as the value of the `operation` key
+    assert prov["operation"] == "opencloning.call"
+    # The standard input/output summary steps are still there
+    assert "Processed 1 OpenCloning source(s)" in prov["opencloning_steps"]
+    assert "Produced 1 final sequence(s)" in prov["opencloning_steps"]
     assert normalized.artifacts[0]["warnings"] == normalized.warnings
