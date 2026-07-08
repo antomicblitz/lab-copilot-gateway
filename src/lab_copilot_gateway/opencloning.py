@@ -1107,6 +1107,44 @@ class OpenCloningAdapter:
 
         return preview_map
 
+    # --- C17c: deterministic validation bundle ----------------------------
+
+    def build_validation_bundle(
+        self,
+        *,
+        run_id: str,
+        approval_args: dict[str, Any],
+        step_manifests: list[dict[str, Any]] | None = None,
+        protocol_result: dict[str, Any] | None = None,
+        preview_refs_count: int = 0,
+    ) -> dict[str, Any]:
+        """Build a deterministic validation bundle from accumulated state.
+
+        The bundle is the gate between "simulation done" and "user can approve
+        writeback."  It is built from captured facts (strategy sequences,
+        sources, primers, artifact reference), not from LLM output, so the LLM
+        cannot influence validation results.
+
+        Returns the bundle as a JSON-serializable dict (schema
+        ``opencloning_validation_bundle_v1``) with ``is_approved`` set to
+        ``False`` if any blocker check failed.
+        """
+        from lab_copilot_gateway.opencloning_validation import (
+            build_validation_bundle as _build_bundle,
+        )
+
+        bundle = _build_bundle(
+            run_id=run_id,
+            sequences=list(self._strategy_sequences),
+            sources=list(self._strategy_sources),
+            primers=list(self._strategy_primers),
+            artifacts=approval_args,
+            step_manifests=list(step_manifests or []),
+            protocol_result=protocol_result,
+            preview_refs_count=preview_refs_count,
+        )
+        return bundle.to_dict()
+
     # --- C17b: writeback artifact to eLabFTW ------------------------------
 
     def writeback_artifact(
@@ -1193,9 +1231,20 @@ class OpenCloningAdapter:
             )
             raise FileTooLarge(len(artifact_bytes), MAX_FILE_SIZE_BYTES)
 
+        # Build the deterministic validation bundle from accumulated cloning
+        # state BEFORE the writeback upload.  The bundle is the gate between
+        # "simulation done" and "user can approve writeback" — it is built from
+        # captured facts (strategy sequences/sources/primers + artifact ref),
+        # not from LLM output.  Included in the result so the orchestrator/
+        # widget can display validation status on the approval card.
+        validation_bundle = self.build_validation_bundle(
+            run_id=request_id or f"writeback-{conversation_id or 'unknown'}",
+            approval_args=approval_args,
+        )
+
         # Use the shared orchestration for token verify + identity + policy.
         # The exec_fn uploads the artifact via the eLabFTW client.
-        return self._execute_writeback(
+        result = self._execute_writeback(
             context_token=context_token,
             approval_id=approval_id,
             approval_args=approval_args,
@@ -1212,6 +1261,10 @@ class OpenCloningAdapter:
             artifact_reference=artifact_reference,
             plan_approval_id=plan_approval_id,
         )
+        # Surface the validation bundle in the result dict so the orchestrator
+        # can emit it as an SSE event and the widget can display it.
+        result.result["validation_bundle"] = validation_bundle
+        return result
 
     def _verify_identity_binding(
         self,

@@ -956,11 +956,19 @@ def _invoke_opencloning_tool(
                 provider=body.provider,
                 model_id=body.model_id,
             )
-            return {
+            response: dict[str, object] = {
                 "ok": True,
                 "tool_name": tool.name,
                 "result": result.to_dict(),
             }
+            # Surface the validation bundle at the top level so the
+            # orchestrator can emit it as an SSE event
+            # (lab_copilot_validation_bundle) and the widget can display
+            # validation status on the approval card.
+            bundle = result.result.get("validation_bundle")
+            if isinstance(bundle, dict):
+                response["validation_bundle"] = bundle
+            return response
         elif tool.name == "opencloning.call":
             result = adapter.call_endpoint(
                 context_token=body.context_token,
