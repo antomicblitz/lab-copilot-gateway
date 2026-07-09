@@ -457,6 +457,8 @@ def build_validation_bundle(
     step_manifests: list[dict[str, Any]],
     protocol_result: dict[str, Any] | None,
     preview_refs_count: int,
+    notebook_draft_generated: bool = False,
+    audit_draft_generated: bool = False,
 ) -> ValidationBundle:
     """Build a validation bundle from the cloning run state.
 
@@ -481,6 +483,10 @@ def build_validation_bundle(
         protocol_result: Protocol lookup result dict (from
             ``ProtocolLookupResult.to_dict()``).  ``None`` if no lookup.
         preview_refs_count: Number of OVE preview refs generated.
+        notebook_draft_generated: Whether the notebook summary draft has
+            been generated (default ``False`` — T10 sets ``True``).
+        audit_draft_generated: Whether the Markdown audit report draft has
+            been generated (default ``False`` — T10 sets ``True``).
     """
     builder = ValidationBundleBuilder(run_id=run_id)
 
@@ -528,10 +534,10 @@ def build_validation_bundle(
     builder.check_preview_refs(preview_refs_count, total_steps)
 
     # 9. Notebook summary draft (WARNING — produced by T10).
-    builder.check_notebook_summary(draft_generated=False)
+    builder.check_notebook_summary(draft_generated=notebook_draft_generated)
 
     # 10. Audit report draft (WARNING — produced by T10).
-    builder.check_audit_report(draft_generated=False)
+    builder.check_audit_report(draft_generated=audit_draft_generated)
 
     return builder.build()
 

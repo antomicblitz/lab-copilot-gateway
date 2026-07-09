@@ -996,10 +996,13 @@ def test_writeback_attaches_artifact_to_experiment(
     assert result.result["artifact_filename"] == "construct.gb"
 
     # Verify the attachment was uploaded to the eLabFTW stub.
+    # The writeback flow also uploads a Markdown audit report (T10).
     uploads = elabftw_stub.seeds[42]["uploads"]
-    assert len(uploads) == 1
+    assert len(uploads) == 2
     assert uploads[0]["real_name"] == "construct.gb"
     assert uploads[0]["comment"] == "OpenCloning design artifact"
+    assert uploads[1]["real_name"] == "construct_audit_report.md"
+    assert "Cloning audit report" in uploads[1]["comment"]
 
     # Verify provenance was written to metadata in the eLabFTW-valid
     # {type, value, description} object format.
@@ -1066,10 +1069,12 @@ def test_writeback_resolves_artifact_bundle_reference(
 
     assert result.result["artifact_filename"] == "construct.gb"
     uploads = elabftw_stub.seeds[42]["uploads"]
-    assert len(uploads) == 1
+    # Two uploads: artifact + audit report Markdown (T10).
+    assert len(uploads) == 2
     assert uploads[0]["real_name"] == "construct.gb"
     assert uploads[0]["size"] == len(data)
     assert uploads[0]["comment"] == "OpenCloning bundled artifact"
+    assert uploads[1]["real_name"] == "construct_audit_report.md"
 
 
 def test_writeback_bundle_hash_mismatch_fails_before_upload(
