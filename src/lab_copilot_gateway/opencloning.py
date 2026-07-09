@@ -35,6 +35,7 @@ Tools exposed (all already in the C06 tool registry):
 
 from __future__ import annotations
 
+import hashlib
 import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -672,6 +673,177 @@ class OpenCloningResult:
         }
 
 
+# --- C52: writeback package data structures --------------------------------
+
+
+@dataclass
+class WritebackStepResult:
+    """Result of a single writeback step (upload, append, patch).
+
+    Each step in the expanded writeback package produces one of these so
+    the caller can report exactly what succeeded, what failed, and what
+    upload IDs were assigned.
+    """
+
+    step_name: str  # "upload_genbank", "upload_history", etc.
+    status: str  # "success" | "failed" | "skipped"
+    upload_id: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class WritebackResult:
+    """Aggregate result of the expanded writeback package.
+
+    ``status`` is "success" only if all required steps succeeded.
+    "partial" means some steps succeeded but a non-blocking step failed
+    (e.g. metadata patch). "failed" means a blocking step failed (e.g.
+    audit report upload) or the primary artifact upload failed.
+    """
+
+    status: str  # "success" | "partial" | "failed"
+    upload_ids: dict[str, int]  # {"genbank": 123, "history": 124, ...}
+    notebook_appended: bool
+    metadata_patched: bool
+    steps: list[WritebackStepResult]
+    rollback_instructions: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "upload_ids": dict(self.upload_ids),
+            "notebook_appended": self.notebook_appended,
+            "metadata_patched": self.metadata_patched,
+            "steps": [
+                {
+                    "step_name": s.step_name,
+                    "status": s.status,
+                    "upload_id": s.upload_id,
+                    "error": s.error,
+                }
+                for s in self.steps
+            ],
+            "rollback_instructions": self.rollback_instructions,
+            "warnings": list(self.warnings),
+        }
+
+
+# --- C52: writeback package hash -------------------------------------------
+
+
+def _compute_writeback_package_hash(
+    artifact_manifest: dict[str, Any],
+    final_construct_hash: str,
+    history_json_hash: str,
+    audit_report_hash: str,
+    notebook_summary_hash: str,
+    selected_intermediate_attachments: list[dict[str, Any]],
+    protocol_source_refs: list[str],
+    validation_bundle_version: str,
+) -> str:
+    """Compute a hash that binds approval to the exact writeback package.
+
+    The hash covers every component of the writeback package: the final
+    GenBank construct, the history JSON, the audit report, the notebook
+    summary, the selected intermediate attachments, protocol source
+    references, and the validation bundle version. If any component
+    changes, the hash changes and the old approval is invalid.
+
+    This uses the same canonical-JSON + SHA-256 approach as
+    ``compute_args_hash`` so it is byte-stable across runs.
+    """
+    return compute_args_hash(
+        {
+            "artifact_manifest": artifact_manifest,
+            "final_construct_hash": final_construct_hash,
+            "history_json_hash": history_json_hash,
+            "audit_report_hash": audit_report_hash,
+            "notebook_summary_hash": notebook_summary_hash,
+            "selected_intermediate_attachments": selected_intermediate_attachments,
+            "protocol_source_refs": protocol_source_refs,
+            "validation_bundle_version": validation_bundle_version,
+        }
+    )
+
+
+def _wrap_amendment_html(existing_body: str, amendment_html: str) -> str:
+    """Wrap an amendment in an HTML section marker.
+
+    Mirrors ``ElabftwWriteAdapter._wrap_amendment`` so the OpenCloning
+    adapter can append notebook entries directly via the eLabFTW client
+    without going through the write adapter. The wrapper is a styled
+    ``<section>`` so eLabFTW viewers can visually identify AI-generated
+    amendments.
+    """
+    if not amendment_html:
+        return existing_body
+    section = (
+        '<section data-source="lab-copilot-gateway" '
+        'data-amendment="1">'
+        f"{amendment_html}"
+        "</section>"
+    )
+    if not existing_body:
+        return section
+    return existing_body.rstrip() + "\n\n" + section
+
+
+def _build_rollback_instructions(
+    upload_ids: dict[str, int],
+    experiment_id: int,
+) -> str:
+    """Build actionable rollback instructions for a partial writeback.
+
+    Lists the uploaded attachment IDs that should be manually deleted from
+    the experiment if the user wants to undo the partial writeback.
+    """
+    uploaded = [
+        f"{name} (upload_id={uid})"
+        for name, uid in upload_ids.items()
+        if uid is not None
+    ]
+    if not uploaded:
+        return "No attachments were uploaded — no rollback needed."
+    return (
+        f"To undo this partial writeback on experiment {experiment_id}, "
+        f"manually delete the following attachments in eLabFTW: "
+        + ", ".join(uploaded)
+        + ". Then remove the lab-copilot amendment section from the "
+        "experiment body if one was appended."
+    )
+
+
+def _step_flags(steps: list[WritebackStepResult]) -> dict[str, bool]:
+    """Extract success/failure flags for each writeback step name.
+
+    Returns a dict with keys like ``notebook_appended``, ``genbank_failed``,
+    etc. — one per step name × status combination the assembler checks.
+    """
+    result: dict[str, bool] = {
+        "notebook_appended": False,
+        "metadata_patched": False,
+        "genbank_failed": False,
+        "audit_failed": False,
+        "notebook_failed": False,
+        "metadata_failed": False,
+    }
+    for s in steps:
+        if s.step_name == "append_notebook" and s.status == "success":
+            result["notebook_appended"] = True
+        elif s.step_name == "append_notebook" and s.status == "failed":
+            result["notebook_failed"] = True
+        elif s.step_name == "patch_metadata" and s.status == "success":
+            result["metadata_patched"] = True
+        elif s.step_name == "patch_metadata" and s.status == "failed":
+            result["metadata_failed"] = True
+        elif s.step_name == "upload_genbank" and s.status == "failed":
+            result["genbank_failed"] = True
+        elif s.step_name == "upload_audit_report" and s.status == "failed":
+            result["audit_failed"] = True
+    return result
+
+
 # --- adapter --------------------------------------------------------------
 
 
@@ -1151,6 +1323,53 @@ class OpenCloningAdapter:
 
     # --- C17b: writeback artifact to eLabFTW ------------------------------
 
+    def _compute_package_hash_for_writeback(
+        self,
+        *,
+        artifact_bytes: bytes,
+        artifact_filename: str,
+        approval_args: dict[str, Any],
+    ) -> str:
+        """Compute the writeback package hash from actual content.
+
+        Renders the history JSON and reports from accumulated strategy
+        state so the hash binds to the exact package that will be uploaded.
+        The orchestrator computes the same hash before requesting approval
+        and includes it in ``approval_args["writeback_package_hash"]``.
+        """
+        history_data = self._build_history_json(artifact_filename=artifact_filename)
+        history_json_bytes = history_data[0] if history_data else b""
+        reports = self._render_writeback_reports(
+            upload_id=None,
+            history_upload_id=None,
+            approval_args=approval_args,
+        )
+        notebook_html = reports.get("notebook_html") or ""
+        audit_markdown = reports.get("audit_markdown") or ""
+        final_construct_hash = hashlib.sha256(artifact_bytes).hexdigest()
+        history_json_hash = hashlib.sha256(history_json_bytes).hexdigest()
+        audit_report_hash = hashlib.sha256(audit_markdown.encode("utf-8")).hexdigest()
+        notebook_summary_hash = hashlib.sha256(
+            notebook_html.encode("utf-8")
+        ).hexdigest()
+        artifact_manifest = {
+            "artifact_filename": artifact_filename,
+            "artifact_size": len(artifact_bytes),
+        }
+        selected_ids = approval_args.get("selected_intermediate_ids") or []
+        selected_intermediate_attachments = [{"id": sid} for sid in selected_ids]
+        protocol_source_refs = list(approval_args.get("protocol_source_refs") or [])
+        return _compute_writeback_package_hash(
+            artifact_manifest=artifact_manifest,
+            final_construct_hash=final_construct_hash,
+            history_json_hash=history_json_hash,
+            audit_report_hash=audit_report_hash,
+            notebook_summary_hash=notebook_summary_hash,
+            selected_intermediate_attachments=selected_intermediate_attachments,
+            protocol_source_refs=protocol_source_refs,
+            validation_bundle_version="opencloning_validation_bundle_v1",
+        )
+
     def writeback_artifact(
         self,
         *,
@@ -1246,6 +1465,51 @@ class OpenCloningAdapter:
             approval_args=approval_args,
         )
 
+        # C52: compute the writeback package hash from actual content. If
+        # approval_args contains writeback_package_hash, verify it matches
+        # BEFORE consuming the approval (fail closed on mismatch — the
+        # strategy state changed between approval and writeback).
+        package_hash = self._compute_package_hash_for_writeback(
+            artifact_bytes=artifact_bytes,
+            artifact_filename=artifact_filename,
+            approval_args=approval_args,
+        )
+        expected_hash = approval_args.get("writeback_package_hash")
+        if expected_hash and package_hash != expected_hash:
+            self._audit(
+                tool_name=TOOL_WRITEBACK,
+                policy_decision="deny",
+                reason="package_hash_mismatch",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=compute_args_hash(
+                    {
+                        "artifact_filename": artifact_filename,
+                        "expected_hash": expected_hash,
+                        "actual_hash": package_hash,
+                    }
+                ),
+                error={
+                    "code": "PACKAGE_HASH_MISMATCH",
+                    "expected": expected_hash,
+                    "actual": package_hash,
+                },
+            )
+            raise OpenCloningAdapterError(
+                reason="package_hash_mismatch",
+                message=(
+                    "writeback package hash does not match the approved hash "
+                    "— the cloning strategy changed between approval and "
+                    "writeback. Request a new approval."
+                ),
+            )
+
         # Use the shared orchestration for token verify + identity + policy.
         # The exec_fn uploads the artifact via the eLabFTW client.
         result = self._execute_writeback(
@@ -1268,10 +1532,17 @@ class OpenCloningAdapter:
         # Surface the validation bundle in the result dict so the orchestrator
         # can emit it as an SSE event and the widget can display it.
         result.result["validation_bundle"] = validation_bundle
+        # C52: include the package hash in the result for transparency.
+        result.result["writeback_package_hash"] = package_hash
 
         # C52: rebuild bundle with report-draft checks set to "pass" now that
         # the reports have been generated inside _execute_writeback.
-        if result.result.get("notebook_summary_html") is not None:
+        wb_result = result.result.get("writeback_result")
+        if isinstance(wb_result, dict):
+            notebook_appended = wb_result.get("notebook_appended", False)
+        else:
+            notebook_appended = result.result.get("notebook_summary_html") is not None
+        if notebook_appended:
             updated_bundle = self.build_validation_bundle(
                 run_id=request_id or f"writeback-{conversation_id or 'unknown'}",
                 approval_args=approval_args,
@@ -1691,27 +1962,20 @@ class OpenCloningAdapter:
         except Exception:
             return artifact_bytes
 
-    def _generate_writeback_reports(
+    def _render_writeback_reports(
         self,
         *,
         upload_id: int | None,
         history_upload_id: int | None,
-        artifact_filename: str,
-        claims: Any,
-        rt_param: str,
         approval_args: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Generate notebook summary HTML and Markdown audit report (T10).
+    ) -> dict[str, str | None]:
+        """Render notebook summary HTML and Markdown audit report (T10/T52).
 
         Both are deterministic — built from accumulated cloning state.
-        The audit report is uploaded as an attachment; the notebook summary
-        HTML is returned for the amendment path.
+        No upload is performed here; the caller uploads the audit report
+        and appends the notebook HTML in separate steps so partial failures
+        can be tracked individually.
         """
-        result: dict[str, Any] = {
-            "notebook_html": None,
-            "audit_markdown": None,
-            "audit_report_upload_id": None,
-        }
         try:
             from lab_copilot_gateway.opencloning_reports import (
                 render_cloning_audit_report_markdown,
@@ -1729,7 +1993,7 @@ class OpenCloningAdapter:
                 "history_json": history_upload_id,
             }
 
-            result["notebook_html"] = render_notebook_summary(
+            notebook_html = render_notebook_summary(
                 sequences=list(self._strategy_sequences),
                 sources=list(self._strategy_sources),
                 primers=list(self._strategy_primers),
@@ -1740,7 +2004,7 @@ class OpenCloningAdapter:
                 llm_rationale=llm_rationale,
             )
 
-            result["audit_markdown"] = render_cloning_audit_report_markdown(
+            audit_markdown = render_cloning_audit_report_markdown(
                 sequences=list(self._strategy_sequences),
                 sources=list(self._strategy_sources),
                 primers=list(self._strategy_primers),
@@ -1751,29 +2015,345 @@ class OpenCloningAdapter:
                 method=method,
             )
 
-            # Upload the Markdown audit report as an attachment.
-            if result["audit_markdown"]:
-                assert self.elabftw_client is not None
-                try:
-                    audit_bytes = result["audit_markdown"].encode("utf-8")
-                    audit_filename = (
-                        artifact_filename.rsplit(".", 1)[0] + "_audit_report.md"
-                    )
-                    result["audit_report_upload_id"] = (
-                        self.elabftw_client.upload_attachment(
-                            experiment_id=claims.experiment_id,
-                            filename=audit_filename,
-                            data=audit_bytes,
-                            comment="Cloning audit report — generated by Lab Copilot Gateway",
-                            record_type=rt_param,
-                        )
-                    )
-                except Exception:
-                    result["audit_report_upload_id"] = None
+            return {"notebook_html": notebook_html, "audit_markdown": audit_markdown}
         except Exception:
-            result["notebook_html"] = None
-            result["audit_markdown"] = None
-        return result
+            return {"notebook_html": None, "audit_markdown": None}
+
+    def _build_history_json(
+        self,
+        *,
+        artifact_filename: str,
+    ) -> tuple[bytes, str] | None:
+        """Build the cloning history JSON bytes and filename.
+
+        Returns ``None`` if no strategy data has been accumulated.
+        Extracted from ``_execute_writeback`` so the hash can be computed
+        before the approval is consumed.
+        """
+        if not (self._strategy_sequences or self._strategy_sources):
+            return None
+        import json as _json
+        import os as _os
+
+        strategy = {
+            "sequences": [dict(s) for s in self._strategy_sequences],
+            "sources": [dict(s) for s in self._strategy_sources],
+            "primers": [dict(p) for p in self._strategy_primers],
+        }
+        _strip_self_references(strategy["sources"])
+        _strip_sequence_names(strategy["sequences"])
+        try:
+            resp = self.client.get("/version")  # type: ignore[union-attr]
+            strategy["backend_version"] = resp.get("backend_version", "")
+            strategy["schema_version"] = resp.get("schema_version", "")
+        except Exception:
+            pass
+        strategy_json = _json.dumps(strategy, indent=2).encode("utf-8")
+        strategy_filename = _os.path.splitext(artifact_filename)[0] + "_history.json"
+        return strategy_json, strategy_filename
+
+    def _upload_genbank_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        artifact_filename: str,
+        artifact_bytes: bytes,
+        artifact_comment: str,
+    ) -> WritebackStepResult:
+        """Upload the final GenBank construct as an attachment."""
+        assert self.elabftw_client is not None
+        try:
+            upload_id = self.elabftw_client.upload_attachment(
+                experiment_id=claims.experiment_id,
+                filename=artifact_filename,
+                data=artifact_bytes,
+                comment=artifact_comment,
+                record_type=rt_param,
+            )
+            return WritebackStepResult(
+                step_name="upload_genbank",
+                status="success",
+                upload_id=upload_id,
+            )
+        except Exception as exc:
+            return WritebackStepResult(
+                step_name="upload_genbank",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _upload_history_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        history_json: bytes | None,
+        history_filename: str | None,
+    ) -> WritebackStepResult:
+        """Upload the cloning history JSON as an attachment."""
+        if history_json is None or history_filename is None:
+            return WritebackStepResult(step_name="upload_history", status="skipped")
+        assert self.elabftw_client is not None
+        try:
+            upload_id = self.elabftw_client.upload_attachment(
+                experiment_id=claims.experiment_id,
+                filename=history_filename,
+                data=history_json,
+                comment="cloning history - generated by OpenCloning via Lab Copilot",
+                record_type=rt_param,
+            )
+            return WritebackStepResult(
+                step_name="upload_history",
+                status="success",
+                upload_id=upload_id,
+            )
+        except Exception as exc:
+            return WritebackStepResult(
+                step_name="upload_history",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _upload_audit_report_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        audit_markdown: str | None,
+        artifact_filename: str,
+    ) -> WritebackStepResult:
+        """Upload the Markdown audit report as an attachment (BLOCKING)."""
+        if not audit_markdown:
+            return WritebackStepResult(
+                step_name="upload_audit_report",
+                status="failed",
+                error="audit report markdown was not generated",
+            )
+        assert self.elabftw_client is not None
+        try:
+            audit_bytes = audit_markdown.encode("utf-8")
+            audit_filename = artifact_filename.rsplit(".", 1)[0] + "_audit_report.md"
+            upload_id = self.elabftw_client.upload_attachment(
+                experiment_id=claims.experiment_id,
+                filename=audit_filename,
+                data=audit_bytes,
+                comment="Cloning audit report — generated by Lab Copilot Gateway",
+                record_type=rt_param,
+            )
+            return WritebackStepResult(
+                step_name="upload_audit_report",
+                status="success",
+                upload_id=upload_id,
+            )
+        except Exception as exc:
+            return WritebackStepResult(
+                step_name="upload_audit_report",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _upload_intermediates_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        approval_args: dict[str, Any],
+        artifact_filename: str,
+    ) -> list[WritebackStepResult]:
+        """Upload selected intermediate sequences (opt-in via checkbox).
+
+        When ``include_intermediate_attachments`` is True in approval_args,
+        each sequence whose id is in ``selected_intermediate_ids`` is
+        uploaded as a separate GenBank file. When False (default), this
+        step is skipped entirely.
+        """
+        if not approval_args.get("include_intermediate_attachments"):
+            return [
+                WritebackStepResult(step_name="upload_intermediates", status="skipped")
+            ]
+        selected_ids = approval_args.get("selected_intermediate_ids") or []
+        if not selected_ids:
+            return [
+                WritebackStepResult(step_name="upload_intermediates", status="skipped")
+            ]
+        return self._upload_selected_intermediates(
+            claims=claims,
+            rt_param=rt_param,
+            selected_ids=selected_ids,
+            artifact_filename=artifact_filename,
+        )
+
+    def _upload_selected_intermediates(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        selected_ids: list[Any],
+        artifact_filename: str,
+    ) -> list[WritebackStepResult]:
+        """Upload each selected intermediate sequence as a GenBank file."""
+        assert self.elabftw_client is not None
+        results: list[WritebackStepResult] = []
+        base_name = artifact_filename.rsplit(".", 1)[0]
+        for seq in self._strategy_sequences:
+            seq_id = seq.get("id")
+            if seq_id not in selected_ids:
+                continue
+            file_content = seq.get("file_content")
+            if not file_content:
+                continue
+            content_bytes = (
+                file_content.encode("utf-8")
+                if isinstance(file_content, str)
+                else file_content
+            )
+            seq_name = str(seq.get("name") or seq_id)
+            filename = f"{base_name}_intermediate_{seq_name}.gb"
+            try:
+                upload_id = self.elabftw_client.upload_attachment(
+                    experiment_id=claims.experiment_id,
+                    filename=filename,
+                    data=content_bytes,
+                    comment=f"Intermediate sequence {seq_name} — generated by Lab Copilot Gateway",
+                    record_type=rt_param,
+                )
+                results.append(
+                    WritebackStepResult(
+                        step_name=f"upload_intermediate_{seq_id}",
+                        status="success",
+                        upload_id=upload_id,
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    WritebackStepResult(
+                        step_name=f"upload_intermediate_{seq_id}",
+                        status="failed",
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                )
+        return results
+
+    def _append_notebook_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        notebook_html: str | None,
+    ) -> WritebackStepResult:
+        """Append the notebook summary to the experiment body."""
+        if not notebook_html:
+            return WritebackStepResult(
+                step_name="append_notebook",
+                status="skipped",
+                error="notebook HTML was not generated",
+            )
+        assert self.elabftw_client is not None
+        try:
+            current = self.elabftw_client.get_experiment(int(claims.experiment_id))
+            existing_body = str(current.get("body", "") or "")
+            amended_body = _wrap_amendment_html(existing_body, notebook_html)
+            self.elabftw_client.patch_experiment_body(
+                int(claims.experiment_id), amended_body
+            )
+            return WritebackStepResult(step_name="append_notebook", status="success")
+        except Exception as exc:
+            return WritebackStepResult(
+                step_name="append_notebook",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _patch_metadata_step(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        action_id: str,
+        upload_id: int | None,
+    ) -> WritebackStepResult:
+        """Patch metadata/provenance (non-blocking)."""
+        assert self.elabftw_client is not None
+        try:
+            if rt_param == "items":
+                current_record = self.elabftw_client.get_item(int(claims.experiment_id))
+            else:
+                current_record = self.elabftw_client.get_experiment(
+                    int(claims.experiment_id)
+                )
+            existing_metadata = current_record.get("metadata") or {}
+            updated_metadata = _merge_provenance_into_metadata(
+                existing_metadata,
+                action_id,
+                {
+                    "lab_copilot_audit_id": action_id,
+                    "lab_copilot_tool": TOOL_WRITEBACK,
+                    "lab_copilot_upload_id": str(upload_id or 0),
+                },
+            )
+            self.elabftw_client.patch_experiment_metadata(
+                experiment_id=claims.experiment_id,
+                metadata=updated_metadata,
+                record_type=rt_param,
+            )
+            return WritebackStepResult(step_name="patch_metadata", status="success")
+        except Exception as exc:
+            return WritebackStepResult(
+                step_name="patch_metadata",
+                status="failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _assemble_writeback_result(
+        self,
+        *,
+        steps: list[WritebackStepResult],
+        upload_ids: dict[str, int],
+        experiment_id: int,
+    ) -> WritebackResult:
+        """Determine overall status from step results.
+
+        Rules:
+        - GenBank upload failure → "failed" (primary deliverable missing)
+        - Audit report upload failure → "failed" (audit trail incomplete)
+        - Notebook append failure after uploads → "partial" with rollback
+        - Metadata patch failure after notebook → "success" with warning
+        """
+        flags = _step_flags(steps)
+        rollback = _build_rollback_instructions(upload_ids, experiment_id)
+        if flags["genbank_failed"] or flags["audit_failed"]:
+            return WritebackResult(
+                status="failed",
+                upload_ids=upload_ids,
+                notebook_appended=flags["notebook_appended"],
+                metadata_patched=flags["metadata_patched"],
+                steps=steps,
+                rollback_instructions=rollback,
+            )
+        if flags["notebook_failed"]:
+            return WritebackResult(
+                status="partial",
+                upload_ids=upload_ids,
+                notebook_appended=flags["notebook_appended"],
+                metadata_patched=flags["metadata_patched"],
+                steps=steps,
+                rollback_instructions=rollback,
+            )
+        warnings: list[str] = []
+        if flags["metadata_failed"]:
+            warnings.append(
+                "Metadata/provenance patch failed — the notebook entry is "
+                "visible but provenance metadata was not updated."
+            )
+        return WritebackResult(
+            status="success",
+            upload_ids=upload_ids,
+            notebook_appended=flags["notebook_appended"],
+            metadata_patched=flags["metadata_patched"],
+            steps=steps,
+            warnings=warnings,
+        )
 
     def _require_elabftw_client(
         self,
@@ -1841,6 +2421,12 @@ class OpenCloningAdapter:
         consumed the plan-level approval (bound to the plan hash, which covers
         all step args).  The per-step approval consume is skipped; the plan
         approval_id is used in audit records.
+
+        C52: the writeback package now includes the GenBank construct, history
+        JSON, Markdown audit report, optional intermediate attachments, a
+        notebook entry appended to the experiment body, and metadata
+        provenance. Each step is tracked as a ``WritebackStepResult`` so
+        partial failures are reported clearly with rollback instructions.
         """
         early_hash = compute_args_hash(
             {
@@ -1957,159 +2543,279 @@ class OpenCloningAdapter:
         # 6b. Rewrite GenBank features to fix pydna annotation gaps.
         artifact_bytes = self._maybe_rewrite_genbank_features(artifact_bytes)
 
-        # 7. Upload the artifact as an attachment.
-        # record_type: "resource" → /api/v2/items/{id}, else /api/v2/experiments/{id}
-        rt_param = "items" if claims.record_type == "resource" else "experiments"
-        assert self.elabftw_client is not None
-        try:
-            upload_id = self.elabftw_client.upload_attachment(
-                experiment_id=claims.experiment_id,
-                filename=artifact_filename,
-                data=artifact_bytes,
-                comment=artifact_comment,
-                record_type=rt_param,
-            )
-        except Exception as exc:
-            self._audit(
-                tool_name=TOOL_WRITEBACK,
-                policy_decision="allow",
-                reason="client_error",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                approval_id=effective_approval_id,
-                api_call_summary={
-                    "method": "POST",
-                    "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",
-                },
-                error={
-                    "code": "CLIENT_ERROR",
-                    "exception": type(exc).__name__,
-                    "message": str(exc),
-                },
-            )
-            raise OpenCloningAdapterError(
-                reason="client_error",
-                message=f"eLabFTW upload failed {type(exc).__name__}: {exc}",
-            ) from exc
-
-        # 7b. Build and upload the cloning history JSON.
-        # This matches what the OpenCloning frontend saves to eLabFTW as
-        # {title}_history.json — the full reproducible workflow including
-        # all intermediate sequences, their sources (provenance chain), and
-        # primers. The JSON can be loaded back into OpenCloning via
-        # "File > Load cloning history from file" or via the URL parameter
-        # ?source=database&item_id=<id>&file_id=<upload_id>.
-        history_upload_id = None
-        if self._strategy_sequences or self._strategy_sources:
-            import json as _json
-            import os as _os
-
-            # Build the cloning strategy from accumulated state
-            strategy = {
-                "sequences": self._strategy_sequences,
-                "sources": self._strategy_sources,
-                "primers": self._strategy_primers,
-            }
-
-            # Strip self-referencing inputs from sources (PCR sources that
-            # reference their own output create cycles that /validate rejects).
-            _strip_self_references(strategy["sources"])
-
-            # Strip the 'name' field from sequences — it's not part of the
-            # TextFileSequence schema (extra='forbid') and causes /validate
-            # to reject the history JSON. The name is already in the LOCUS
-            # line of the GenBank file_content.
-            _strip_sequence_names(strategy["sequences"])
-
-            # Add version info (best-effort)
-            try:
-                resp = self.client.get("/version")  # type: ignore[union-attr]
-                strategy["backend_version"] = resp.get("backend_version", "")
-                strategy["schema_version"] = resp.get("schema_version", "")
-            except Exception:
-                pass
-
-            strategy_json = _json.dumps(strategy, indent=2).encode("utf-8")
-            strategy_filename = (
-                _os.path.splitext(artifact_filename)[0] + "_history.json"
-            )
-
-            assert self.elabftw_client is not None
-            try:
-                history_upload_id = self.elabftw_client.upload_attachment(
-                    experiment_id=claims.experiment_id,
-                    filename=strategy_filename,
-                    data=strategy_json,
-                    comment="cloning history - generated by OpenCloning via Lab Copilot",
-                    record_type=rt_param,
-                )
-            except Exception:
-                # Non-fatal — the GenBank file is already uploaded.
-                # The history is a bonus, not a requirement.
-                history_upload_id = None
-
-        # 7c. Generate notebook summary and audit report (T10).
-        reports = self._generate_writeback_reports(
-            upload_id=upload_id,
-            history_upload_id=history_upload_id,
-            artifact_filename=artifact_filename,
-            claims=claims,
-            rt_param=rt_param,
-            approval_args=approval_args,
-        )
-        notebook_html = reports["notebook_html"]
-        audit_markdown = reports["audit_markdown"]
-        audit_report_upload_id = reports["audit_report_upload_id"]
-
-        # 8. Write provenance (audit_action_id in metadata).
+        # 7. Run all writeback steps (uploads, notebook append, metadata).
         import secrets as _secrets
         import time as _time
 
-        action_id = f"{self.action_id_prefix}-writeback-{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+        action_id = (
+            f"{self.action_id_prefix}-writeback-"
+            f"{int(_time.time() * 1000)}-{_secrets.token_hex(4)}"
+        )
+        rt_param = "items" if claims.record_type == "resource" else "experiments"
+        wb_result = self._run_writeback_steps(
+            claims=claims,
+            rt_param=rt_param,
+            artifact_filename=artifact_filename,
+            artifact_bytes=artifact_bytes,
+            artifact_comment=artifact_comment,
+            approval_args=approval_args,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            effective_approval_id=effective_approval_id,
+            action_id=action_id,
+        )
 
-        assert self.elabftw_client is not None
-        try:
-            # Read existing metadata so we don't clobber it; then merge the
-            # lab-copilot provenance extra fields in the eLabFTW-valid
-            # {type, value, description} object format.
-            if rt_param == "items":
-                current_record = self.elabftw_client.get_item(int(claims.experiment_id))
-            else:
-                current_record = self.elabftw_client.get_experiment(
-                    int(claims.experiment_id)
-                )
-            existing_metadata = current_record.get("metadata") or {}
-            updated_metadata = _merge_provenance_into_metadata(
-                existing_metadata,
-                action_id,
-                {
-                    "lab_copilot_audit_id": action_id,
-                    "lab_copilot_tool": TOOL_WRITEBACK,
-                    "lab_copilot_upload_id": str(upload_id),
-                },
-            )
-            self.elabftw_client.patch_experiment_metadata(
-                experiment_id=claims.experiment_id,
-                metadata=updated_metadata,
-                record_type=rt_param,
-            )
-        except Exception:
-            # Provenance write failure is not fatal — the artifact is
-            # already uploaded.  Log to audit but don't raise.
-            pass
+        # 8. Audit the writeback result.
+        self._audit_writeback_result(
+            wb_result=wb_result,
+            artifact_filename=artifact_filename,
+            artifact_bytes=artifact_bytes,
+            claims=claims,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            effective_approval_id=effective_approval_id,
+            action_id=action_id,
+        )
 
-        # 9. Success audit.
+        return self._build_writeback_opencloning_result(
+            wb_result=wb_result,
+            claims=claims,
+            artifact_filename=artifact_filename,
+            artifact_bytes=artifact_bytes,
+            action_id=action_id,
+        )
+
+    def _run_writeback_steps(
+        self,
+        *,
+        claims: Any,
+        rt_param: str,
+        artifact_filename: str,
+        artifact_bytes: bytes,
+        artifact_comment: str,
+        approval_args: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        effective_approval_id: str,
+        action_id: str,
+    ) -> WritebackResult:
+        """Run all writeback upload/append/patch steps in order.
+
+        Steps:
+        1. Upload GenBank (blocking on failure)
+        2. Upload history JSON (non-blocking)
+        3. Upload audit report (BLOCKING — audit trail must be complete)
+        4. Upload intermediate attachments (opt-in, non-blocking)
+        5. Append notebook entry (non-blocking, but affects status)
+        6. Patch metadata/provenance (non-blocking)
+        """
+        steps: list[WritebackStepResult] = []
+        upload_ids: dict[str, int] = {}
+
+        # Step 1: Upload GenBank (blocking).
+        genbank_step = self._upload_genbank_step(
+            claims=claims,
+            rt_param=rt_param,
+            artifact_filename=artifact_filename,
+            artifact_bytes=artifact_bytes,
+            artifact_comment=artifact_comment,
+        )
+        steps.append(genbank_step)
+        if genbank_step.status == "failed":
+            self._audit_writeback_error(
+                genbank_step,
+                claims,
+                mapped_identity,
+                conversation_id,
+                request_id,
+                keycloak_subject,
+                librechat_user_id,
+                provider,
+                model_id,
+                tool_args_hash,
+                effective_approval_id,
+            )
+            return WritebackResult(
+                status="failed",
+                upload_ids=upload_ids,
+                notebook_appended=False,
+                metadata_patched=False,
+                steps=steps,
+                rollback_instructions=_build_rollback_instructions(
+                    upload_ids, claims.experiment_id
+                ),
+            )
+        upload_ids["genbank"] = genbank_step.upload_id or 0
+
+        # Step 2: Build + upload history JSON (non-blocking).
+        history_data = self._build_history_json(artifact_filename=artifact_filename)
+        history_json = history_data[0] if history_data else None
+        history_filename = history_data[1] if history_data else None
+        history_step = self._upload_history_step(
+            claims=claims,
+            rt_param=rt_param,
+            history_json=history_json,
+            history_filename=history_filename,
+        )
+        steps.append(history_step)
+        if history_step.upload_id is not None:
+            upload_ids["history_json"] = history_step.upload_id
+
+        # Step 3: Render reports + upload audit report (BLOCKING).
+        reports = self._render_writeback_reports(
+            upload_id=genbank_step.upload_id,
+            history_upload_id=history_step.upload_id,
+            approval_args=approval_args,
+        )
+        notebook_html = reports.get("notebook_html")
+        audit_markdown = reports.get("audit_markdown")
+        audit_step = self._upload_audit_report_step(
+            claims=claims,
+            rt_param=rt_param,
+            audit_markdown=audit_markdown,
+            artifact_filename=artifact_filename,
+        )
+        steps.append(audit_step)
+        if audit_step.status == "failed":
+            self._audit_writeback_error(
+                audit_step,
+                claims,
+                mapped_identity,
+                conversation_id,
+                request_id,
+                keycloak_subject,
+                librechat_user_id,
+                provider,
+                model_id,
+                tool_args_hash,
+                effective_approval_id,
+            )
+            return WritebackResult(
+                status="failed",
+                upload_ids=upload_ids,
+                notebook_appended=False,
+                metadata_patched=False,
+                steps=steps,
+                rollback_instructions=_build_rollback_instructions(
+                    upload_ids, claims.experiment_id
+                ),
+            )
+        if audit_step.upload_id is not None:
+            upload_ids["audit_report"] = audit_step.upload_id
+
+        # Step 4: Upload intermediate attachments (opt-in, non-blocking).
+        intermediate_steps = self._upload_intermediates_step(
+            claims=claims,
+            rt_param=rt_param,
+            approval_args=approval_args,
+            artifact_filename=artifact_filename,
+        )
+        steps.extend(intermediate_steps)
+        for s in intermediate_steps:
+            if s.upload_id is not None:
+                upload_ids[f"intermediate_{s.step_name}"] = s.upload_id
+
+        # Step 5: Append notebook entry (non-blocking, affects status).
+        notebook_step = self._append_notebook_step(
+            claims=claims,
+            rt_param=rt_param,
+            notebook_html=notebook_html,
+        )
+        steps.append(notebook_step)
+
+        # Step 6: Patch metadata/provenance (non-blocking).
+        metadata_step = self._patch_metadata_step(
+            claims=claims,
+            rt_param=rt_param,
+            action_id=action_id,
+            upload_id=genbank_step.upload_id,
+        )
+        steps.append(metadata_step)
+
+        return self._assemble_writeback_result(
+            steps=steps,
+            upload_ids=upload_ids,
+            experiment_id=claims.experiment_id,
+        )
+
+    def _audit_writeback_error(
+        self,
+        step: WritebackStepResult,
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        effective_approval_id: str,
+    ) -> None:
+        """Audit a blocking writeback step failure."""
         self._audit(
             tool_name=TOOL_WRITEBACK,
             policy_decision="allow",
-            reason="writeback_succeeded",
+            reason=f"writeback_step_failed:{step.step_name}",
+            mapped_identity=mapped_identity,
+            experiment_id=claims.experiment_id,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+            approval_id=effective_approval_id,
+            error={
+                "code": "WRITEBACK_STEP_FAILED",
+                "step": step.step_name,
+                "message": step.error or "unknown error",
+            },
+        )
+
+    def _audit_writeback_result(
+        self,
+        *,
+        wb_result: WritebackResult,
+        artifact_filename: str,
+        artifact_bytes: bytes,
+        claims: Any,
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+        effective_approval_id: str,
+        action_id: str,
+    ) -> None:
+        """Audit the final writeback result (success, partial, or failed)."""
+        reason = f"writeback_{wb_result.status}"
+        self._audit(
+            tool_name=TOOL_WRITEBACK,
+            policy_decision="allow",
+            reason=reason,
             mapped_identity=mapped_identity,
             experiment_id=claims.experiment_id,
             conversation_id=conversation_id,
@@ -2125,29 +2831,55 @@ class OpenCloningAdapter:
                 "path": f"/api/v2/experiments/{claims.experiment_id}/uploads",
             },
             result_summary={
-                "upload_id": upload_id,
+                "status": wb_result.status,
+                "upload_ids": wb_result.upload_ids,
                 "artifact_filename": artifact_filename,
                 "artifact_size": len(artifact_bytes),
+                "steps": [s.step_name for s in wb_result.steps],
             },
             require_persistence=True,
             action_id=action_id,
         )
 
+    def _build_writeback_opencloning_result(
+        self,
+        *,
+        wb_result: WritebackResult,
+        claims: Any,
+        artifact_filename: str,
+        artifact_bytes: bytes,
+        action_id: str,
+    ) -> OpenCloningResult:
+        """Build the final OpenCloningResult from a WritebackResult."""
+        genbank_id = wb_result.upload_ids.get("genbank")
+        history_id = wb_result.upload_ids.get("history_json")
+        audit_id = wb_result.upload_ids.get("audit_report")
+
+        # Re-render the notebook HTML for the result dict (it was already
+        # appended to the experiment body; including it in the result lets
+        # the widget display what was written).
+        notebook_html = None
+        for s in wb_result.steps:
+            if s.step_name == "append_notebook" and s.status == "success":
+                notebook_html = "(appended to experiment body)"
+                break
+
         return OpenCloningResult(
             tool_name=TOOL_WRITEBACK,
             result={
-                "upload_id": upload_id,
+                "upload_id": genbank_id,
                 "experiment_id": claims.experiment_id,
                 "artifact_filename": artifact_filename,
-                "history_upload_id": history_upload_id,
+                "history_upload_id": history_id,
                 "notebook_summary_html": notebook_html,
-                "audit_report_markdown": audit_markdown,
-                "audit_report_upload_id": audit_report_upload_id,
+                "audit_report_markdown": None,
+                "audit_report_upload_id": audit_id,
                 "artifact_ids": {
-                    "genbank": upload_id,
-                    "history_json": history_upload_id,
-                    "audit_report": audit_report_upload_id,
+                    "genbank": genbank_id,
+                    "history_json": history_id,
+                    "audit_report": audit_id,
                 },
+                "writeback_result": wb_result.to_dict(),
             },
             audit_action_id=action_id,
         )

@@ -97,6 +97,30 @@ def _is_retryable(error_str: str) -> bool:
     return any(error_str.startswith(r) for r in RETRYABLE_REASONS)
 
 
+def _check_writeback_failure(
+    result: dict[str, Any] | None,
+    tool_name: str,
+) -> str | None:
+    """Check if a writeback result has a failed/partial status.
+
+    Returns an error string (starting with "client_error:" for retryability)
+    if the writeback failed or was partial, or None if it succeeded.
+    """
+    if tool_name != TOOL_WRITEBACK or not isinstance(result, dict):
+        return None
+    inner = result.get("result")
+    if not isinstance(inner, dict):
+        return None
+    wb = inner.get("writeback_result")
+    if not isinstance(wb, dict) or wb.get("status") not in ("failed", "partial"):
+        return None
+    failed_steps = [s for s in wb.get("steps", []) if s.get("status") == "failed"]
+    detail = "; ".join(
+        f"{s.get('step_name', '?')}: {s.get('error', 'unknown')}" for s in failed_steps
+    )
+    return f"client_error: writeback {wb['status']} — {detail}"
+
+
 # --- result models -----------------------------------------------------------
 
 
@@ -379,6 +403,21 @@ class PlanExecutor:
                     librechat_user_id=librechat_user_id,
                     provider=provider,
                     model_id=model_id,
+                )
+            # C52: check if the writeback returned a failed/partial result.
+            # The writeback no longer raises on step failures — it returns a
+            # WritebackResult with status "failed" or "partial". Convert that
+            # to a failed StepResult so the plan executor reports it correctly.
+            wb_failure = _check_writeback_failure(result, step.tool_name)
+            if wb_failure is not None:
+                return StepResult(
+                    step_index=step_index,
+                    tool_name=step.tool_name,
+                    status="failed",
+                    result=result,
+                    error=wb_failure,
+                    retryable=True,
+                    write_failed=True,
                 )
             return StepResult(
                 step_index=step_index,

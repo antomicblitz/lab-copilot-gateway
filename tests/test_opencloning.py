@@ -51,6 +51,10 @@ from lab_copilot_gateway.opencloning import (
     OpenCloningResult,
     PolicyDenied,
     StubOpenCloningClient,
+    WritebackResult,
+    WritebackStepResult,
+    _build_rollback_instructions,
+    _compute_writeback_package_hash,
     _default_client_from_env,
     _infer_extension,
     _rewrite_opencloning_result_ids,
@@ -1309,7 +1313,12 @@ def test_writeback_client_error_propagates(
     audit: AuditStore,
     approval_store: ApprovalStore,
 ) -> None:
-    """eLabFTW upload error is structured and audited."""
+    """eLabFTW upload error is reported as a failed writeback result.
+
+    C52: the GenBank upload failure no longer raises an exception — it
+    returns a WritebackResult with status "failed" and rollback
+    instructions. The audit row records the step failure.
+    """
     # Use a stub with no seeds — upload will raise KeyError.
     elabftw_stub = StubElabftwClient(seeds={})
     adapter = OpenCloningAdapter(
@@ -1324,13 +1333,404 @@ def test_writeback_client_error_propagates(
         "artifact_content": "LOCUS test\n",
     }
     approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+    result = adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "failed"
+    assert any(
+        s["step_name"] == "upload_genbank" and s["status"] == "failed"
+        for s in wb["steps"]
+    )
+    assert wb["rollback_instructions"] is not None
+    rows = _audit_rows(audit)
+    assert any(
+        r["error"] and r["error"].get("code") == "WRITEBACK_STEP_FAILED" for r in rows
+    )
+
+
+# ============================================================================
+# C52 — Expanded writeback package tests (T11)
+# ============================================================================
+#
+# Acceptance checks:
+#     1. Full writeback: all steps succeed, returns success with all upload IDs.
+#     2. Audit report upload failure → status "failed" (blocking).
+#     3. Notebook append failure → status "partial" with rollback.
+#     4. Metadata patch failure → status "success" with warning.
+#     5. Intermediate attachments opt-in (True) → uploads intermediates.
+#     6. Intermediate attachments opt-in (False, default) → skips.
+#     7. Package hash binding: hash includes all components.
+#     8. Rollback instructions are clear and actionable.
+
+
+def test_writeback_full_success_has_all_upload_ids(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Full writeback: all steps succeed, result has all upload IDs."""
+    artifact_content = "LOCUS test 100 bp DNA\nORIGIN\nATCG\n//"
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": artifact_content,
+        "artifact_comment": "OpenCloning design artifact",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "success"
+    assert wb["upload_ids"]["genbank"] is not None
+    assert wb["upload_ids"]["audit_report"] is not None
+    assert wb["notebook_appended"] is True
+    assert wb["metadata_patched"] is True
+    assert wb["rollback_instructions"] is None
+    assert len(wb["warnings"]) == 0
+    # Package hash is included in the result.
+    assert result.result["writeback_package_hash"] is not None
+
+
+def test_writeback_audit_report_failure_is_blocking(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Audit report upload failure → status 'failed' (not 'partial')."""
+    # Simulate audit report upload failure by making the 2nd upload fail.
+    original_upload = elabftw_stub.upload_attachment
+    call_count = [0]
+
+    def failing_upload(
+        experiment_id, filename, data, comment="", record_type="experiments"
+    ):
+        call_count[0] += 1
+        if call_count[0] == 2:  # 2nd upload = audit report
+            raise RuntimeError("audit upload failed")
+        return original_upload(experiment_id, filename, data, comment, record_type)
+
+    elabftw_stub.upload_attachment = failing_upload  # type: ignore[assignment]
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "failed"
+    assert any(
+        s["step_name"] == "upload_audit_report" and s["status"] == "failed"
+        for s in wb["steps"]
+    )
+    assert wb["rollback_instructions"] is not None
+
+
+def test_writeback_notebook_append_failure_is_partial(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Notebook append failure after uploads → status 'partial' with rollback."""
+    # Make patch_experiment_body fail (used by notebook append).
+    original_patch_body = elabftw_stub.patch_experiment_body
+
+    def failing_patch_body(experiment_id, body_html):
+        raise RuntimeError("body patch failed")
+
+    elabftw_stub.patch_experiment_body = failing_patch_body  # type: ignore[assignment]
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "partial"
+    assert wb["notebook_appended"] is False
+    assert any(
+        s["step_name"] == "append_notebook" and s["status"] == "failed"
+        for s in wb["steps"]
+    )
+    assert wb["rollback_instructions"] is not None
+    assert "genbank" in wb["rollback_instructions"]
+    # Restore for other tests.
+    elabftw_stub.patch_experiment_body = original_patch_body  # type: ignore[assignment]
+
+
+def test_writeback_metadata_patch_failure_is_non_blocking(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Metadata patch failure after notebook → status 'success' with warning."""
+    # Make patch_experiment_metadata fail.
+    original_patch_meta = elabftw_stub.patch_experiment_metadata
+
+    def failing_patch_meta(experiment_id, metadata, record_type="experiments"):
+        raise RuntimeError("metadata patch failed")
+
+    elabftw_stub.patch_experiment_metadata = failing_patch_meta  # type: ignore[assignment]
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "success"
+    assert wb["notebook_appended"] is True
+    assert wb["metadata_patched"] is False
+    assert len(wb["warnings"]) == 1
+    assert "Metadata" in wb["warnings"][0]
+    # Restore for other tests.
+    elabftw_stub.patch_experiment_metadata = original_patch_meta  # type: ignore[assignment]
+
+
+def test_writeback_intermediate_attachments_opt_in(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """When include_intermediate_attachments=True, uploads intermediate files."""
+    # Seed strategy sequences with file_content.
+    writeback_adapter._strategy_sequences = [
+        {"id": 1, "name": "part1", "file_content": "LOCUS part1\n//"},
+        {"id": 2, "name": "part2", "file_content": "LOCUS part2\n//"},
+        {"id": 3, "name": "final", "file_content": "LOCUS final\n//"},
+    ]
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+        "include_intermediate_attachments": True,
+        "selected_intermediate_ids": [1, 2],
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "success"
+    # Check intermediate uploads happened.
+    intermediate_steps = [
+        s for s in wb["steps"] if s["step_name"].startswith("upload_intermediate_")
+    ]
+    assert len(intermediate_steps) == 2
+    assert all(s["status"] == "success" for s in intermediate_steps)
+    # Verify the files were uploaded.
+    uploads = elabftw_stub.seeds[42]["uploads"]
+    intermediate_uploads = [u for u in uploads if "intermediate" in u["real_name"]]
+    assert len(intermediate_uploads) == 2
+
+
+def test_writeback_intermediate_attachments_default_skipped(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """When include_intermediate_attachments is False (default), skips intermediates."""
+    writeback_adapter._strategy_sequences = [
+        {"id": 1, "name": "part1", "file_content": "LOCUS part1\n//"},
+    ]
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+        # include_intermediate_attachments not set → defaults to False
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "success"
+    # No intermediate uploads — the step is skipped.
+    intermediate_steps = [s for s in wb["steps"] if "intermediate" in s["step_name"]]
+    assert len(intermediate_steps) == 1
+    assert intermediate_steps[0]["status"] == "skipped"
+
+
+def test_writeback_package_hash_binds_all_components() -> None:
+    """Package hash includes all components — change any → different hash."""
+    base = dict(
+        artifact_manifest={"artifact_filename": "construct.gb", "artifact_size": 100},
+        final_construct_hash="aaa",
+        history_json_hash="bbb",
+        audit_report_hash="ccc",
+        notebook_summary_hash="ddd",
+        selected_intermediate_attachments=[{"id": 1}],
+        protocol_source_refs=["ref1"],
+        validation_bundle_version="v1",
+    )
+    h1 = _compute_writeback_package_hash(**base)
+    # Change one component → different hash.
+    changed = dict(base, final_construct_hash="aaa2")
+    h2 = _compute_writeback_package_hash(**changed)
+    assert h1 != h2
+    # Change intermediates → different hash.
+    changed2 = dict(base, selected_intermediate_attachments=[{"id": 2}])
+    h3 = _compute_writeback_package_hash(**changed2)
+    assert h1 != h3
+    # Same inputs → same hash (deterministic).
+    h4 = _compute_writeback_package_hash(**base)
+    assert h1 == h4
+
+
+def test_writeback_package_hash_mismatch_fails_closed(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+    audit: AuditStore,
+) -> None:
+    """Package hash mismatch → fail closed before consuming approval."""
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": "LOCUS test\n",
+        "writeback_package_hash": "0" * 64,  # wrong hash
+    }
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
     with pytest.raises(OpenCloningAdapterError) as exc_info:
-        adapter.writeback_artifact(
+        writeback_adapter.writeback_artifact(
             context_token=_token(),
             approval_id=approval_id,
             approval_args=approval_args,
             mapped_identity=_identity(),
         )
-    assert exc_info.value.reason == "client_error"
+    assert exc_info.value.reason == "package_hash_mismatch"
+    # Approval should NOT be consumed (fail closed before consume).
+    record = approval_store.get(approval_id)
+    assert record is not None
+    assert record.consumed_at is None
+    # Audit row records the denial.
     rows = _audit_rows(audit)
-    assert rows[0]["error"]["code"] == "CLIENT_ERROR"
+    assert any(
+        r["error"] and r["error"].get("code") == "PACKAGE_HASH_MISMATCH" for r in rows
+    )
+
+
+def test_writeback_package_hash_match_succeeds(
+    writeback_adapter: OpenCloningAdapter,
+    elabftw_stub: StubElabftwClient,
+    approval_store: ApprovalStore,
+) -> None:
+    """Package hash match → writeback succeeds normally."""
+    artifact_content = "LOCUS test\n"
+    approval_args = {
+        "artifact_filename": "construct.gb",
+        "artifact_content": artifact_content,
+    }
+    # Compute the correct package hash.
+    package_hash = writeback_adapter._compute_package_hash_for_writeback(
+        artifact_bytes=artifact_content.encode("utf-8"),
+        artifact_filename="construct.gb",
+        approval_args=approval_args,
+    )
+    approval_args["writeback_package_hash"] = package_hash
+    approval_id = _issue_writeback_approval(approval_store, args=approval_args)
+
+    result = writeback_adapter.writeback_artifact(
+        context_token=_token(),
+        approval_id=approval_id,
+        approval_args=approval_args,
+        mapped_identity=_identity(),
+    )
+    wb = result.result["writeback_result"]
+    assert wb["status"] == "success"
+
+
+def test_writeback_rollback_instructions_are_actionable() -> None:
+    """Rollback instructions list uploaded IDs and mention the experiment."""
+    instructions = _build_rollback_instructions(
+        {"genbank": 123, "audit_report": 125}, experiment_id=42
+    )
+    assert "42" in instructions
+    assert "genbank" in instructions
+    assert "123" in instructions
+    assert "125" in instructions
+    assert "delete" in instructions.lower()
+
+
+def test_writeback_rollback_instructions_empty_when_no_uploads() -> None:
+    """Rollback instructions say 'no rollback needed' when no uploads."""
+    instructions = _build_rollback_instructions({}, experiment_id=42)
+    assert "no rollback needed" in instructions.lower()
+
+
+def test_writeback_step_result_dataclass() -> None:
+    """WritebackStepResult stores step name, status, upload_id, error."""
+    r = WritebackStepResult(step_name="upload_genbank", status="success", upload_id=42)
+    assert r.step_name == "upload_genbank"
+    assert r.status == "success"
+    assert r.upload_id == 42
+    assert r.error is None
+
+    r2 = WritebackStepResult(
+        step_name="upload_audit_report", status="failed", error="boom"
+    )
+    assert r2.upload_id is None
+    assert r2.error == "boom"
+
+
+def test_writeback_result_to_dict() -> None:
+    """WritebackResult.to_dict() produces a JSON-serializable dict."""
+    wb = WritebackResult(
+        status="partial",
+        upload_ids={"genbank": 1},
+        notebook_appended=False,
+        metadata_patched=True,
+        steps=[
+            WritebackStepResult(
+                step_name="upload_genbank", status="success", upload_id=1
+            )
+        ],
+        rollback_instructions="delete upload 1",
+        warnings=["metadata failed"],
+    )
+    d = wb.to_dict()
+    assert d["status"] == "partial"
+    assert d["upload_ids"] == {"genbank": 1}
+    assert d["notebook_appended"] is False
+    assert d["metadata_patched"] is True
+    assert len(d["steps"]) == 1
+    assert d["steps"][0]["step_name"] == "upload_genbank"
+    assert d["rollback_instructions"] == "delete upload 1"
+    assert d["warnings"] == ["metadata failed"]
