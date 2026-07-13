@@ -1734,3 +1734,268 @@ def test_writeback_result_to_dict() -> None:
     assert d["steps"][0]["step_name"] == "upload_genbank"
     assert d["rollback_instructions"] == "delete upload 1"
     assert d["warnings"] == ["metadata failed"]
+
+
+# ============================================================================
+# C49 — opencloning.call hardening (body/endpoint validation)
+# ============================================================================
+#
+# Regression tests for failures observed in the live Lab Copilot stack trace
+# where the LLM emitted ``body`` as a JSON string (causing 500s) or sent
+# GET-only endpoints via POST (causing 405s). The hardening happens in
+# ``normalize_call_body``, ``split_endpoint_path``, and the
+# ``OpenCloningAdapter.call_endpoint`` dispatcher.
+
+from lab_copilot_gateway.opencloning import (
+    InvalidToolArgs,
+    UnknownEndpoint,
+    normalize_call_body,
+    split_endpoint_path,
+    _is_known_endpoint,
+    _is_post_endpoint,
+)
+
+
+def test_normalize_call_body_dict_passthrough() -> None:
+    """A dict body is returned unchanged."""
+    body = {"sequences": [], "source": {"id": 0, "type": "X"}}
+    assert normalize_call_body(body) is body
+
+
+def test_normalize_call_body_none_returns_empty_dict() -> None:
+    """None / missing body becomes an empty dict, not an error."""
+    assert normalize_call_body(None) == {}
+
+
+def test_normalize_call_body_string_parses_valid_json() -> None:
+    """A JSON string body is parsed (this is the LLM double-encoding case)."""
+    raw = '{"sequences": [], "source": {"id": 0, "type": "X"}}'
+    parsed = normalize_call_body(raw)
+    assert parsed == {"sequences": [], "source": {"id": 0, "type": "X"}}
+
+
+def test_normalize_call_body_empty_string_returns_empty_dict() -> None:
+    """An empty/whitespace string becomes an empty dict."""
+    assert normalize_call_body("") == {}
+    assert normalize_call_body("   ") == {}
+
+
+def test_normalize_call_body_string_invalid_json_raises() -> None:
+    """A malformed JSON string raises ``InvalidToolArgs`` (not 500)."""
+    with pytest.raises(InvalidToolArgs) as excinfo:
+        normalize_call_body('{"sequences": [}')
+    assert excinfo.value.reason == "invalid_tool_args"
+
+
+def test_normalize_call_body_string_parses_to_non_dict_raises() -> None:
+    """A JSON string that parses to a non-object raises ``InvalidToolArgs``."""
+    with pytest.raises(InvalidToolArgs):
+        normalize_call_body("[1, 2, 3]")
+
+
+def test_normalize_call_body_rejects_arbitrary_types() -> None:
+    """Non-dict, non-string bodies raise ``InvalidToolArgs``."""
+    with pytest.raises(InvalidToolArgs):
+        normalize_call_body(42)
+    with pytest.raises(InvalidToolArgs):
+        normalize_call_body(["list", "of", "items"])
+
+
+def test_split_endpoint_path_simple() -> None:
+    """A bare path is returned with an empty query string."""
+    assert split_endpoint_path("/restriction") == ("/restriction", "")
+
+
+def test_split_endpoint_path_with_query() -> None:
+    """A path with query string is split correctly."""
+    path, q = split_endpoint_path(
+        "/restriction?restriction_enzymes=EcoRI&restriction_enzymes=HindIII"
+    )
+    assert path == "/restriction"
+    assert q == "restriction_enzymes=EcoRI&restriction_enzymes=HindIII"
+
+
+def test_split_endpoint_path_rejects_relative_path() -> None:
+    """Non-absolute paths raise ``InvalidToolArgs``."""
+    with pytest.raises(InvalidToolArgs):
+        split_endpoint_path("restriction")
+    with pytest.raises(InvalidToolArgs):
+        split_endpoint_path("")
+    with pytest.raises(InvalidToolArgs):
+        split_endpoint_path(None)  # type: ignore[arg-type]
+
+
+def test_is_known_endpoint_recognises_allowlist() -> None:
+    """Post and GET endpoints are both recognised."""
+    assert _is_known_endpoint("/restriction")
+    assert _is_known_endpoint("/pcr")
+    assert _is_known_endpoint("/primer_design/gibson_assembly")
+    assert _is_known_endpoint("/restriction_enzyme_list")
+    assert _is_known_endpoint("/version")
+
+
+def test_is_known_endpoint_rejects_unknown() -> None:
+    """Random or invented paths are not in the allowlist."""
+    assert not _is_known_endpoint("/some/invented/endpoint")
+    assert not _is_known_endpoint("/admin/shutdown")
+    assert not _is_known_endpoint("/")
+
+
+def test_is_post_endpoint_routes_get_only_paths() -> None:
+    """GET-only paths are recognised so the adapter can route to GET."""
+    assert not _is_post_endpoint("/restriction_enzyme_list")
+    assert not _is_post_endpoint("/version")
+    assert _is_post_endpoint("/restriction")
+    assert _is_post_endpoint("/pcr")
+    assert _is_post_endpoint("/primer_design/gibson_assembly")
+
+
+# --- opencloning.call adapter hardening -----------------------------------
+
+
+def _call_endpoint_adapter(responses: dict | None = None, error: Exception | None = None) -> OpenCloningAdapter:
+    """Build a stubbed OpenCloningAdapter suitable for call_endpoint tests."""
+    from lab_copilot_gateway.policy import PolicyEngine
+    from lab_copilot_gateway.audit import AuditStore
+
+    return OpenCloningAdapter(
+        policy_engine=PolicyEngine(),
+        audit_store=AuditStore(db_path=":memory:"),
+        client=StubOpenCloningClient(responses=responses or {}, error=error),
+    )
+
+
+def _call_endpoint_identity() -> MappedIdentity:
+    """Identity helper for the new call_endpoint hardening tests.
+
+    Renamed to avoid shadowing the module-level ``_identity()`` used by
+    the other tests in this file. This helper matches the default
+    context-token subject/elabftw user, so the default ``_token()`` is
+    accepted.
+    """
+    return MappedIdentity(
+        keycloak_subject="kc-human-1",
+        librechat_user_id="lc-human-1",
+        elabftw_user_id="elab-human-1",
+        elabftw_team_ids=["team-1"],
+    )
+
+
+def test_call_endpoint_with_string_body_parses_and_succeeds() -> None:
+    """The LLM double-encoded body as a JSON string. Adapter should accept it."""
+    adapter = _call_endpoint_adapter(responses={"call_endpoint": {"ok": True, "n": 1}})
+    body = '{"sequences": [], "source": {"id": 0, "type": "PCRSource"}}'
+    result = adapter.call_endpoint(
+        context_token=_token(),
+        endpoint="/pcr",
+        body=body,  # type: ignore[arg-type]  — string body, the regression case
+        mapped_identity=_call_endpoint_identity(),
+    )
+    assert result.result.get("n") == 1
+    assert adapter.client.calls[-1]["method"] == "call_endpoint"
+    assert adapter.client.calls[-1]["path"] == "/pcr"
+
+
+def test_call_endpoint_routes_get_only_path_to_client_get() -> None:
+    """``/restriction_enzyme_list`` is GET-only; adapter must use client.get()."""
+    adapter = _call_endpoint_adapter(responses={"get": {"restriction_enzyme_list": ["EcoRI"]}})
+    result = adapter.call_endpoint(
+        context_token=_token(),
+        endpoint="/restriction_enzyme_list",
+        body={},
+        mapped_identity=_call_endpoint_identity(),
+    )
+    assert result.result == {"restriction_enzyme_list": ["EcoRI"]}
+    assert adapter.client.calls[-1]["method"] == "get"
+    assert adapter.client.calls[-1]["path"] == "/restriction_enzyme_list"
+
+
+def test_call_endpoint_rejects_unknown_path() -> None:
+    """An invented endpoint raises ``UnknownEndpoint`` (no downstream call)."""
+    adapter = _call_endpoint_adapter()
+    with pytest.raises(UnknownEndpoint) as excinfo:
+        adapter.call_endpoint(
+            context_token=_token(),
+            endpoint="/invented/endpoint",
+            body={},
+            mapped_identity=_call_endpoint_identity(),
+        )
+    assert excinfo.value.reason == "unknown_endpoint"
+    assert not adapter.client.calls, "no downstream call should be made"
+
+
+def test_call_endpoint_rejects_relative_endpoint() -> None:
+    """A non-absolute endpoint raises ``InvalidToolArgs`` (no downstream call)."""
+    adapter = _call_endpoint_adapter()
+    with pytest.raises(InvalidToolArgs):
+        adapter.call_endpoint(
+            context_token=_token(),
+            endpoint="restriction",
+            body={},
+            mapped_identity=_call_endpoint_identity(),
+        )
+    assert not adapter.client.calls
+
+
+def test_call_endpoint_preserves_query_string_in_path() -> None:
+    """A /restriction call with a query string is forwarded verbatim to OpenCloning."""
+    adapter = _call_endpoint_adapter(responses={"call_endpoint": {"ok": True}})
+    adapter.call_endpoint(
+        context_token=_token(),
+        endpoint="/restriction?restriction_enzymes=EcoRI&restriction_enzymes=HindIII",
+        body={"sequences": [], "source": {"id": 0, "type": "RestrictionEnzymeDigestionSource"}},
+        mapped_identity=_call_endpoint_identity(),
+    )
+    assert adapter.client.calls[-1]["method"] == "call_endpoint"
+    assert (
+        adapter.client.calls[-1]["path"]
+        == "/restriction?restriction_enzymes=EcoRI&restriction_enzymes=HindIII"
+    )
+
+
+def test_call_endpoint_truncated_endpoint_is_allowlisted() -> None:
+    """Even a truncated endpoint that points at /restriction still routes to POST.
+
+    The live failure was: ``/restriction?restriction_enzymes=BamHI&restriction_e``
+    (truncated). With the allowlist gate the call still routes to POST
+    rather than crashing in body normalisation. OpenCloning will return
+    its own error; the gateway surfaces it as ``client_error``.
+    """
+    import requests
+
+    from lab_copilot_gateway.policy import PolicyEngine
+    from lab_copilot_gateway.audit import AuditStore
+
+    resp = requests.Response()
+    resp.status_code = 400
+    http_err = requests.HTTPError("400 Bad Request: Unprocessable Entity", response=resp)
+    stub = StubOpenCloningClient(responses={"call_endpoint": {"ok": True}}, error=http_err)
+    adapter = OpenCloningAdapter(
+        policy_engine=PolicyEngine(),
+        audit_store=AuditStore(db_path=":memory:"),
+        client=stub,
+    )
+    with pytest.raises(OpenCloningAdapterError) as excinfo:
+        adapter.call_endpoint(
+            context_token=_token(),
+            endpoint="/restriction?restriction_enzymes=BamHI&restriction_e",
+            body={
+                "sequences": [],
+                "source": {"id": 0, "type": "RestrictionEnzymeDigestionSource"},
+            },
+            mapped_identity=_call_endpoint_identity(),
+        )
+    assert excinfo.value.reason == "client_error"
+
+
+def test_call_endpoint_non_dict_body_raises_clean_error() -> None:
+    """A list body (instead of dict) raises ``InvalidToolArgs``."""
+    adapter = _call_endpoint_adapter()
+    with pytest.raises(InvalidToolArgs):
+        adapter.call_endpoint(
+            context_token=_token(),
+            endpoint="/pcr",
+            body=[1, 2, 3],  # type: ignore[arg-type]
+            mapped_identity=_call_endpoint_identity(),
+        )
+    assert not adapter.client.calls
