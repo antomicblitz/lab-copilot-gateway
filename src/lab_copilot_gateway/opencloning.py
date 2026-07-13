@@ -36,6 +36,7 @@ Tools exposed (all already in the C06 tool registry):
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -133,6 +134,214 @@ class DisallowedFileType(OpenCloningAdapterError):
         self.extension = extension
 
 
+class InvalidToolArgs(OpenCloningAdapterError):
+    """Tool args failed structural validation (shape, type, or value).
+
+    Distinct from ``client_error`` so the LLM can recognise a recoverable
+    argument problem (e.g. ``body`` was a string, not a dict) and fix it,
+    vs. a downstream OpenCloning failure that requires a different
+    recovery path.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(reason="invalid_tool_args", message=message)
+
+
+class UnknownEndpoint(OpenCloningAdapterError):
+    """OpenCloning endpoint path is not in the allowlist.
+
+    The LLM is the source of endpoint paths for ``opencloning.call``.
+    Restricting to a known allowlist prevents the LLM from inventing
+    paths that 404 or, worse, accidentally hit a write endpoint.
+    """
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__(
+            reason="unknown_endpoint",
+            message=(
+                f"OpenCloning endpoint {endpoint!r} is not in the gateway allowlist. "
+                "Use a typed tool (e.g. opencloning.restriction_digest) or a known "
+                "endpoint from the system prompt's API catalog."
+            ),
+        )
+        self.endpoint = endpoint
+
+
+# --- endpoint allowlist + helpers -----------------------------------------
+#
+# The LLM is the source of ``endpoint`` for ``opencloning.call``. We
+# refuse to forward paths that are not in this set so the LLM cannot:
+#   * invent a non-existent path and 404 the call,
+#   * try to use a GET-only endpoint via POST (or vice-versa),
+#   * accidentally hit a write endpoint without going through approval.
+#
+# The allowlist is the intersection of what the system prompt documents
+# and what the OpenCloning v1.3.1 OpenAPI spec exposes. Keep it in sync
+# with both. New endpoints should be added by editing this set, not by
+# loosening the gate.
+
+
+# Endpoints that accept POST (request body required, may also accept
+# query params).
+OPENCLONING_POST_ENDPOINTS: frozenset[str] = frozenset(
+    {
+        # Sequence imports
+        "/read_from_file",
+        "/manually_typed",
+        "/repository_id/genbank",
+        "/repository_id/snapgene",
+        "/repository_id/addgene",
+        "/repository_id/benchling",
+        "/repository_id/euroscarf",
+        "/repository_id/seva",
+        "/repository_id/wekwikgene",
+        "/genome_coordinates",
+        # Cloning operations
+        "/pcr",
+        "/primer_details",
+        "/primer_heterodimer",
+        "/homologous_recombination",
+        "/gibson_assembly",
+        "/ligation",
+        "/restriction_and_ligation",
+        "/crispr",
+        "/cre_lox_recombination",
+        "/gateway",
+        "/recombinase",
+        "/polymerase_extension",
+        "/reverse_complement",
+        "/oligonucleotide_hybridization",
+        # Restriction
+        "/restriction",
+        # Annotation
+        "/annotate/plannotate",
+        "/annotation/get_gateway_sites",
+        # Validation
+        "/validate",
+        "/validate_syntax",
+        # Sanger alignment
+        "/align_sanger",
+        # Batch cloning
+        "/batch_cloning/homologous_recombination",
+        "/batch_cloning/gibson_assembly",
+        "/batch_cloning/restriction_ligation",
+    }
+)
+
+# Endpoint prefixes that accept POST (handled by prefix match).
+OPENCLONING_POST_PREFIXES: tuple[str, ...] = (
+    "/primer_design/",
+    "/batch_cloning/",
+)
+
+# Endpoints that accept GET (no body, no mutation).
+OPENCLONING_GET_ENDPOINTS: frozenset[str] = frozenset(
+    {
+        "/version",
+        "/restriction_enzyme_list",
+    }
+)
+
+# Read-only endpoints handled by the typed ``simulate_assembly`` tool
+# (not exposed via ``opencloning.call`` — the orchestrator must use the
+# typed tool so the gateway can validate source.type before forwarding).
+OPENCLONING_TYPED_ASSEMBLY_ENDPOINTS: frozenset[str] = frozenset(
+    {
+        "/gibson_assembly",
+        "/ligation",
+        "/restriction_and_ligation",
+        "/homologous_recombination",
+        "/crispr",
+        "/cre_lox_recombination",
+        "/gateway",
+        "/recombinase",
+    }
+)
+
+
+def split_endpoint_path(endpoint: str) -> tuple[str, str]:
+    """Split ``endpoint`` into ``(path, query_string)``.
+
+    The OpenCloning API expects query params inline in the URL
+    (e.g. ``/restriction?restriction_enzymes=EcoRI&...``). LLM-generated
+    endpoints may have malformed or duplicated query strings, so we
+    separate them here for the few endpoints that require query params
+    (currently only ``/restriction``).
+
+    Returns ``(path, query_string)`` where ``query_string`` is empty if
+    the endpoint has no ``?``. Raises ``InvalidToolArgs`` if the path is
+    not absolute.
+    """
+    if not isinstance(endpoint, str) or not endpoint.startswith("/"):
+        raise InvalidToolArgs(
+            f"endpoint must be a string starting with '/' (got {endpoint!r})"
+        )
+    if "?" in endpoint:
+        path, _, query = endpoint.partition("?")
+        return path, query
+    return endpoint, ""
+
+
+def _is_known_endpoint(path: str) -> bool:
+    """True if ``path`` is in the POST/GET allowlist (or matches a POST prefix)."""
+    if path in OPENCLONING_POST_ENDPOINTS or path in OPENCLONING_GET_ENDPOINTS:
+        return True
+    for prefix in OPENCLONING_POST_PREFIXES:
+        if path.startswith(prefix):
+            return True
+    return False
+
+
+def _is_post_endpoint(path: str) -> bool:
+    """True if ``path`` accepts a POST request body.
+
+    GET-only endpoints must be routed through ``client.get()`` rather
+    than ``_post_json()``; posting to them returns 405 from OpenCloning.
+    """
+    if path in OPENCLONING_GET_ENDPOINTS and path not in OPENCLONING_POST_ENDPOINTS:
+        return False
+    return True
+
+
+def normalize_call_body(args_body: Any) -> dict[str, Any]:
+    """Coerce and validate the ``body`` arg for ``opencloning.call``.
+
+    The LLM sometimes emits ``body`` as a JSON string (it double-encodes
+    the request body, often after an LLM extraction glitch). Rather than
+    crash later in the adapter with a 500, accept the string and parse it.
+
+    Returns an empty dict for missing or None bodies. Raises
+    ``InvalidToolArgs`` for non-dict, non-string bodies, or for
+    unparseable JSON strings.
+    """
+    if args_body is None:
+        return {}
+    if isinstance(args_body, dict):
+        return args_body
+    if isinstance(args_body, str):
+        text = args_body.strip()
+        if not text:
+            return {}
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise InvalidToolArgs(
+                f"opencloning.call body is a string but not valid JSON: {exc.msg} "
+                "(the LLM likely emitted a truncated or double-encoded body; "
+                "re-issue with a real JSON object)"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise InvalidToolArgs(
+                f"opencloning.call body parsed to {type(parsed).__name__}, "
+                "expected a JSON object"
+            )
+        return parsed
+    raise InvalidToolArgs(
+        f"opencloning.call body must be a JSON object or string (got "
+        f"{type(args_body).__name__})"
+    )
+
+
 # --- downstream client ---------------------------------------------------
 
 
@@ -196,6 +405,10 @@ class OpenCloningClient(Protocol):
         """
         ...
 
+    def get(self, path: str) -> dict[str, Any]:
+        """GET any OpenCloning endpoint (e.g. /version, /restriction_enzyme_list)."""
+        ...
+
 
 @dataclass
 class StubOpenCloningClient:
@@ -251,6 +464,9 @@ class StubOpenCloningClient:
 
     def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
         return self._record("call_endpoint", path=path, body_keys=list(body.keys()))
+
+    def get(self, path: str) -> dict[str, Any]:
+        return self._record("get", path=path)
 
 
 @dataclass
@@ -1185,14 +1401,51 @@ class OpenCloningAdapter:
         - Rename: /rename_sequence
         - Batch cloning: /batch_cloning/*
         """
-        # Inject file_content from the sequence store for any sequences
-        # that are missing it. The LLM sees redacted sequences (file_content
-        # is replaced with {redacted: true, ...}) but OpenCloning needs the
-        # raw file_content to process the sequences. The gateway stores the
-        # full sequences from prior OpenCloning responses and injects them
-        # here so the LLM never needs to handle raw sequence bytes.
+        # 1. Validate the body shape up front. The LLM sometimes emits
+        #    ``body`` as a JSON string (truncation, double-encoding); rather
+        #    than crash later with AttributeError we normalise here. The
+        #    caller (``app.py``) pre-parses the body, but we defend in depth
+        #    in case the adapter is invoked directly.
+        if not isinstance(body, dict):
+            body = normalize_call_body(body)
+
+        # 2. Validate the endpoint path against the allowlist and split
+        #    ``?query`` from the path so we can route GET-only paths to
+        #    ``client.get()`` and the rest to ``_post_json()``.
+        path, query_string = split_endpoint_path(endpoint)
+        if not _is_known_endpoint(path):
+            raise UnknownEndpoint(endpoint)
+        if not _is_post_endpoint(path):
+            # Re-route to the GET path; assemble the full path including
+            # any (LLM-supplied) query string so we don't lose intent.
+            full_path = f"{path}?{query_string}" if query_string else path
+            return self._execute(
+                tool_name=TOOL_CALL,
+                context_token=context_token,
+                mapped_identity=mapped_identity,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                args_for_hash={"endpoint": endpoint, "body_keys": []},
+                api_call_summary={"method": "GET", "path": full_path},
+                exec_fn=lambda _client: _client.get(full_path),
+            )
+
+        # 3. Inject file_content from the sequence store for any sequences
+        #    that are missing it. The LLM sees redacted sequences
+        #    (file_content is replaced with {redacted: true, ...}) but
+        #    OpenCloning needs the raw file_content to process the
+        #    sequences. The gateway stores the full sequences from prior
+        #    OpenCloning responses and injects them here so the LLM never
+        #    needs to handle raw sequence bytes.
         body = _inject_file_content_from_store(body, self._sequence_store)
 
+        # 4. Forward to the downstream client. If the LLM supplied a query
+        #    string, append it to the path the client posts to.
+        full_path = f"{path}?{query_string}" if query_string else path
         result = self._execute(
             tool_name=TOOL_CALL,
             context_token=context_token,
@@ -1204,17 +1457,17 @@ class OpenCloningAdapter:
             provider=provider,
             model_id=model_id,
             args_for_hash={"endpoint": endpoint, "body_keys": sorted(body.keys())},
-            api_call_summary={"method": "POST", "path": endpoint},
-            exec_fn=lambda _client: _client.call_endpoint(endpoint, body),
+            api_call_summary={"method": "POST", "path": full_path},
+            exec_fn=lambda _client: _client.call_endpoint(full_path, body),
         )
 
         # Feature-loss detection for PCR (single-template operations only).
         # Assembly operations legitimately change feature counts, so we
         # only warn for PCR where feature loss indicates a degraded template.
-        if endpoint == "/pcr":
+        if path == "/pcr":
             from lab_copilot_gateway.opencloning_features import detect_feature_loss
 
-            warning = detect_feature_loss(endpoint, body, result.result)
+            warning = detect_feature_loss(path, body, result.result)
             if warning:
                 result.result["feature_loss_warning"] = warning
 

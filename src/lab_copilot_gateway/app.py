@@ -974,18 +974,53 @@ def _dispatch_opencloning_tool(
             response["validation_bundle"] = bundle
         return response
     elif tool.name == "opencloning.call":
-        result = adapter.call_endpoint(
-            context_token=body.context_token,
-            endpoint=body.args.get("endpoint", "/"),
-            body=body.args.get("body", {}),
-            mapped_identity=mapped_identity,
-            conversation_id=body.conversation_id,
-            request_id=body.request_id,
-            keycloak_subject=body.keycloak_subject,
-            librechat_user_id=body.librechat_user_id,
-            provider=body.provider,
-            model_id=body.model_id,
+        # The LLM sometimes emits ``body`` as a JSON string rather than
+        # an object (it double-encodes the body after an extraction
+        # glitch). Parse it here so the adapter never receives a
+        # non-dict body and we return a structured ``invalid_tool_args``
+        # error instead of a 500.
+        from lab_copilot_gateway.opencloning import (
+            InvalidToolArgs,
+            UnknownEndpoint,
+            normalize_call_body,
         )
+
+        try:
+            normalized_body = normalize_call_body(body.args.get("body", {}))
+        except InvalidToolArgs as exc:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": exc.reason,
+                "message": exc.message,
+            }
+        try:
+            result = adapter.call_endpoint(
+                context_token=body.context_token,
+                endpoint=str(body.args.get("endpoint") or "/"),
+                body=normalized_body,
+                mapped_identity=mapped_identity,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                provider=body.provider,
+                model_id=body.model_id,
+            )
+        except UnknownEndpoint as exc:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": exc.reason,
+                "message": exc.message,
+            }
+        except InvalidToolArgs as exc:
+            return {
+                "ok": False,
+                "tool_name": tool.name,
+                "reason": exc.reason,
+                "message": exc.message,
+            }
         return _opencloning_invoke_success(
             tool_name=tool.name,
             result=result,
