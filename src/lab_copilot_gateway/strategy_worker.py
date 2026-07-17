@@ -216,5 +216,5 @@ class _NoOpClient:
     def simulate_assembly(self, sequences: list, source: dict) -> dict:
         raise RuntimeError("strategy worker singleton not configured for execution")
 
-    def call_endpoint(self, path: str, body: dict) -> dict:
+    def call_endpoint(self, path: str, body: dict | list) -> dict:
         raise RuntimeError("strategy worker singleton not configured for execution")

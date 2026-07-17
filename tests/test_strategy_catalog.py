@@ -202,9 +202,8 @@ class TestExperimentalGating:
 
     EXPERIMENTAL_KEYS = {
         "batch_domestication",
-        "batch_gibson",
-        "batch_restriction_ligation",
-        "batch_homologous_recombination",
+        "batch_pombe",
+        "batch_ziqiang",
     }
 
     def test_experimental_operations_marked(self) -> None:

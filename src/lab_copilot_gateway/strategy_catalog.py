@@ -308,52 +308,51 @@ _CATALOG_ENTRIES: tuple[OperationCapability, ...] = (
         description="Reverse complement of a sequence.",
     ),
     # --- Native batch family (experimental) ------------------------------
+    # Verified against manulera/opencloning:v1.3.1-baseurl-opencloning.
+    # Only three /batch_cloning/* POST endpoints exist on the pinned image:
+    #   /batch_cloning/domesticate       (JSON → BaseCloningStrategy)
+    #   /batch_cloning/pombe             (multipart form → ZIP file)
+    #   /batch_cloning/ziqiang_et_al2024 (JSON → BaseCloningStrategy)
+    # The previously-cataloged gibson/restriction_ligation/homologous_recombination
+    # batch endpoints do not exist on this backend version (405).
     OperationCapability(
         operation_key="batch_domestication",
         source_type="BatchDomesticationSource",
-        endpoint="/batch_cloning/gibson_assembly",
+        endpoint="/batch_cloning/domesticate",
         cardinality=Cardinality.BATCH_COUPLED,
         visual_family=VisualFamily.BATCH,
         status=CapabilityStatus.EXPERIMENTAL,
         description=(
-            "Native batch domestication via OpenCloning batch endpoint. "
-            "Depends on external services; experimental until staging-proven."
+            "Native batch domestication via OpenCloning. Removes internal "
+            "restriction sites and adds GoldenBraid compatibility overhangs. "
+            "Depends on external GoldenBraid service (goldenbraidpro.com)."
         ),
     ),
     OperationCapability(
-        operation_key="batch_gibson",
-        source_type="BatchGibsonAssemblySource",
-        endpoint="/batch_cloning/gibson_assembly",
+        operation_key="batch_pombe",
+        source_type="BatchPombeSource",
+        endpoint="/batch_cloning/pombe",
         cardinality=Cardinality.BATCH_COUPLED,
         visual_family=VisualFamily.BATCH,
         status=CapabilityStatus.EXPERIMENTAL,
         description=(
-            "Native batch Gibson assembly via OpenCloning batch endpoint. "
-            "Experimental until staging-proven."
+            "S. pombe gene tagging workflow via OpenCloning. Takes a gene list "
+            "and plasmid, returns a ZIP archive of cloning results. "
+            "Depends on external NCBI and Addgene services. "
+            "Multipart form input, ZIP output — incompatible with JSON DAG execution."
         ),
     ),
     OperationCapability(
-        operation_key="batch_restriction_ligation",
-        source_type="BatchRestrictionLigationSource",
-        endpoint="/batch_cloning/restriction_ligation",
+        operation_key="batch_ziqiang",
+        source_type="BatchZiqiangSource",
+        endpoint="/batch_cloning/ziqiang_et_al2024",
         cardinality=Cardinality.BATCH_COUPLED,
         visual_family=VisualFamily.BATCH,
         status=CapabilityStatus.EXPERIMENTAL,
         description=(
-            "Native batch restriction/ligation via OpenCloning batch endpoint. "
-            "Experimental until staging-proven."
-        ),
-    ),
-    OperationCapability(
-        operation_key="batch_homologous_recombination",
-        source_type="BatchHomologousRecombinationSource",
-        endpoint="/batch_cloning/homologous_recombination",
-        cardinality=Cardinality.BATCH_COUPLED,
-        visual_family=VisualFamily.BATCH,
-        status=CapabilityStatus.EXPERIMENTAL,
-        description=(
-            "Native batch homologous recombination via OpenCloning batch endpoint. "
-            "Experimental until staging-proven."
+            "Ziqiang et al. 2024 CRISPR multiplex cloning workflow. Takes a list "
+            "of protospacers, internally runs PCR → Golden Gate → Gateway BP/LR. "
+            "No external service dependency — uses a bundled template."
         ),
     ),
 )

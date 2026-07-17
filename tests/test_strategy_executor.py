@@ -74,10 +74,13 @@ class StubExecutionClient:
             },
         )
 
-    def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    def call_endpoint(self, path: str, body: Any) -> dict[str, Any]:
         self.call_count += 1
+        body_keys = (
+            list(body.keys()) if isinstance(body, dict) else f"list({len(body)})"
+        )
         self.calls.append(
-            {"method": "call_endpoint", "path": path, "body_keys": list(body.keys())}
+            {"method": "call_endpoint", "path": path, "body_keys": body_keys}
         )
         if self.permanent_error:
             raise self.permanent_error
@@ -580,6 +583,179 @@ class TestTopologicalOrder:
 
 
 # --- No LLM participation ----------------------------------------------------
+
+
+class TestBatchOperations:
+    """Native batch operations: domesticate, pombe, ziqiang (Slice 14)."""
+
+    def test_batch_ziqiang_succeeds_without_input_molecules(self) -> None:
+        """Ziqiang uses a bundled template — no input molecules needed."""
+        client = StubExecutionClient(
+            responses={
+                "/batch_cloning/ziqiang_et_al2024": {
+                    "sequences": [
+                        {"id": 1, "name": "template"},
+                        {"id": 7, "name": "expression_clone"},
+                    ],
+                    "sources": [
+                        {"id": 1, "input": [{"sequence": 1}], "output": 7},
+                    ],
+                }
+            }
+        )
+        executor = StrategyExecutor(client)
+        strategy = Strategy(
+            id="s1",
+            goal="Ziqiang CRISPR cloning",
+            molecules=[
+                _make_product_molecule("mol_001", "op_001", "expression_clone"),
+            ],
+            operations=[
+                Operation(
+                    id="op_001",
+                    operation_key="batch_ziqiang",
+                    input_molecule_ids=(),
+                    output_molecule_ids=("mol_001",),
+                    parameters={"protospacers": ["GCGTCCACTGAGTCGTGAGC"]},
+                ),
+            ],
+            product_compositions=(),
+        )
+        result = executor.execute(strategy, {})
+        assert result.status == "completed"
+        assert result.operation_results[0].status == OperationStatus.SUCCEEDED
+        assert client.calls[0]["path"] == "/batch_cloning/ziqiang_et_al2024"
+        assert client.calls[0]["body_keys"] == "list(1)"
+        assert "mol_001" in result.product_sequence_ids
+
+    def test_batch_ziqiang_without_protospacers_blocked(self) -> None:
+        """Missing protospacers parameter must fail clearly."""
+        client = StubExecutionClient()
+        executor = StrategyExecutor(client)
+        strategy = Strategy(
+            id="s1",
+            goal="Ziqiang",
+            molecules=[_make_product_molecule("mol_001", "op_001")],
+            operations=[
+                Operation(
+                    id="op_001",
+                    operation_key="batch_ziqiang",
+                    input_molecule_ids=(),
+                    output_molecule_ids=("mol_001",),
+                ),
+            ],
+            product_compositions=(),
+        )
+        result = executor.execute(strategy, {})
+        assert result.operation_results[0].status == OperationStatus.FAILED
+
+    def test_batch_domestication_with_input_sequence(self) -> None:
+        """Domesticate takes a source sequence and returns a domesticated part."""
+        seq = _make_sequence(1, "template")
+        client = StubExecutionClient(
+            responses={
+                "/batch_cloning/domesticate": {
+                    "sequences": [
+                        {"id": 1, "name": "domesticated_part"},
+                    ],
+                    "sources": [],
+                }
+            }
+        )
+        executor = StrategyExecutor(client)
+        strategy = Strategy(
+            id="s1",
+            goal="Domesticate",
+            molecules=[
+                _make_source_molecule("mol_001"),
+                _make_product_molecule("mol_002", "op_001", "domesticated"),
+            ],
+            operations=[
+                Operation(
+                    id="op_001",
+                    operation_key="batch_domestication",
+                    input_molecule_ids=("mol_001",),
+                    output_molecule_ids=("mol_002",),
+                    parameters={
+                        "cloning_type": "domestication",
+                        "part_name": "test_part",
+                        "enzymes": ["BsaI"],
+                        "location": "1..100",
+                    },
+                ),
+            ],
+            product_compositions=(),
+        )
+        result = executor.execute(strategy, {"mol_001": seq})
+        assert result.status == "completed"
+        assert result.operation_results[0].status == OperationStatus.SUCCEEDED
+
+    def test_batch_pombe_not_supported_by_executor(self) -> None:
+        """Pombe (multipart/ZIP) is intentionally BLOCKED in the executor."""
+        client = StubExecutionClient()
+        executor = StrategyExecutor(client)
+        strategy = Strategy(
+            id="s1",
+            goal="Pombe",
+            molecules=[_make_product_molecule("mol_001", "op_001")],
+            operations=[
+                Operation(
+                    id="op_001",
+                    operation_key="batch_pombe",
+                    input_molecule_ids=(),
+                    output_molecule_ids=("mol_001",),
+                ),
+            ],
+            product_compositions=(),
+        )
+        result = executor.execute(strategy, {})
+        assert result.operation_results[0].status == OperationStatus.BLOCKED
+        assert "not supported" in result.operation_results[0].error
+
+    def test_batch_terminal_product_extraction(self) -> None:
+        """When multiple sequences returned, extract the terminal one."""
+        client = StubExecutionClient(
+            responses={
+                "/batch_cloning/ziqiang_et_al2024": {
+                    "sequences": [
+                        {"id": 1, "name": "template"},
+                        {"id": 2, "name": "pcr_product_1"},
+                        {"id": 3, "name": "pcr_product_2"},
+                        {"id": 4, "name": "golden_gate"},
+                        {"id": 5, "name": "expression_clone"},
+                    ],
+                    "sources": [
+                        {"id": 1, "input": [], "output": 2},
+                        {"id": 2, "input": [], "output": 3},
+                        {
+                            "id": 3,
+                            "input": [{"sequence": 2}, {"sequence": 3}],
+                            "output": 4,
+                        },
+                        {"id": 4, "input": [{"sequence": 4}], "output": 5},
+                    ],
+                }
+            }
+        )
+        executor = StrategyExecutor(client)
+        strategy = Strategy(
+            id="s1",
+            goal="Ziqiang multi-step",
+            molecules=[_make_product_molecule("mol_001", "op_001")],
+            operations=[
+                Operation(
+                    id="op_001",
+                    operation_key="batch_ziqiang",
+                    input_molecule_ids=(),
+                    output_molecule_ids=("mol_001",),
+                    parameters={"protospacers": ["ACGT" * 5]},
+                ),
+            ],
+            product_compositions=(),
+        )
+        result = executor.execute(strategy, {})
+        # consumed_ids = {2, 3, 4}; terminal = {1, 5} → 2 terminals → ambiguous
+        assert result.operation_results[0].status == OperationStatus.AMBIGUOUS
 
 
 class TestNoLLM:

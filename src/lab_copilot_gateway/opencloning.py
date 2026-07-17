@@ -84,17 +84,24 @@ class OpenCloningAdapterError(Exception):
     """Base class for OpenCloning adapter errors.
 
     ``reason`` is a machine-readable code; ``message`` is human-readable.
+    ``status_code`` is the optional HTTP status from the upstream response.
     Mirrors ``ElabftwAdapterError`` so the /invoke endpoint can handle
     both uniformly.
     """
 
-    def __init__(self, reason: str, message: str) -> None:
+    def __init__(
+        self, reason: str, message: str, status_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.reason = reason
         self.message = message
+        self.status_code = status_code
 
-    def to_dict(self) -> dict[str, str]:
-        return {"reason": self.reason, "message": self.message}
+    def to_dict(self) -> dict[str, str | int]:
+        payload: dict[str, str | int] = {"reason": self.reason, "message": self.message}
+        if self.status_code is not None:
+            payload["status_code"] = self.status_code
+        return payload
 
 
 class PolicyDenied(OpenCloningAdapterError):
@@ -309,10 +316,13 @@ class HttpOpenCloningClient:
             body_text = str(detail.get("detail", detail))
         except Exception:
             body_text = resp.text[:200]
-        return _requests.HTTPError(
+        err = _requests.HTTPError(
             f"{resp.status_code} {resp.reason} for {path}: {body_text}",
             response=resp,
         )
+        # Attach status_code so callers can extract it via getattr.
+        err.status_code = resp.status_code  # type: ignore[attr-defined]
+        return err
 
     def parse_sequence_file(
         self, file_content: bytes, file_format: str

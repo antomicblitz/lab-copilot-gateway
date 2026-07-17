@@ -48,7 +48,7 @@ class TestBackendVersion:
         resp = requests.get(f"{OPENCLONING_URL}/version", timeout=10, verify=False)
         assert resp.ok, f"/version returned {resp.status_code}"
         data = resp.json()
-        assert "version" in data or "OpenCloning" in str(data)
+        assert "opencloning_version" in data or "version" in str(data).lower()
 
     def test_pinned_image_constant(self) -> None:
         """The catalog records which image it was validated against."""
@@ -108,3 +108,74 @@ class TestCatalogBackendAgreement:
             f"endpoints missing from backend: {missing}. "
             f"Catalog is out of sync with {PINNED_OPENCLONING_IMAGE}"
         )
+
+
+class TestBatchEndpointContracts:
+    """Experimental batch endpoints must exist on the running backend.
+
+    Verified against manulera/opencloning:v1.3.1-baseurl-opencloning.
+    Only three /batch_cloning/* POST endpoints exist on this image:
+    domesticate, pombe, ziqiang_et_al2024.
+    """
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        sorted({e.endpoint for e in get_catalog().list_experimental()}),
+    )
+    def test_batch_endpoint_exists(self, endpoint: str) -> None:
+        """Each experimental batch endpoint must exist (not 404).
+
+        We accept 422/400/415 (validation/conversion errors on empty body)
+        but reject 404/405 (endpoint doesn't exist or doesn't accept POST).
+        """
+        import requests
+
+        resp = requests.post(
+            f"{OPENCLONING_URL}{endpoint}",
+            json={},
+            timeout=10,
+            verify=False,
+        )
+        assert resp.status_code not in (404, 405), (
+            f"batch endpoint {endpoint} returned {resp.status_code} — "
+            f"catalog is out of sync with {PINNED_OPENCLONING_IMAGE}"
+        )
+
+    def test_ziqiang_executes_with_valid_protospacers(self) -> None:
+        """The ziqiang_et_al2024 workflow must succeed with valid input.
+
+        This is the only batch endpoint with no external dependency —
+        it uses a bundled template, so it can be fully contract-tested.
+        """
+        import requests
+
+        resp = requests.post(
+            f"{OPENCLONING_URL}/batch_cloning/ziqiang_et_al2024",
+            json=["GCGTCCACTGAGTCGTGAGC", "ACAGGTGGACAGTGTCGTAC"],
+            timeout=60,
+            verify=False,
+        )
+        assert resp.ok, f"ziqiang failed: {resp.status_code} {resp.text[:200]}"
+        data = resp.json()
+        assert "sequences" in data
+        assert len(data["sequences"]) > 1, "ziqiang should produce multiple sequences"
+        assert "sources" in data
+
+    def test_no_phantom_batch_endpoints_in_catalog(self) -> None:
+        """The catalog must not reference nonexistent batch endpoints.
+
+        Previously cataloged batch_gibson/restriction_ligation/
+        homologous_recombination pointed to endpoints that return 405.
+        This test prevents regression.
+        """
+        phantom_prefixes = [
+            "/batch_cloning/gibson_assembly",
+            "/batch_cloning/restriction_ligation",
+            "/batch_cloning/homologous_recombination",
+        ]
+        catalog_endpoints = {e.endpoint for e in get_catalog().list_all()}
+        for ep in phantom_prefixes:
+            assert ep not in catalog_endpoints, (
+                f"phantom endpoint {ep} is in the catalog but does not "
+                f"exist on {PINNED_OPENCLONING_IMAGE}"
+            )

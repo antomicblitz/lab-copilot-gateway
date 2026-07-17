@@ -74,6 +74,17 @@ _DIRECT_ENDPOINT_OPERATIONS: dict[str, str] = {
     "reverse_complement": "/reverse_complement",
 }
 
+# Native batch operations that route through call_endpoint with batch-specific
+# body construction and terminal-product extraction from the CloningStrategy
+# response. Verified against manulera/opencloning:v1.3.1-baseurl-opencloning.
+_BATCH_OPERATIONS: dict[str, str] = {
+    "batch_domestication": "/batch_cloning/domesticate",
+    "batch_ziqiang": "/batch_cloning/ziqiang_et_al2024",
+    # batch_pombe intentionally omitted — multipart form + ZIP response is
+    # incompatible with the JSON DAG execution model. It will hit the
+    # BLOCKED fallback with a clear error.
+}
+
 
 # --- Result types ------------------------------------------------------------
 
@@ -128,7 +139,9 @@ class ExecutionClient(Protocol):
         source: dict[str, Any],
     ) -> dict[str, Any]: ...
 
-    def call_endpoint(self, path: str, body: dict[str, Any]) -> dict[str, Any]: ...
+    def call_endpoint(
+        self, path: str, body: dict[str, Any] | list[Any]
+    ) -> dict[str, Any]: ...
 
 
 # --- Executor ----------------------------------------------------------------
@@ -208,14 +221,18 @@ class StrategyExecutor:
                     error=f"unknown operation key: {op.operation_key}",
                 )
 
-            # Resolve input sequences
-            input_sequences = self._resolve_inputs(op, ctx)
-            if not input_sequences:
-                return OperationResult(
-                    operation_id=op.id,
-                    status=OperationStatus.BLOCKED,
-                    error="could not resolve input sequences",
-                )
+            # Batch operations may not need input sequences (e.g. ziqiang
+            # uses a bundled template). Resolve inputs only if the operation
+            # has input molecules.
+            input_sequences: list[dict[str, Any]] = []
+            if op.input_molecule_ids:
+                input_sequences = self._resolve_inputs(op, ctx)
+                if not input_sequences:
+                    return OperationResult(
+                        operation_id=op.id,
+                        status=OperationStatus.BLOCKED,
+                        error="could not resolve input sequences",
+                    )
 
             # Execute based on operation type
             if op.operation_key in _ASSEMBLY_OPERATIONS:
@@ -223,6 +240,9 @@ class StrategyExecutor:
             elif op.operation_key in _DIRECT_ENDPOINT_OPERATIONS:
                 endpoint = _DIRECT_ENDPOINT_OPERATIONS[op.operation_key]
                 result = self._execute_direct(op, endpoint, input_sequences, ctx)
+            elif op.operation_key in _BATCH_OPERATIONS:
+                endpoint = _BATCH_OPERATIONS[op.operation_key]
+                result = self._execute_batch(op, endpoint, input_sequences, ctx)
             else:
                 return OperationResult(
                     operation_id=op.id,
@@ -283,6 +303,26 @@ class StrategyExecutor:
         )
         return self._process_response(op, response, ctx)
 
+    def _execute_batch(
+        self,
+        op: Operation,
+        endpoint: str,
+        sequences: list[dict[str, Any]],
+        ctx: _ExecutionContext,
+    ) -> OperationResult:
+        """Execute a native batch operation (domesticate, ziqiang, etc.).
+
+        Batch endpoints return a full ``BaseCloningStrategy`` (sequences +
+        sources), not just output sequences. The terminal product — the
+        sequence that is not an input to any other source — is extracted
+        and stored as the operation's output.
+        """
+        body = self._build_batch_body(op, sequences)
+        response = self._call_with_retry(
+            lambda: self._client.call_endpoint(endpoint, body)
+        )
+        return self._process_batch_response(op, response, ctx)
+
     @staticmethod
     def _build_source(op: Operation, cap: OperationCapability) -> dict[str, Any]:
         """Build the OpenCloning source object for an assembly operation."""
@@ -304,6 +344,80 @@ class StrategyExecutor:
         body: dict[str, Any] = {"sequences": sequences}
         body.update(op.parameters)
         return body
+
+    @staticmethod
+    def _build_batch_body(
+        op: Operation, sequences: list[dict[str, Any]]
+    ) -> dict[str, Any] | list[str]:
+        """Build the request body for a native batch operation.
+
+        - ``batch_domestication``: JSON dict with sequence + params.
+        - ``batch_ziqiang``: JSON array of protospacer strings from
+          operation parameters (no input sequence needed).
+        """
+        if op.operation_key == "batch_ziqiang":
+            protospacers = op.parameters.get("protospacers", [])
+            if not protospacers:
+                raise ValueError("batch_ziqiang requires 'protospacers' parameter")
+            return list(protospacers)
+
+        # Default: dict body with first input sequence + operation params
+        body: dict[str, Any] = {}
+        if sequences:
+            body["sequence"] = sequences[0]
+        body.update(op.parameters)
+        return body
+
+    def _process_batch_response(
+        self, op: Operation, response: dict[str, Any], ctx: _ExecutionContext
+    ) -> OperationResult:
+        """Process a batch CloningStrategy response.
+
+        Extracts the terminal product — the sequence whose ID is not
+        consumed as input by any source — and stores it as the output.
+        """
+        all_sequences = response.get("sequences") or []
+        if not all_sequences:
+            return OperationResult(
+                operation_id=op.id,
+                status=OperationStatus.AMBIGUOUS,
+                ambiguity_detail="batch operation produced zero sequences",
+            )
+
+        terminal = _find_terminal_products(all_sequences, response.get("sources") or [])
+        if not terminal:
+            return OperationResult(
+                operation_id=op.id,
+                status=OperationStatus.AMBIGUOUS,
+                ambiguity_detail="batch operation has no terminal product",
+            )
+
+        if len(terminal) > 1:
+            names = [s.get("name", s.get("id", "?")) for s in terminal]
+            return OperationResult(
+                operation_id=op.id,
+                status=OperationStatus.AMBIGUOUS,
+                ambiguity_detail=(
+                    f"batch operation produced {len(terminal)} terminal products "
+                    f"({names}); product selector not yet implemented"
+                ),
+            )
+
+        # Single terminal product — store it
+        seq = terminal[0]
+        ctx.seq_counter += 1
+        gateway_id = ctx.seq_counter
+        seq["id"] = gateway_id
+        ctx.sequence_store[str(gateway_id)] = dict(seq)
+
+        for mid in op.output_molecule_ids:
+            ctx.molecule_to_seq[mid] = gateway_id
+
+        return OperationResult(
+            operation_id=op.id,
+            status=OperationStatus.SUCCEEDED,
+            output_sequence_ids=(gateway_id,),
+        )
 
     def _process_response(
         self, op: Operation, response: dict[str, Any], ctx: _ExecutionContext
@@ -468,6 +582,24 @@ def _kahn_sort(
 
 
 # --- Result building helpers -------------------------------------------------
+
+
+def _find_terminal_products(
+    sequences: list[dict[str, Any]], sources: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Find sequences not consumed as input by any source.
+
+    In a CloningStrategy, the terminal product is the sequence whose ID
+    does not appear in any source's ``input`` list. This is the final
+    output of the coupled workflow.
+    """
+    consumed_ids: set[int] = set()
+    for source in sources:
+        for inp in source.get("input", []):
+            seq_ref = inp.get("sequence") if isinstance(inp, dict) else inp
+            if seq_ref is not None:
+                consumed_ids.add(seq_ref)
+    return [s for s in sequences if s.get("id") not in consumed_ids]
 
 
 def _compute_overall_status(statuses: list[OperationStatus]) -> str:

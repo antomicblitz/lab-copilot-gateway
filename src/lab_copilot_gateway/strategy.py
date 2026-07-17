@@ -229,9 +229,12 @@ class Operation:
         if not self.operation_key:
             raise ValueError("Operation.operation_key must not be empty")
         if not self.input_molecule_ids:
-            raise ValueError(
-                f"Operation {self.id} must have at least one input molecule"
-            )
+            # Batch native workflows (e.g. ziqiang_et_al2024) may use a
+            # bundled template with no external input molecules.
+            if not self.operation_key.startswith("batch_"):
+                raise ValueError(
+                    f"Operation {self.id} must have at least one input molecule"
+                )
 
 
 @dataclass(frozen=True)

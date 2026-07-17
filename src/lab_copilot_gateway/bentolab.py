@@ -434,8 +434,73 @@ class BentoLabAdapter:
             {**args_for_hash, "token_present": bool(context_token)}
         )
 
-        # 1. Verify context token.
-        if not context_token:
+        # 0. Determine tier early (needed for read-only bypass).
+        tier = tier_override or TOOL_TIER_STATUS
+
+        # 1. Identity resolution (before token check so unmapped callers
+        #    are denied even without a token).
+        if mapped_identity is None:
+            self._audit(
+                tool_name=tool_name,
+                policy_decision="deny",
+                reason="unmapped_caller",
+                mapped_identity=None,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=early_hash,
+                error={"code": "UNMAPPED_CALLER"},
+            )
+            raise UnmappedCaller()
+
+        # 2. Verify context token (skip for read-only tiers without a token).
+        experiment_id: int | None = None
+        if context_token:
+            try:
+                claims = verify_context_token(context_token)
+            except InvalidContextToken as exc:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason=f"invalid_context_token:{exc.detail}",
+                    mapped_identity=mapped_identity,
+                    experiment_id=None,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=early_hash,
+                    error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
+                )
+                raise
+            experiment_id = claims.experiment_id
+
+            # Token-identity binding.
+            if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
+                self._audit(
+                    tool_name=tool_name,
+                    policy_decision="deny",
+                    reason="context_token_user_mismatch",
+                    mapped_identity=mapped_identity,
+                    experiment_id=experiment_id,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=early_hash,
+                    error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
+                )
+                raise InvalidContextToken("token user does not match resolved identity")
+        elif tier >= Tier.HARDWARE_EXECUTION:
+            # Hardware execution requires a context token.
             self._audit(
                 tool_name=tool_name,
                 policy_decision="deny",
@@ -453,70 +518,11 @@ class BentoLabAdapter:
             )
             raise InvalidContextToken("missing")
 
-        try:
-            claims = verify_context_token(context_token)
-        except InvalidContextToken as exc:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason=f"invalid_context_token:{exc.detail}",
-                mapped_identity=mapped_identity,
-                experiment_id=None,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=early_hash,
-                error={"code": "INVALID_CONTEXT_TOKEN", "detail": exc.detail},
-            )
-            raise
-
         tool_args_hash = compute_args_hash(
-            {**args_for_hash, "experiment_id": claims.experiment_id}
+            {**args_for_hash, "experiment_id": experiment_id}
         )
 
-        # 2. Identity resolution.
-        if mapped_identity is None:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="unmapped_caller",
-                mapped_identity=None,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "UNMAPPED_CALLER"},
-            )
-            raise UnmappedCaller()
-
-        # 3. Token-identity binding.
-        if claims.mapped_elabftw_user_id != mapped_identity.elabftw_user_id:
-            self._audit(
-                tool_name=tool_name,
-                policy_decision="deny",
-                reason="context_token_user_mismatch",
-                mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
-                conversation_id=conversation_id,
-                request_id=request_id,
-                keycloak_subject=keycloak_subject,
-                librechat_user_id=librechat_user_id,
-                provider=provider,
-                model_id=model_id,
-                tool_args_hash=tool_args_hash,
-                error={"code": "CONTEXT_TOKEN_USER_MISMATCH"},
-            )
-            raise InvalidContextToken("token user does not match resolved identity")
-
         # 4. Policy decision.
-        tier = tier_override or TOOL_TIER_STATUS
         policy_req = PolicyRequest(
             tool_name=tool_name,
             tier=tier,
@@ -532,7 +538,7 @@ class BentoLabAdapter:
                 policy_decision="deny",
                 reason=decision.reason,
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -555,7 +561,7 @@ class BentoLabAdapter:
                 policy_decision="allow",
                 reason="bentolab_not_configured",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -581,7 +587,7 @@ class BentoLabAdapter:
                 policy_decision="allow",
                 reason="client_error",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -609,7 +615,7 @@ class BentoLabAdapter:
             policy_decision="allow",
             reason="call_succeeded",
             mapped_identity=mapped_identity,
-            experiment_id=claims.experiment_id,
+            experiment_id=experiment_id,
             conversation_id=conversation_id,
             request_id=request_id,
             keycloak_subject=keycloak_subject,
