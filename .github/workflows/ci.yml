@@ -23,3 +23,40 @@ jobs:
       - run: npm ci
       - run: npm install -g pyright
       - run: make check
+
+  opencloning-contract:
+    # Real-container contract tests against the pinned OpenCloning image.
+    # Verifies that the strategy catalog's endpoint/source-type mappings
+    # match the actual runtime API.  Not required for merge — runs on
+    # push to main and on manual dispatch.
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Start OpenCloning container
+        run: |
+          docker run -d --name opencloning \
+            -p 8091:8091 \
+            manulera/opencloning:v1.3.1-baseurl-opencloning
+          # Wait for the container to be ready
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8091/version >/dev/null 2>&1; then
+              echo "OpenCloning is ready"
+              break
+            fi
+            echo "Waiting for OpenCloning... ($i/30)"
+            sleep 2
+          done
+          curl -sf http://localhost:8091/version || { echo "OpenCloning failed to start"; exit 1; }
+      - name: Run contract tests
+        env:
+          LAB_COPILOT_OPENCLONING_URL: http://localhost:8091
+        run: |
+          uv run pytest -n 0 -v tests/test_opencloning_contract.py
+      - name: Cleanup
+        if: always()
+        run: docker rm -f opencloning 2>/dev/null || true

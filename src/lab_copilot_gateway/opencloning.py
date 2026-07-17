@@ -375,22 +375,13 @@ class HttpOpenCloningClient:
         source: dict[str, Any],
     ) -> dict[str, Any]:
         # The assembly endpoint is determined by source["type"].
-        # Map source type → endpoint path.
+        # Use the canonical strategy catalog (Slice 1) to resolve the
+        # endpoint.  Unknown source types raise UnknownSourceTypeError
+        # — no Gibson fallback.
+        from lab_copilot_gateway.strategy_catalog import get_catalog
+
         source_type = source.get("type", "")
-        type_to_path = {
-            "GibsonAssemblySource": "/gibson_assembly",
-            "LigationSource": "/ligation",
-            "RestrictionAndLigationSource": "/restriction_and_ligation",
-            "OverlapExtensionPCRLigationSource": "/gibson_assembly",
-            "InFusionSource": "/gibson_assembly",
-            "InVivoAssemblySource": "/gibson_assembly",
-            "HomologousRecombinationSource": "/homologous_recombination",
-            "CRISPRSource": "/crispr",
-            "CreLoxRecombinationSource": "/cre_lox_recombination",
-            "GatewaySource": "/gateway",
-            "RecombinaseSource": "/recombinase",
-        }
-        path = type_to_path.get(source_type, "/gibson_assembly")
+        path = get_catalog().resolve_endpoint(source_type)
         return self._post_json(
             path,
             {"sequences": sequences, "source": source},
