@@ -11,6 +11,8 @@ requirements. Update the status column as slices complete.
 | Slice | Description | Status | Evidence |
 |-------|-------------|--------|----------|
 | 1 | Pinned OpenCloning capability contract | DONE | `strategy_catalog.py` (20 ops), 45 tests, `make test-opencloning-contract`, CI contract job; commit `4bf68e6` |
+| 2 | Canonical strategy schema v3 | DONE | `strategy.py` + `strategy_validation.py`, 35 tests; commit `3ce1d1c` |
+| 3 | Canonical preparation + secure approval | DONE | `strategy_service.py`, `GET /strategy/capabilities`, `POST /strategy/prepare`, 17 tests; commit `603d488` |
 | 2 | Canonical strategy schema v3 | TODO | — |
 | 3 | Canonical preparation + secure approval | TODO | — |
 | 6 | Deterministic execution (core methods) | TODO | — |
