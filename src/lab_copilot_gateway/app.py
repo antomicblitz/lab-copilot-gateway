@@ -2182,8 +2182,13 @@ def _register_bentolab_route(api: FastAPI, identity_mapper: IdentityMapper) -> N
 
 
 def _register_strategy_routes(api: FastAPI) -> None:
-    """Register strategy v3 routes: GET /strategy/capabilities, POST /strategy/prepare."""
+    """Register strategy v3 routes."""
+    _register_strategy_capabilities_route(api)
+    _register_strategy_prepare_route(api)
+    _register_strategy_run_routes(api)
 
+
+def _register_strategy_capabilities_route(api: FastAPI) -> None:
     @api.get("/strategy/capabilities")
     def strategy_capabilities(
         include_experimental: bool = False,
@@ -2194,20 +2199,13 @@ def _register_strategy_routes(api: FastAPI) -> None:
         service = get_strategy_service()
         return service.get_capabilities(include_experimental=include_experimental)
 
+
+def _register_strategy_prepare_route(api: FastAPI) -> None:
     @api.post("/strategy/prepare")
     def strategy_prepare(
         body: dict[str, object],
     ) -> dict[str, object]:
-        """Canonicalize, validate, hash, and optionally approve a strategy.
-
-        Request body:
-            strategy: dict — the raw strategy from the LLM
-            experiment_id: str (optional) — eLabFTW experiment ID
-            conversation_id: str (optional) — chat conversation ID
-
-        Returns:
-            PreparedStrategy.to_public_dict() — no nucleotide sequences.
-        """
+        """Canonicalize, validate, hash, and optionally approve a strategy."""
         from lab_copilot_gateway.strategy_service import get_strategy_service
 
         strategy_dict = body.get("strategy", {})
@@ -2238,6 +2236,102 @@ def _register_strategy_routes(api: FastAPI) -> None:
         result = prepared.to_public_dict()
         result["ok"] = not prepared.has_blockers
         return result
+
+
+def _register_strategy_run_routes(api: FastAPI) -> None:
+    @api.post("/strategy/runs")
+    def strategy_submit_run(
+        body: dict[str, object],
+    ) -> dict[str, object]:
+        """Submit a strategy for asynchronous execution."""
+        return _handle_strategy_submit(body)
+
+    @api.get("/strategy/runs/{run_id}")
+    def strategy_get_run(run_id: str) -> dict[str, object]:
+        """Get the status of a strategy run."""
+        from lab_copilot_gateway.strategy_run_store import get_strategy_run_store
+
+        run_store = get_strategy_run_store()
+        run = run_store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return run.to_dict()
+
+    @api.post("/strategy/runs/{run_id}/cancel")
+    def strategy_cancel_run(run_id: str) -> dict[str, object]:
+        """Cancel a strategy run."""
+        from lab_copilot_gateway.strategy_run_store import get_strategy_run_store
+
+        run_store = get_strategy_run_store()
+        run = run_store.get(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        if run.is_terminal():
+            return {
+                "ok": False,
+                "reason": "already_terminal",
+                "message": f"run is already {run.status}",
+            }
+        run_store.update_status(run_id, status="cancelled", error="cancelled by user")
+        return {"ok": True, "run_id": run_id, "status": "cancelled"}
+
+
+def _handle_strategy_submit(body: dict[str, object]) -> dict[str, object]:
+    """Handle strategy run submission logic."""
+    from lab_copilot_gateway.strategy_run_store import get_strategy_run_store
+    from lab_copilot_gateway.strategy_service import get_strategy_service
+
+    plan_hash = body.get("plan_hash")
+    approval_id = body.get("approval_id")
+    strategy_dict = body.get("strategy")
+
+    if not plan_hash or not approval_id or not isinstance(strategy_dict, dict):
+        return {
+            "ok": False,
+            "reason": "invalid_request",
+            "message": "plan_hash, approval_id, and strategy are required",
+        }
+
+    experiment_id = body.get("experiment_id")
+    conversation_id = body.get("conversation_id")
+
+    service = get_strategy_service()
+    try:
+        prepared = service.prepare(
+            strategy_dict,
+            experiment_id=str(experiment_id) if experiment_id else None,
+            conversation_id=str(conversation_id) if conversation_id else None,
+        )
+    except (ValueError, KeyError) as exc:
+        return {"ok": False, "reason": "parse_error", "message": str(exc)}
+
+    if prepared.has_blockers:
+        return {
+            "ok": False,
+            "reason": "strategy_blocked",
+            "message": "strategy has blocking validation issues",
+        }
+
+    if prepared.plan_hash != plan_hash:
+        return {
+            "ok": False,
+            "reason": "hash_mismatch",
+            "message": "plan_hash does not match the re-validated strategy",
+        }
+
+    target = service._build_target_record(
+        str(experiment_id) if experiment_id else None,
+        str(conversation_id) if conversation_id else None,
+    )
+    run_store = get_strategy_run_store()
+    run = run_store.create(
+        strategy_id=prepared.strategy.id,
+        plan_hash=str(plan_hash),
+        approval_id=str(approval_id),
+        target_record=target,
+    )
+
+    return {"ok": True, "run_id": run.run_id, "status": run.status}
 
 
 # Module-level ASGI app for uvicorn (Dockerfile CMD expects
