@@ -200,7 +200,14 @@ class StrategyExecutor:
                 self._mark_remaining_skipped(op, ordered_ops, ctx)
                 break
 
-        return self._build_result(strategy, ctx)
+        result = self._build_result(strategy, ctx)
+
+        # Telemetry: privacy-safe outcome counter (Slice 15 step 4).
+        from lab_copilot_gateway.strategy_telemetry import get_telemetry
+
+        get_telemetry().record_execute(outcome=result.status)
+
+        return result
 
     def _topological_sort(self, strategy: Strategy) -> list[Operation]:
         """Sort operations by dependency (sources first, products last)."""

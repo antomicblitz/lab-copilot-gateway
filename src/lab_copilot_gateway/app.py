@@ -2186,6 +2186,7 @@ def _register_strategy_routes(api: FastAPI) -> None:
     _register_strategy_capabilities_route(api)
     _register_strategy_prepare_route(api)
     _register_strategy_run_routes(api)
+    _register_strategy_telemetry_route(api)
 
 
 def _register_strategy_capabilities_route(api: FastAPI) -> None:
@@ -2274,6 +2275,19 @@ def _register_strategy_run_routes(api: FastAPI) -> None:
             }
         run_store.update_status(run_id, status="cancelled", error="cancelled by user")
         return {"ok": True, "run_id": run_id, "status": "cancelled"}
+
+
+def _register_strategy_telemetry_route(api: FastAPI) -> None:
+    @api.get("/strategy/telemetry")
+    def strategy_telemetry() -> dict[str, object]:
+        """Return privacy-safe aggregate counters for strategy v3.
+
+        No sequences, user IDs, or strategy payloads — only category
+        labels and integer counts.
+        """
+        from lab_copilot_gateway.strategy_telemetry import get_telemetry
+
+        return get_telemetry().to_dict()
 
 
 def _handle_strategy_submit(body: dict[str, object]) -> dict[str, object]:

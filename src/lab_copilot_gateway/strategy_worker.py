@@ -125,7 +125,14 @@ class StrategyWorker:
                     args_hash=plan_hash,
                     target_record=target_record,
                 )
-            except Exception:
+            except Exception as exc:
+                # Telemetry: record approval mismatch type (Slice 15 step 4).
+                from lab_copilot_gateway.strategy_telemetry import get_telemetry
+
+                mismatch_type = type(exc).__name__.replace("Approval", "").lower()
+                get_telemetry().record_approval_mismatch(
+                    mismatch_type=mismatch_type or "unknown"
+                )
                 # Approval may have been consumed during idempotent
                 # run creation.  If the run was already created, we
                 # proceed — the approval was consumed at creation time.

@@ -44,6 +44,7 @@ from lab_copilot_gateway.strategy_catalog import (
     StrategyCatalog,
     get_catalog,
 )
+from lab_copilot_gateway.strategy_telemetry import get_telemetry
 from lab_copilot_gateway.strategy_validation import (
     has_blockers,
     validate_strategy,
@@ -131,6 +132,15 @@ class StrategyService:
         issues = validate_strategy(strategy)
         plan_hash = strategy.compute_hash()
         blocked = has_blockers(issues)
+
+        # Telemetry: privacy-safe aggregate counters (Slice 15 step 4).
+        get_telemetry().record_prepare(
+            operation_keys=[op.operation_key for op in strategy.operations],
+            molecule_count=len(strategy.molecules),
+            operation_count=len(strategy.operations),
+            revision=strategy.revision,
+            issue_codes=[issue.code for issue in issues],
+        )
 
         approval_id: str | None = None
         expires_at: str | None = None
