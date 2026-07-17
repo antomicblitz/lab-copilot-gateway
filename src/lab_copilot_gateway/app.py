@@ -1420,6 +1420,7 @@ def create_app() -> FastAPI:
     _register_plan_route(api, identity_mapper)
     _register_bentolab_route(api, identity_mapper)
     _register_opencloning_preview_routes(api)
+    _register_strategy_routes(api)
 
     return api
 
@@ -2178,6 +2179,65 @@ def _register_bentolab_route(api: FastAPI, identity_mapper: IdentityMapper) -> N
                     "message": f"attachment_b64 is not valid base64: {exc}",
                 }
         return _invoke_bentolab_tool(tool, body, mapped_identity)
+
+
+def _register_strategy_routes(api: FastAPI) -> None:
+    """Register strategy v3 routes: GET /strategy/capabilities, POST /strategy/prepare."""
+
+    @api.get("/strategy/capabilities")
+    def strategy_capabilities(
+        include_experimental: bool = False,
+    ) -> dict[str, object]:
+        """Return the canonical operation catalog."""
+        from lab_copilot_gateway.strategy_service import get_strategy_service
+
+        service = get_strategy_service()
+        return service.get_capabilities(include_experimental=include_experimental)
+
+    @api.post("/strategy/prepare")
+    def strategy_prepare(
+        body: dict[str, object],
+    ) -> dict[str, object]:
+        """Canonicalize, validate, hash, and optionally approve a strategy.
+
+        Request body:
+            strategy: dict — the raw strategy from the LLM
+            experiment_id: str (optional) — eLabFTW experiment ID
+            conversation_id: str (optional) — chat conversation ID
+
+        Returns:
+            PreparedStrategy.to_public_dict() — no nucleotide sequences.
+        """
+        from lab_copilot_gateway.strategy_service import get_strategy_service
+
+        strategy_dict = body.get("strategy", {})
+        if not isinstance(strategy_dict, dict):
+            return {
+                "ok": False,
+                "reason": "invalid_request",
+                "message": "strategy must be a JSON object",
+            }
+
+        experiment_id = body.get("experiment_id")
+        conversation_id = body.get("conversation_id")
+
+        service = get_strategy_service()
+        try:
+            prepared = service.prepare(
+                strategy_dict,
+                experiment_id=str(experiment_id) if experiment_id else None,
+                conversation_id=str(conversation_id) if conversation_id else None,
+            )
+        except (ValueError, KeyError) as exc:
+            return {
+                "ok": False,
+                "reason": "parse_error",
+                "message": str(exc),
+            }
+
+        result = prepared.to_public_dict()
+        result["ok"] = not prepared.has_blockers
+        return result
 
 
 # Module-level ASGI app for uvicorn (Dockerfile CMD expects
