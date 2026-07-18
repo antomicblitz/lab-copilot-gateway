@@ -35,6 +35,8 @@ Tools exposed (all already in the C06 tool registry):
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import os
 from dataclasses import dataclass, field
@@ -138,6 +140,16 @@ class DisallowedFileType(OpenCloningAdapterError):
             ),
         )
         self.extension = extension
+
+
+class InvalidFileContent(OpenCloningAdapterError):
+    """Base64-encoded file content could not be decoded safely."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            reason="invalid_file_content",
+            message="file_content_b64 is not valid base64",
+        )
 
 
 # --- downstream client ---------------------------------------------------
@@ -939,9 +951,10 @@ class OpenCloningAdapter:
         self,
         *,
         context_token: str,
-        file_content: str,
         file_format: str,
         mapped_identity: MappedIdentity | None,
+        file_content: str = "",
+        file_content_b64: str | None = None,
         conversation_id: str | None = None,
         request_id: str | None = None,
         keycloak_subject: str | None = None,
@@ -951,19 +964,26 @@ class OpenCloningAdapter:
     ) -> OpenCloningResult:
         """Parse an uploaded sequence file via OpenCloning.
 
-        ``file_content`` is the raw file content as a string (base64-decoded
-        by the /invoke endpoint if needed).  ``file_format`` is one of
+        ``file_content`` is UTF-8 sequence text. ``file_content_b64`` carries
+        binary-safe attachment bytes and is decoded only when explicitly set.
+        ``file_format`` is one of
         ``genbank``, ``fasta``, ``snapgene``, ``embl``.
 
         Enforces file-size limit and file-type allowlist before any
         downstream call.
         """
         # Decode file content to bytes for size check and downstream call.
-        raw_bytes = (
-            file_content.encode("utf-8")
-            if isinstance(file_content, str)
-            else file_content
-        )
+        if file_content_b64 is not None:
+            try:
+                raw_bytes = base64.b64decode(file_content_b64, validate=True)
+            except (binascii.Error, ValueError, TypeError) as exc:
+                raise InvalidFileContent() from exc
+        else:
+            raw_bytes = (
+                file_content.encode("utf-8")
+                if isinstance(file_content, str)
+                else file_content
+            )
 
         # File-size limit (enforced before any downstream call).
         if len(raw_bytes) > MAX_FILE_SIZE_BYTES:

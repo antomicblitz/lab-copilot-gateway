@@ -763,6 +763,48 @@ def _resolve_download_record_id(
     return record_id, record_type, None
 
 
+def _serialize_downloaded_upload(
+    upload_id: int,
+    content: bytes,
+    upload: dict[str, object] | None,
+) -> dict[str, object]:
+    """Encode upload bytes for JSON and derive the parser format."""
+    import base64
+    from pathlib import Path
+
+    metadata = upload or {}
+    filename = str(metadata.get("real_name") or metadata.get("name") or "")
+    extension = str(metadata.get("file_extension") or Path(filename).suffix).lower()
+    if extension and not extension.startswith("."):
+        extension = f".{extension}"
+    file_format = {
+        ".dna": "snapgene",
+        ".gb": "genbank",
+        ".gbk": "genbank",
+        ".ape": "genbank",
+        ".fasta": "fasta",
+        ".fa": "fasta",
+        ".embl": "embl",
+    }.get(extension, extension.lstrip(".") or "genbank")
+    result: dict[str, object] = {
+        "upload_id": upload_id,
+        "content_b64": base64.b64encode(content).decode("ascii"),
+        "content_encoding": "base64",
+        "byte_length": len(content),
+        "filename": filename,
+        "file_format": file_format,
+    }
+    try:
+        text_content = content.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    else:
+        # Backward compatibility for direct clients that consume text files.
+        result["content"] = text_content
+        result["length"] = len(text_content)
+    return result
+
+
 def _invoke_elabftw_download_upload(
     tool: Any,
     body: InvokeBody,
@@ -787,10 +829,20 @@ def _invoke_elabftw_download_upload(
     if record_type not in ("experiments",):
         try_record_types.append("experiments")
 
-    content: str | None = None
+    content: bytes | None = None
+    upload: dict[str, object] | None = None
     last_exc: Exception | None = None
     for rt in try_record_types:
         try:
+            uploads = adapter.client.get_uploads(rt, record_id)
+            upload = next(
+                (
+                    candidate
+                    for candidate in uploads
+                    if int(candidate.get("id", 0)) == upload_id
+                ),
+                None,
+            )
             content = adapter.client.get_upload_content(rt, record_id, upload_id)
             break
         except Exception as exc:
@@ -805,11 +857,7 @@ def _invoke_elabftw_download_upload(
     return {
         "ok": True,
         "tool_name": tool.name,
-        "result": {
-            "upload_id": upload_id,
-            "content": content,
-            "length": len(content),
-        },
+        "result": _serialize_downloaded_upload(upload_id, content, upload),
     }
 
 
@@ -870,6 +918,7 @@ def _dispatch_opencloning_tool(
         result = adapter.parse_sequence_file(
             context_token=body.context_token,
             file_content=body.args.get("file_content", ""),
+            file_content_b64=body.args.get("file_content_b64"),
             file_format=body.args.get("file_format", "genbank"),
             mapped_identity=mapped_identity,
             conversation_id=body.conversation_id,

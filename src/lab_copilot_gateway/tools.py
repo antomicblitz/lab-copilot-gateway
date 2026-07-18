@@ -252,7 +252,7 @@ _CATALOG: tuple[Tool, ...] = (
         adapter="elabftw",
         requires_approval=False,
         mutability="read",
-        description="Download the raw content of a file attached to an experiment or resource. Use after read_current_experiment or read_experiment_by_id to get the file content of an attached .gb, .fasta, or other sequence file. Returns the file text directly.",
+        description="Download a file attached to an experiment or resource. Use after read_current_experiment or read_experiment_by_id. Returns binary-safe stored content plus the detected sequence file format.",
     ),
     Tool(
         name="elabftw.draft_experiment_update",

@@ -2275,3 +2275,135 @@ def test_plan_execute_endpoint_invalid_approval() -> None:
     assert out["ok"] is False
     assert out["status"] == "rejected"
     assert "Approval consume failed" in out["summary"]
+
+
+# --- elabftw.download_upload binary-safe contract ------------------------
+
+
+def test_download_upload_must_include_content_encoding_and_file_format():
+    """The JSON boundary base64-encodes bytes and preserves file metadata."""
+    import base64
+
+    from lab_copilot_gateway.app import _invoke_elabftw_download_upload
+    from lab_copilot_gateway.elabftw import (
+        ElabftwReadAdapter,
+        StubElabftwClient,
+        reset_elabftw_read_adapter,
+    )
+    from lab_copilot_gateway.policy import PolicyEngine, Tier
+    from lab_copilot_gateway.tools import Tool
+
+    snapgene_bytes = bytes(range(256))
+    stub = StubElabftwClient(
+        seeds={
+            42: {
+                "id": 42,
+                "title": "Test",
+                "body": "<p>body</p>",
+                "metadata": None,
+                "uploads": [
+                    {
+                        "id": 1,
+                        "real_name": "plasmid.dna",
+                        "file_extension": "dna",
+                        "_content": snapgene_bytes,
+                    }
+                ],
+            }
+        }
+    )
+
+    from lab_copilot_gateway.audit import AuditStore
+
+    audit = AuditStore(db_path=":memory:")
+    adapter = ElabftwReadAdapter(
+        policy_engine=PolicyEngine(),
+        audit_store=audit,
+        client=stub,
+    )
+    reset_elabftw_read_adapter(adapter)
+
+    tool = Tool(
+        name="elabftw.download_upload",
+        tier=Tier.PERMISSIONED_ELABFTW_READ,
+        adapter="elabftw",
+        requires_approval=False,
+        mutability="read",
+        description="download upload",
+    )
+
+    class _Body:
+        args = {"upload_id": 1, "experiment_id": 42}
+        context_token = ""
+        conversation_id = None
+        request_id = None
+        keycloak_subject = None
+        librechat_user_id = None
+        provider = None
+        model_id = None
+
+    try:
+        response = _invoke_elabftw_download_upload(tool, _Body())
+    finally:
+        audit.close()
+        reset_elabftw_read_adapter(None)
+
+    assert response.get("ok") is True
+    result = response["result"]
+    assert result["content_encoding"] == "base64"
+    assert result["filename"] == "plasmid.dna"
+    assert result["file_format"] == "snapgene"
+    assert result["byte_length"] == len(snapgene_bytes)
+    assert base64.b64decode(result["content_b64"]) == snapgene_bytes
+
+
+def test_download_upload_keeps_legacy_content_for_utf8_text() -> None:
+    from lab_copilot_gateway.app import _serialize_downloaded_upload
+
+    result = _serialize_downloaded_upload(
+        2,
+        b"LOCUS plasmid\n//\n",
+        {"real_name": "plasmid.gb", "file_extension": "gb"},
+    )
+
+    assert result["content"] == "LOCUS plasmid\n//\n"
+    assert result["length"] == len("LOCUS plasmid\n//\n")
+
+
+def test_opencloning_invoke_rejects_invalid_file_content_b64() -> None:
+    import lab_copilot_gateway.audit as auditmod
+    import lab_copilot_gateway.identity as identitymod
+    import lab_copilot_gateway.opencloning as opencloningmod
+    import lab_copilot_gateway.policy as policymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+    stub = StubOpenCloningClient()
+    opencloningmod.reset_opencloning_adapter(
+        OpenCloningAdapter(
+            policy_engine=policymod._default_engine,
+            audit_store=auditmod._default_store,
+            client=stub,
+        )
+    )
+
+    response = make_client().post(
+        "/invoke",
+        json={
+            "tool_name": "opencloning.parse_sequence_file",
+            "context_token": _http_token(),
+            "args": {"file_content_b64": "not base64!", "file_format": "snapgene"},
+            "keycloak_subject": "kc-http-1",
+            "librechat_user_id": "lc-http-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "invalid_file_content"
+    assert stub.calls == []

@@ -479,10 +479,10 @@ class ElabftwClient(Protocol):
 
     def get_upload_content(
         self, record_type: str, record_id: int, upload_id: int
-    ) -> str:
+    ) -> bytes:
         """Download the raw content of an attached file.
 
-        Returns the file body as a string (text files: GenBank, FASTA, etc.).
+        Returns the exact file bytes. JSON callers must encode them explicitly.
         """
         ...
 
@@ -592,10 +592,11 @@ class StubElabftwClient:
 
     def get_upload_content(
         self, record_type: str, record_id: int, upload_id: int
-    ) -> str:
+    ) -> bytes:
         for u in self.get_uploads(record_type, record_id):
             if u.get("id") == upload_id:
-                return u.get("_content", "")
+                content = u.get("_content", b"")
+                return content.encode("utf-8") if isinstance(content, str) else content
         raise KeyError(f"upload {upload_id} not found")
 
     def search_experiments(
@@ -737,7 +738,7 @@ class HttpElabftwClient:
 
     def get_upload_content(
         self, record_type: str, record_id: int, upload_id: int
-    ) -> str:
+    ) -> bytes:
         """GET /api/v2/{record_type}/{id}/uploads/{uid}?format=binary — raw file content."""
         url = (
             f"{self.base_url.rstrip('/')}/api/v2/{record_type}"
@@ -746,7 +747,7 @@ class HttpElabftwClient:
         s = self._connect()
         resp = s.get(url, params={"format": "binary"}, timeout=self.timeout_seconds)
         resp.raise_for_status()
-        return resp.text
+        return resp.content
 
     def search_experiments(
         self, query: str, limit: int = 20, offset: int = 0

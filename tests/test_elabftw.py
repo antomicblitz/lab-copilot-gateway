@@ -1318,3 +1318,26 @@ def test_read_by_id_client_error(
     assert row is not None
     assert row["policy_decision"] == "allow"
     assert "CLIENT_ERROR" in (row["error_json"] or "")
+
+
+# --- HttpElabftwClient.get_upload_content binary regression -------------
+
+
+def test_get_upload_content_must_return_raw_bytes_not_text():
+    """Binary uploads remain bytes until the JSON response boundary."""
+    from unittest.mock import MagicMock
+
+    client = HttpElabftwClient(base_url="https://elab.example.org", api_key="k")
+    original = bytes(range(256))  # full byte range incl. non-UTF-8
+
+    mock_sess = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.content = original
+    mock_resp.raise_for_status = MagicMock()
+    mock_sess.get.return_value = mock_resp
+    client._session = mock_sess
+
+    result = client.get_upload_content("experiments", 42, 1)
+
+    assert isinstance(result, bytes)
+    assert result == original

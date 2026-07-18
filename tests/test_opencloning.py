@@ -1734,3 +1734,51 @@ def test_writeback_result_to_dict() -> None:
     assert d["steps"][0]["step_name"] == "upload_genbank"
     assert d["rollback_instructions"] == "delete upload 1"
     assert d["warnings"] == ["metadata failed"]
+
+
+# --- parse_sequence_file: file_content_b64 dispatch regression ----------
+
+
+def test_parse_sequence_file_must_accept_file_content_b64():
+    """Explicit base64 input reaches OpenCloning as the original bytes."""
+    import base64
+
+    from lab_copilot_gateway.audit import AuditStore
+
+    original = bytes([0x09, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x10])
+    b64_str = base64.b64encode(original).decode("ascii")
+
+    class _CapturingStub(StubOpenCloningClient):
+        captured_bytes: bytes | None = None
+
+        def parse_sequence_file(
+            self, file_content: bytes, file_format: str
+        ) -> dict[str, object]:
+            self.captured_bytes = file_content
+            return super().parse_sequence_file(file_content, file_format)
+
+    stub = _CapturingStub(
+        responses={
+            "parse_sequence_file": {
+                "sequences": [{"id": "seq1", "length": 8, "circular": False}],
+            }
+        }
+    )
+    audit = AuditStore(db_path=":memory:")
+    adapter = OpenCloningAdapter(
+        policy_engine=PolicyEngine(),
+        audit_store=audit,
+        client=stub,
+    )
+
+    try:
+        adapter.parse_sequence_file(
+            context_token=_token(),
+            file_content_b64=b64_str,
+            file_format="snapgene",
+            mapped_identity=_identity(),
+        )
+    finally:
+        audit.close()
+
+    assert stub.captured_bytes == original
