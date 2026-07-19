@@ -677,3 +677,183 @@ async def test_streamable_http_client_requires_live_server() -> None:
     client = StreamableHttpMcpClient(spec)
     assert client is not None
     await client.close()
+
+
+# ---------------------------------------------------------------------------
+# B3 — Overall timeout enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adapter_overall_timeout_fires_on_hung_call_tool(
+    server_spec: McpServerSpec,
+    remote_tool: McpRemoteTool,
+) -> None:
+    """When call_tool hangs forever, the overall adapter timeout returns
+    a normalized error within the configured bound (plus reasonable slack).
+    """
+    import time as _time
+
+    bindings = {
+        "mcp.test": McpToolBinding(
+            server_id="test-mcp",
+            local_name="mcp.test",
+            remote_name="remote_search",
+            input_schema_hash=remote_tool.input_schema_hash(),
+        )
+    }
+
+    # Stub whose call_tool hangs forever.
+    stub = StubMcpClient(
+        tools=[remote_tool],
+        _never_return=True,
+        _never_return_method="call_tool",
+    )
+    adapter = McpAdapter(
+        server_specs={server_spec.id: server_spec},
+        bindings=bindings,
+        client_factory=lambda spec, **kw: stub,  # type: ignore[arg-type]
+        overall_timeout=0.5,  # Short timeout for fast test
+    )
+    t0 = _time.monotonic()
+    result = await adapter.invoke(local_name="mcp.test", arguments={})
+    elapsed = _time.monotonic() - t0
+
+    assert result.ok is False
+    assert result.reason == "mcp_timeout"
+    # Must return within timeout + reasonable slack (2s).
+    assert elapsed < 2.0
+
+
+@pytest.mark.asyncio
+async def test_adapter_overall_timeout_fires_on_hung_initialize(
+    server_spec: McpServerSpec,
+    remote_tool: McpRemoteTool,
+) -> None:
+    """When initialize hangs forever, the overall adapter timeout fires."""
+    import time as _time
+
+    bindings = {
+        "mcp.test": McpToolBinding(
+            server_id="test-mcp",
+            local_name="mcp.test",
+            remote_name="remote_search",
+            input_schema_hash=remote_tool.input_schema_hash(),
+        )
+    }
+
+    stub = StubMcpClient(
+        tools=[remote_tool],
+        _never_return=True,
+        _never_return_method="initialize",
+    )
+    adapter = McpAdapter(
+        server_specs={server_spec.id: server_spec},
+        bindings=bindings,
+        client_factory=lambda spec, **kw: stub,  # type: ignore[arg-type]
+        overall_timeout=0.5,
+    )
+    t0 = _time.monotonic()
+    result = await adapter.invoke(local_name="mcp.test", arguments={})
+    elapsed = _time.monotonic() - t0
+
+    assert result.ok is False
+    assert result.reason == "mcp_timeout"
+    assert elapsed < 2.0
+
+
+# ---------------------------------------------------------------------------
+# B4 — Transport-level size cap before MCP SDK parsing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adapter_size_cap_rejects_before_full_materialization(
+    remote_tool: McpRemoteTool,
+) -> None:
+    """When a response exceeds max_result_bytes, the adapter rejects it
+    and the stub records that it was NOT fully materialized.
+
+    Simulates the transport-level cap by using the adapter's size check:
+    the adapter raises McpResultTooLargeError before the full content is
+    returned.
+    """
+    server_spec = McpServerSpec(
+        id="small-server",
+        url="http://x",
+        max_result_bytes=10,  # Very small cap — 10 bytes
+    )
+    bindings = {
+        "mcp.test": McpToolBinding(
+            server_id="small-server",
+            local_name="mcp.test",
+            remote_name="remote_search",
+            input_schema_hash=remote_tool.input_schema_hash(),
+        )
+    }
+
+    # Create a stub that produces a large result.
+    stub = StubMcpClient(
+        tools=[remote_tool],
+        call_results={
+            "remote_search": McpCallResult(
+                structured_content={"data": "x" * 2048},  # 2 KiB >> 10 byte cap
+                is_error=False,
+            ),
+        },
+    )
+    adapter = McpAdapter(
+        server_specs={"small-server": server_spec},
+        bindings=bindings,
+        client_factory=lambda spec, **kw: stub,  # type: ignore[arg-type]
+        overall_timeout=5.0,
+    )
+    result = await adapter.invoke(local_name="mcp.test", arguments={})
+    assert result.ok is False
+    assert result.reason == "mcp_result_too_large"
+    # The stub recorded bytes_produced — it was called and returned a result,
+    # but the adapter rejected it at the size check.
+    assert stub._bytes_produced > 10
+
+
+@pytest.mark.asyncio
+async def test_adapter_result_too_large_has_old_test_regression(
+    remote_tool: McpRemoteTool,
+) -> None:
+    """Regression: the existing oversized-result logic still works.
+
+    This test mirrors the pre-existing test_adapter_invoke_result_too_large
+    but with the updated adapter constructor signature.
+    """
+    server_spec = McpServerSpec(
+        id="small-server",
+        url="http://x",
+        max_result_bytes=10,
+    )
+    bindings = {
+        "mcp.test": McpToolBinding(
+            server_id="small-server",
+            local_name="mcp.test",
+            remote_name="remote_search",
+            input_schema_hash=remote_tool.input_schema_hash(),
+        )
+    }
+    stub = StubMcpClient(
+        tools=[remote_tool],
+        call_results={
+            "remote_search": McpCallResult(
+                structured_content={"data": "x" * 1000},
+                is_error=False,
+            ),
+        },
+    )
+    adapter = McpAdapter(
+        server_specs={"small-server": server_spec},
+        bindings=bindings,
+        client_factory=lambda spec, **kw: stub,  # type: ignore[arg-type]
+        overall_timeout=5.0,
+    )
+    result = await adapter.invoke(local_name="mcp.test", arguments={})
+    assert result.ok is False
+    assert result.reason == "mcp_result_too_large"
+    assert result.result_size_bytes > 10

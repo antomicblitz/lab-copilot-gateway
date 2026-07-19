@@ -1441,67 +1441,199 @@ def _build_mcp_server_specs() -> dict[str, McpServerSpec]:
     return specs
 
 
+def _mcp_deny_response(
+    *,
+    tool_name: str,
+    reason: str,
+    action_id: str,
+    message: str | None = None,
+    detail: dict[str, Any] | None = None,
+) -> dict[str, object]:
+    """Build a standard deny response for MCP tool invocations."""
+    resp: dict[str, object] = {
+        "ok": False,
+        "tool_name": tool_name,
+        "reason": reason,
+        "audit_action_id": action_id,
+    }
+    if message:
+        resp["message"] = message
+    if detail:
+        resp["detail"] = detail
+    return resp
+
+
+def _mcp_check_approval(
+    tool: Any,
+    body: InvokeBody,
+    args_hash: str,
+    approval_store: Any,
+) -> str | None:
+    """Check and consume approval for MCP tools. Returns error reason or None."""
+    from lab_copilot_gateway.approval import ApprovalError
+
+    if not tool.requires_approval:
+        return None
+    if not body.approval_id:
+        return "approval_required"
+    try:
+        approval_store.consume(
+            body.approval_id,
+            tool_name=tool.name,
+            args_hash=args_hash,
+            target_record=None,
+        )
+    except ApprovalError as exc:
+        return f"approval_invalid: {exc}"
+    return None
+
+
 def _invoke_mcp_tool(
     tool: Any,
     body: InvokeBody,
-    mapped_identity: MappedIdentity | None,  # noqa: ARG001 — required by dispatcher signature
+    mapped_identity: MappedIdentity | None,
     bindings: dict | None = None,
     client_factory: Any = None,
 ) -> dict[str, object]:
-    """Dispatch an MCP adapter tool invocation.
+    """Dispatch an MCP adapter tool invocation with full policy enforcement.
 
-    Resolves the binding by ``tool.name``, validates the remote still
-    advertises the tool with a matching input-schema hash, invokes the
-    tool, enforces size caps, and returns a normalized Gateway-shaped
-    result.  Fails closed on absence, mismatch, timeout, oversize, or
-    malformed shape.
-
-    ``structuredContent`` is surfaced; arbitrary text, resources, images,
-    and prompts are dropped.
+    Every MCP call goes through the same security boundary as other adapters:
+    identity mapping → policy decision → kill-switch check → approval check
+    (when required) → audit (allow and deny).  Only after passing all gates
+    does the call reach the downstream MCP server.
     """
+    import uuid as _uuid
+
+    policy_engine = get_policy_engine()
+    audit_store = get_audit_store()
+    approval_store = get_approval_store()
+
+    user_id = mapped_identity.elabftw_user_id if mapped_identity else None
+    team_id = mapped_identity.elabftw_team_id if mapped_identity else None
+    args_hash = compute_args_hash(body.args)
+    action_id = str(_uuid.uuid4())
+
+    def _audit(**kw: object) -> None:
+        try:
+            record = AuditRecord(
+                action_id=action_id,
+                conversation_id=body.conversation_id,
+                request_id=body.request_id,
+                keycloak_subject=body.keycloak_subject,
+                librechat_user_id=body.librechat_user_id,
+                mapped_elabftw_user_id=user_id,
+                mapped_elabftw_team_id=team_id,
+                provider=body.provider,
+                model_id=body.model_id,
+                tool_name=tool.name,
+                tool_args_hash=args_hash,
+                approval_id=body.approval_id,
+                policy_decision=str(kw.get("policy_decision", "")),
+                api_call_summary=kw.get("api_call_summary") or {},  # type: ignore[arg-type]
+                result_summary=kw.get("result_summary") or {},  # type: ignore[arg-type]
+                error=kw.get("error"),  # type: ignore[arg-type]
+            )
+            audit_store.append(record)
+        except Exception:
+            pass
+
+    def _deny(
+        reason: str, message: str | None = None, **kw: object
+    ) -> dict[str, object]:
+        _audit(policy_decision="deny", reason=reason, **kw)
+        return _mcp_deny_response(
+            tool_name=tool.name,
+            reason=reason,
+            action_id=action_id,
+            message=message,
+            detail=kw.get("detail"),  # type: ignore[arg-type]
+        )
+
+    # --- B1: policy preflight ---
+    decision = policy_engine.decide(
+        PolicyRequest(
+            tool_name=tool.name,
+            tier=tool.tier,
+            adapter="mcp",
+            user_id=user_id,
+            team_id=team_id,
+            has_approval=body.approval_id is not None,
+            approval_id=body.approval_id,
+        )
+    )
+    if decision.decision != "allow":
+        return _deny(
+            decision.reason,
+            message=f"policy denies {tool.name!r}: {decision.reason}",
+            error={
+                "code": "POLICY_DENIED",
+                "reason": decision.reason,
+                "tier": int(tool.tier),
+                "matched_kill_switches": decision.matched_kill_switches,
+            },
+        )
+
+    # --- Approval gate ---
+    approval_err = _mcp_check_approval(tool, body, args_hash, approval_store)
+    if approval_err is not None:
+        return _deny(
+            approval_err,
+            message=f"tool {tool.name!r}: {approval_err}",
+            error={"code": "APPROVAL_DENIED", "reason": approval_err},
+        )
+
+    # --- Resolve binding ---
     if bindings is None:
         bindings = _MCP_BINDINGS
-
     binding = bindings.get(tool.name)
     if binding is None:
-        return {
-            "ok": False,
-            "tool_name": tool.name,
-            "reason": "mcp_unregistered_tool",
-            "message": (
-                f"tool {tool.name!r} is registered as mcp adapter but "
-                "has no MCP binding — add it to mcp_bindings.py"
-            ),
-        }
+        return _deny(
+            "mcp_unregistered_tool",
+            message=f"tool {tool.name!r} is registered as mcp adapter but has no MCP binding",
+            error={"code": "MCP_UNREGISTERED_TOOL"},
+        )
 
-    server_specs = _build_mcp_server_specs()
+    # --- Dispatch ---
     adapter = McpAdapter(
-        server_specs=server_specs,
+        server_specs=_build_mcp_server_specs(),
         bindings=bindings,
         client_factory=client_factory,
+        overall_timeout=60.0,
     )
     result: McpInvokeResult = _run_async_to_sync(
         adapter.invoke(local_name=tool.name, arguments=body.args)
     )
 
-    response: dict[str, object] = {
-        "ok": result.ok,
-        "tool_name": tool.name,
-    }
-    if result.ok:
-        response["result"] = result.structured_content or {}
-    else:
-        response["reason"] = result.reason
-        if result.structured_content:
-            response["detail"] = result.structured_content
-
-    # Record MCP-specific audit metadata.
-    response["_mcp_audit"] = {
+    # --- Build response + B2: audit ---
+    response: dict[str, object] = {"ok": result.ok, "tool_name": tool.name}
+    mcp_summary: dict[str, object] = {
         "server_id": result.server_id,
         "remote_tool": result.remote_tool,
         "duration_ms": result.duration_ms,
         "result_size_bytes": result.result_size_bytes,
+        "schema_hash": result.schema_hash,
     }
+    if result.ok:
+        response["result"] = result.structured_content or {}
+        _audit(
+            policy_decision="allow",
+            reason=result.reason,
+            api_call_summary=mcp_summary,
+            result_summary={"ok": True},
+        )
+    else:
+        response["reason"] = result.reason
+        if result.structured_content:
+            response["detail"] = result.structured_content
+        _audit(
+            policy_decision="allow",
+            reason=result.reason,
+            api_call_summary=mcp_summary,
+            error={"code": "MCP_ADAPTER_ERROR", "reason": result.reason},
+        )
+
+    response["_mcp_audit"] = mcp_summary
+    response["audit_action_id"] = action_id
     return response
 
 

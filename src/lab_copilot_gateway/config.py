@@ -26,6 +26,7 @@ _KILL_SWITCH_CATEGORY_ENV_VARS: dict[str, str] = {
     "adapter_opencloning": "LAB_COPILOT_KILL_ADAPTER_OPENCLONING",
     "adapter_wallac": "LAB_COPILOT_KILL_ADAPTER_WALLAC",
     "adapter_bentolab": "LAB_COPILOT_KILL_ADAPTER_BENTOLAB",
+    "adapter_mcp": "LAB_COPILOT_KILL_ADAPTER_MCP",
 }
 
 #: The set of valid named kill switch category names.
@@ -108,12 +109,20 @@ def get_mcp_server_specs() -> list[dict[str, object]]:
     for spec in specs:
         if not isinstance(spec, dict) or not isinstance(spec.get("id"), str):
             continue
+        try:
+            timeout = float(spec.get("timeout", 30.0))
+        except (ValueError, TypeError):
+            timeout = 30.0
+        try:
+            max_result_bytes = int(spec.get("max_result_bytes", 1048576))
+        except (ValueError, TypeError):
+            max_result_bytes = 1048576
         result.append(
             {
                 "id": spec["id"],
                 "url": spec.get("url", ""),
-                "timeout": float(spec.get("timeout", 30.0)),
-                "max_result_bytes": int(spec.get("max_result_bytes", 1048576)),
+                "timeout": timeout,
+                "max_result_bytes": max_result_bytes,
             }
         )
     return result

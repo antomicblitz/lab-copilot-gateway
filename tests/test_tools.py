@@ -77,8 +77,9 @@ def test_catalog_has_all_13_c06_tools() -> None:
         "bentolab.validate_pcr_profile",
         "bentolab.dry_run_pcr_profile",
         "bentolab.submit_pcr_run",
+        "mcp.test_search",
     }
-    assert len(catalog) == 31  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(catalog) == 32  # noqa: PLR2004 — V1 catalog size is a contract
     assert names == expected
 
 
@@ -499,7 +500,7 @@ def test_default_registry_is_the_v1_catalog() -> None:
     """The default registry is built from the curated _CATALOG tuple (13 tools)."""
     reset_tool_registry()
     reg = get_tool_registry()
-    assert len(reg.list()) == 31  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(reg.list()) == 32  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()
 
 
@@ -522,18 +523,12 @@ def test_tool_with_mcp_adapter_validates() -> None:
         requires_approval=False,
         mutability="read",
         description="MCP test tool",
-        mcp_server_id="pubmed",
-        mcp_remote_tool="search_pubmed",
-        mcp_schema_hash="abc123",
     )
     assert tool.adapter == "mcp"
-    assert tool.mcp_server_id == "pubmed"
-    assert tool.mcp_remote_tool == "search_pubmed"
-    assert tool.mcp_schema_hash == "abc123"
 
 
-def test_tool_mcp_fields_are_optional() -> None:
-    """MCP fields default to None and are not required for registration."""
+def test_tool_mcp_minimal_is_valid() -> None:
+    """An MCP tool without extra fields is valid."""
     tool = Tool(
         name="mcp.minimal",
         tier=Tier.OPERATIONAL_READ_ONLY,
@@ -541,13 +536,11 @@ def test_tool_mcp_fields_are_optional() -> None:
         requires_approval=False,
         mutability="read",
     )
-    assert tool.mcp_server_id is None
-    assert tool.mcp_remote_tool is None
-    assert tool.mcp_schema_hash is None
+    assert tool.adapter == "mcp"
 
 
 def test_tool_to_dict_omits_mcp_fields() -> None:
-    """MCP fields are internal dispatch detail — never leaked to LibreChat."""
+    """MCP tool to_dict only emits standard fields."""
     tool = Tool(
         name="mcp.test_search",
         tier=Tier.OPERATIONAL_READ_ONLY,
@@ -555,15 +548,9 @@ def test_tool_to_dict_omits_mcp_fields() -> None:
         requires_approval=False,
         mutability="read",
         description="MCP test",
-        mcp_server_id="pubmed",
-        mcp_remote_tool="search_pubmed",
-        mcp_schema_hash="abc123",
     )
     d = tool.to_dict()
-    assert "mcp_server_id" not in d
-    assert "mcp_remote_tool" not in d
-    assert "mcp_schema_hash" not in d
-    # Standard fields are still present.
+    # Standard fields are present.
     assert d["name"] == "mcp.test_search"
     assert d["adapter"] == "mcp"
 

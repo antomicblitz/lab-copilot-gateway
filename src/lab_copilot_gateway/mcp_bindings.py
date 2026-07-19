@@ -16,5 +16,13 @@ from __future__ import annotations
 from lab_copilot_gateway.mcp_adapter import McpToolBinding
 
 #: Static MCP tool bindings.  Populated by code review; no dynamic discovery.
-#: Entries added in Slice 4 (PubMed bindings).
-BINDINGS: dict[str, McpToolBinding] = {}
+#: Slice 4 adds PubMed bindings here.  The test_search entry exists so the
+#: gateway's /invoke path can dispatch MCP tools end-to-end in tests.
+BINDINGS: dict[str, McpToolBinding] = {
+    "mcp.test_search": McpToolBinding(
+        server_id="test-mcp",
+        local_name="mcp.test_search",
+        remote_name="remote_search",
+        input_schema_hash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    ),
+}

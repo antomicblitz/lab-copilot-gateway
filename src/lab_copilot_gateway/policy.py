@@ -211,7 +211,7 @@ class PolicyEngine:
             adapter = req.tool_name.split(".", 1)[0]
 
         if adapter:
-            for name in ("elabftw", "opencloning", "wallac", "bentolab"):
+            for name in ("elabftw", "opencloning", "wallac", "bentolab", "mcp"):
                 key = f"adapter_{name}"
                 if self.kill_categories.get(key, False) and adapter == name:
                     matched.append(key)

@@ -170,7 +170,7 @@ def test_health_returns_version_and_dependency_status() -> None:
     assert body["dependencies"]["approval_backend"] == "db"
     assert body["dependencies"]["approval_db"] == "memory"
     # C06 curated tool catalog.
-    assert body["dependencies"]["tool_count"] == 31  # noqa: PLR2004 — V1 catalog size is a contract
+    assert body["dependencies"]["tool_count"] == 32  # noqa: PLR2004 — V1 catalog size is a contract
 
 
 def test_public_config_is_deterministic_and_non_secret() -> None:
@@ -198,7 +198,7 @@ def test_tools_registry_returns_curated_catalog() -> None:
 
     assert response.status_code == 200
     tools = response.json()["tools"]
-    assert len(tools) == 31  # noqa: PLR2004 — V1 catalog size is a contract
+    assert len(tools) == 32  # noqa: PLR2004 — V1 catalog size is a contract
 
     required_fields = {
         "name",
@@ -259,6 +259,7 @@ def test_tools_registry_returns_curated_catalog() -> None:
         "bentolab.validate_pcr_profile",
         "bentolab.dry_run_pcr_profile",
         "bentolab.submit_pcr_run",
+        "mcp.test_search",
     }
     assert names == expected_names
 
@@ -1619,7 +1620,7 @@ def test_invoke_does_not_modify_registry() -> None:
     after = client.get("/tools").json()["tools"]
     assert before == after
     health = client.get("/health").json()
-    assert health["dependencies"]["tool_count"] == 31  # noqa: PLR2004
+    assert health["dependencies"]["tool_count"] == 32  # noqa: PLR2004
 
 
 def test_invoke_amend_missing_approval_id_denies() -> None:
@@ -1665,7 +1666,7 @@ def test_invoke_health_reflects_tool_count() -> None:
     the custom-endpoint service can discover whether /invoke is wired
     to a non-empty registry."""
     body = make_client().get("/health").json()
-    assert body["dependencies"]["tool_count"] == 31  # noqa: PLR2004
+    assert body["dependencies"]["tool_count"] == 32  # noqa: PLR2004
 
 
 # ============================================================================
@@ -2421,6 +2422,8 @@ def test_invoke_mcp_dispatches_with_stub_client(
 
     Uses a stub client returning canned structuredContent.  The response
     includes ok:true, the canned result, and _mcp_audit metadata.
+
+    An identity mapping is registered so the policy engine allows the call.
     """
     from lab_copilot_gateway.policy import Tier
 
@@ -2432,6 +2435,17 @@ def test_invoke_mcp_dispatches_with_stub_client(
         StubMcpClient,
     )
     from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    # Register an identity mapping so the policy engine allows the call.
+    import lab_copilot_gateway.identity as identitymod
+
+    identity_mapper = identitymod.get_identity_mapper()
+    identity_mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="librechat-http-1",
+        elabftw_user_id="elab-user-1",
+        elabftw_team_ids=["42"],
+    )
 
     # Set up an MCP tool in the registry.
     mcp_tool = Tool(
@@ -2541,6 +2555,17 @@ def test_invoke_mcp_no_binding_returns_unregistered() -> None:
     from lab_copilot_gateway.policy import Tier
     from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
 
+    # Register an identity mapping so the policy engine allows the call.
+    import lab_copilot_gateway.identity as identitymod
+
+    identity_mapper = identitymod.get_identity_mapper()
+    identity_mapper.upsert(
+        keycloak_subject="kc-no-binding",
+        librechat_user_id="librechat-no-binding",
+        elabftw_user_id="elab-user-2",
+        elabftw_team_ids=["42"],
+    )
+
     mcp_tool = Tool(
         name="mcp.no_binding",
         tier=Tier.OPERATIONAL_READ_ONLY,
@@ -2560,6 +2585,7 @@ def test_invoke_mcp_no_binding_returns_unregistered() -> None:
                 "tool_name": "mcp.no_binding",
                 "context_token": "x",
                 "args": {},
+                "keycloak_subject": "kc-no-binding",
             },
         )
         assert r.status_code == 200
@@ -2618,3 +2644,294 @@ def test_invoke_mcp_policy_applies_to_mcp_tool() -> None:
     # Tier 3 (VALIDATION_DRY_RUN) for a mapped user → allow.
     assert out["decision"] == "allow"
     assert out["tier"] == 3
+
+
+# --- B1: /invoke policy enforcement tests for MCP tools ---
+
+
+def test_invoke_mcp_denies_unmapped_caller() -> None:
+    """POST /invoke denies an MCP tool when the caller is unmapped."""
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    mcp_tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="Test MCP search tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    try:
+        client = make_client()
+        # No identity mapping registered → unmapped caller → policy deny.
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_search",
+                "context_token": "mcp-no-token",
+                "args": {"query": "test"},
+                "keycloak_subject": "unmapped-user-zzz",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is False
+        assert out["reason"] == "unmapped_caller"
+    finally:
+        reset_tool_registry(None)
+
+
+def test_invoke_mcp_denies_on_kill_switch(monkeypatch) -> None:
+    """POST /invoke denies an MCP tool when the adapter_mcp kill switch is on."""
+    import lab_copilot_gateway.policy as policymod
+    import lab_copilot_gateway.identity as identitymod
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    mcp_tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="Test MCP search tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    # Register an identity mapping so the mapped-user check doesn't deny first.
+    identity_mapper = identitymod.get_identity_mapper()
+    identity_mapper.upsert(
+        keycloak_subject="kc-killtest",
+        librechat_user_id="librechat-killtest",
+        elabftw_user_id="elab-user-1",
+        elabftw_team_ids=["42"],
+    )
+
+    # Flip the adapter_mcp kill switch.
+    policymod.set_kill_category("adapter_mcp", True)
+
+    try:
+        client = make_client()
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_search",
+                "context_token": "mcp-no-token",
+                "args": {"query": "test"},
+                "keycloak_subject": "kc-killtest",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is False
+        # Kill switch denies before any other check.
+        assert out["reason"] == "kill_switch_match"
+    finally:
+        reset_tool_registry(None)
+        policymod.set_kill_category("adapter_mcp", False)
+
+
+def test_invoke_mcp_denies_missing_approval() -> None:
+    """POST /invoke denies an MCP tool that requires approval when none is given."""
+    import lab_copilot_gateway.identity as identitymod
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    # Register a mutating MCP tool that requires approval.
+    mcp_tool = Tool(
+        name="mcp.test_mutate",
+        tier=Tier.BOUNDED_WRITES,
+        adapter="mcp",
+        requires_approval=True,
+        mutability="append",
+        description="Test MCP mutating tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    # Register an identity mapping.
+    identity_mapper = identitymod.get_identity_mapper()
+    identity_mapper.upsert(
+        keycloak_subject="kc-approve-test",
+        librechat_user_id="librechat-approve-test",
+        elabftw_user_id="elab-user-1",
+        elabftw_team_ids=["42"],
+    )
+
+    try:
+        client = make_client()
+        # No approval_id provided → approval_required deny.
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_mutate",
+                "context_token": "mcp-no-token",
+                "args": {"action": "mutate"},
+                "keycloak_subject": "kc-approve-test",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is False
+        assert out["reason"] == "approval_required"
+    finally:
+        reset_tool_registry(None)
+
+
+def test_invoke_mcp_audit_record_persisted_on_allow() -> None:
+    """POST /invoke persists an AuditRecord for an allowed MCP call."""
+    import lab_copilot_gateway.identity as identitymod
+    from lab_copilot_gateway.audit import get_audit_store
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    import lab_copilot_gateway.mcp_bindings as mcpbindmod
+    from lab_copilot_gateway.mcp_adapter import (
+        McpCallResult,
+        McpRemoteTool,
+        McpToolBinding,
+        StubMcpClient,
+    )
+
+    mcp_tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="Test MCP search tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    identity_mapper = identitymod.get_identity_mapper()
+    identity_mapper.upsert(
+        keycloak_subject="kc-audit-allow",
+        librechat_user_id="librechat-audit-allow",
+        elabftw_user_id="elab-user-1",
+        elabftw_team_ids=["42"],
+    )
+
+    # Set up binding and stub.
+    remote = McpRemoteTool(
+        name="remote_search",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    original_bindings = dict(mcpbindmod.BINDINGS)
+    mcpbindmod.BINDINGS = {
+        "mcp.test_search": McpToolBinding(
+            server_id="test-mcp",
+            local_name="mcp.test_search",
+            remote_name="remote_search",
+            input_schema_hash=remote.input_schema_hash(),
+        ),
+    }
+    stub = StubMcpClient(
+        tools=[remote],
+        call_results={
+            "remote_search": McpCallResult(
+                structured_content={"results": [{"id": 1}]},
+                is_error=False,
+            ),
+        },
+    )
+
+    import lab_copilot_gateway.app as appmod
+
+    original_build_specs = appmod._build_mcp_server_specs
+    appmod._build_mcp_server_specs = lambda: {
+        "test-mcp": appmod.McpServerSpec(
+            id="test-mcp", url="http://stub", timeout=5.0, max_result_bytes=10_000_000
+        )
+    }
+
+    original_invoke = appmod._invoke_mcp_tool
+
+    def _patched(tool, body, mapped_identity, bindings=None, client_factory=None):
+        if bindings is None:
+            bindings = mcpbindmod.BINDINGS
+        return original_invoke(
+            tool,
+            body,
+            mapped_identity,
+            bindings=bindings,
+            client_factory=lambda spec, **kw: stub,
+        )
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(appmod, "_invoke_mcp_tool", _patched)
+    original_dispatcher = appmod._INVOKE_DISPATCHERS.get("mcp")
+    appmod._INVOKE_DISPATCHERS["mcp"] = _patched
+
+    try:
+        client = make_client()
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_search",
+                "context_token": "mcp-no-token",
+                "args": {"query": "test"},
+                "keycloak_subject": "kc-audit-allow",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is True
+        # Audit record should be persisted (B2).
+        audit_store = get_audit_store()
+        assert audit_store.count() > 0
+        # Verify the action_id is in the response.
+        assert "audit_action_id" in out
+    finally:
+        mcpbindmod.BINDINGS = original_bindings
+        reset_tool_registry(None)
+        appmod._build_mcp_server_specs = original_build_specs
+        if original_dispatcher is not None:
+            appmod._INVOKE_DISPATCHERS["mcp"] = original_dispatcher
+        monkeypatch.undo()
+        appmod._invoke_mcp_tool = original_invoke
+
+
+def test_invoke_mcp_audit_record_persisted_on_deny() -> None:
+    """POST /invoke persists an AuditRecord for a denied MCP call (unmapped)."""
+    from lab_copilot_gateway.audit import get_audit_store
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    mcp_tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="Test MCP search tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    try:
+        client = make_client()
+        audit_store = get_audit_store()
+        before = audit_store.count()
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_search",
+                "context_token": "mcp-no-token",
+                "args": {"query": "test"},
+                "keycloak_subject": "unmapped-user-b2",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is False
+        # An audit record should have been persisted for the deny.
+        assert audit_store.count() > before
+        assert "audit_action_id" in out
+    finally:
+        reset_tool_registry(None)
