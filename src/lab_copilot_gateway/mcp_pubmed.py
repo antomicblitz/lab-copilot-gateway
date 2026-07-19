@@ -41,18 +41,49 @@ MAX_ABSTRACT_CHARS: int = 500
 def normalize_search_result(raw_structured_content: Any) -> dict[str, Any]:
     """Normalize a ``pubmed_search_articles`` result into the contract shape.
 
-    The raw result has ``pmids`` + ``summaries`` lists with optional
-    ``enriched`` metadata.  We extract only the article records.
+    The raw result has ``pmids`` + ``summaries`` lists.  When summaries
+    are populated, each is a full article record.  When summaries are
+    empty (the common case for search — the server returns PMIDs only),
+    we create minimal article records (PMID + PubMed URL) so the model
+    can cite them and call ``fetch_pubmed_articles`` for full details.
     """
     if not isinstance(raw_structured_content, dict):
         return {"articles": [], "total": 0}
 
     summaries = raw_structured_content.get("summaries")
-    if not isinstance(summaries, list):
-        return {"articles": [], "total": 0}
+    if isinstance(summaries, list) and summaries:
+        articles = [normalize_article(s) for s in summaries if isinstance(s, dict)]
+        return {"articles": articles, "total": len(articles)}
 
-    articles = [normalize_article(s) for s in summaries if isinstance(s, dict)]
-    return {"articles": articles, "total": len(articles)}
+    pmids = raw_structured_content.get("pmids")
+    if isinstance(pmids, list) and pmids:
+        articles = _pmids_to_minimal_articles(pmids)
+        return {"articles": articles, "total": len(articles)}
+
+    return {"articles": [], "total": 0}
+
+
+def _pmids_to_minimal_articles(pmids: list[Any]) -> list[dict[str, Any]]:
+    """Convert a list of PMIDs into minimal article records (PMID + URL only)."""
+    articles: list[dict[str, Any]] = []
+    for pmid in pmids:
+        pmid_str = str(pmid).strip() if pmid else ""
+        if pmid_str:
+            articles.append(
+                {
+                    "pmid": pmid_str,
+                    "title": None,
+                    "authors": [],
+                    "journal": None,
+                    "year": None,
+                    "doi": None,
+                    "abstract": None,
+                    "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid_str}/",
+                }
+            )
+    return articles
+
+    return {"articles": [], "total": 0}
 
 
 def normalize_fetch_result(raw_structured_content: Any) -> dict[str, Any]:

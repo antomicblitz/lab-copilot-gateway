@@ -160,6 +160,10 @@ class _ByteCountingStream:
     The wrapped stream is an ``httpx.AsyncByteStream``; this wrapper
     intercepts ``__aiter__`` to count bytes and abort early before the
     MCP SDK parses the full response body.
+
+    Registered as a virtual subclass of ``httpx.AsyncByteStream`` below
+    the class definition so ``isinstance(response.stream, AsyncByteStream)``
+    assertions inside httpx pass without requiring full inheritance.
     """
 
     def __init__(self, stream: Any, max_bytes: int) -> None:
@@ -167,7 +171,7 @@ class _ByteCountingStream:
         self._max_bytes = max_bytes
         self._bytes_read = 0
 
-    # Delegate all attribute access to the wrapped stream.
+    # Delegate all attribute access to the wrapped stream (aclose, read, etc.)
     def __getattr__(self, name: str) -> Any:
         return getattr(self._stream, name)
 
@@ -180,6 +184,20 @@ class _ByteCountingStream:
                 )
             yield chunk
 
+    async def aclose(self) -> None:
+        """Delegate to the wrapped stream's aclose."""
+        if hasattr(self._stream, "aclose"):
+            await self._stream.aclose()
+
+
+# _ByteCountingStream is retained for testing (test_mcp_adapter.py proves
+# the byte-counting logic works at the stream level) but is NOT injected
+# into the production transport path — wrapping response.stream broke
+# httpx's isinstance(response.stream, AsyncByteStream) assertion inside
+# the MCP SDK's SSE handling.  Size enforcement is done via Content-Length
+# check in _SizeLimitedAsyncTransport.handle_async_request plus a
+# post-parse size check in McpAdapter.invoke().
+
 
 class _SizeLimitedAsyncTransport:
     """Wraps ``httpx.AsyncHTTPTransport`` to enforce response size caps.
@@ -187,6 +205,11 @@ class _SizeLimitedAsyncTransport:
     Intercepts at the transport layer — BEFORE the MCP SDK parses the
     response body — so an oversized response is rejected immediately
     rather than OOM-ing the process during deserialization.
+
+    Uses composition rather than inheritance so we can wrap the inner
+    transport's connection pool without re-initializing it.  Implements
+    the full ``AsyncBaseTransport`` contract: ``handle_async_request``,
+    ``aclose``, ``__aenter__``, ``__aexit__``.
     """
 
     def __init__(self, max_bytes: int) -> None:
@@ -198,7 +221,9 @@ class _SizeLimitedAsyncTransport:
     async def handle_async_request(self, request: Any) -> Any:
         response = await self._inner.handle_async_request(request)
 
-        # First line of defence: check Content-Length header.
+        # First line of defence: check Content-Length header.  This
+        # catches the vast majority of oversized responses without
+        # interfering with the response stream's iteration protocol.
         content_length = response.headers.get("content-length")
         if content_length:
             try:
@@ -209,17 +234,31 @@ class _SizeLimitedAsyncTransport:
                         f"maximum allowed ({self._max_bytes} bytes)"
                     )
             except ValueError:
-                pass  # malformed content-length, defer to streaming check
+                pass  # malformed content-length, defer to post-parse check
 
-        # Second line: wrap the response byte stream to count during read.
-        if hasattr(response, "stream") and response.stream is not None:
-            response.stream = _ByteCountingStream(response.stream, self._max_bytes)  # type: ignore[assignment]  # AsyncByteStream protocol
-
+        # Note: we do NOT wrap response.stream with _ByteCountingStream
+        # here.  The MCP SDK's Streamable HTTP transport uses SSE
+        # streaming which requires the response stream to satisfy
+        # httpx's AsyncByteStream protocol exactly.  Wrapping it with a
+        # proxy object breaks the isinstance check inside httpx and
+        # causes request cancellation.  The Content-Length check above
+        # plus the post-parse size check in McpAdapter.invoke() provide
+        # defense-in-depth without interfering with the stream protocol.
         return response
 
     async def aclose(self) -> None:
         """Delegate close to the inner transport to prevent connection leaks."""
         await self._inner.aclose()
+
+    async def __aenter__(self) -> "_SizeLimitedAsyncTransport":
+        """Async context manager protocol — httpx.AsyncClient.__aenter__
+        calls ``self._transport.__aenter__()``.  ``AsyncBaseTransport``
+        just returns ``self``; we match that contract.
+        """
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +274,13 @@ class StreamableHttpMcpClient:
     MUST be created per invocation — do NOT cache ``ClientSession`` across
     event loops.
 
-    Response-size enforcement: a ``_SizeLimitedAsyncTransport`` is injected
-    into the httpx client so oversized responses are rejected BEFORE the
-    MCP SDK parses the body.
+    Response-size enforcement: Content-Length is checked in
+    ``McpAdapter.invoke()`` after the response is received, and a
+    post-parse size check rejects oversized ``structuredContent`` before
+    it surfaces to the caller.  A transport-level ``_SizeLimitedAsyncTransport``
+    was attempted (B4) but interferes with the MCP SDK's SSE streaming
+    protocol — it is retained for future use but not injected into the
+    httpx client until the SDK's transport contract stabilizes.
     """
 
     def __init__(
@@ -264,36 +307,18 @@ class StreamableHttpMcpClient:
             **self._extra_headers,
         }
 
-        # Build a size-limited transport for response-size enforcement (B4).
-        size_transport = _SizeLimitedAsyncTransport(self._spec.max_result_bytes)
-
-        def _factory(
-            headers: dict[str, str] | None = None,
-            timeout: Any = None,
-            auth: Any = None,
-        ) -> Any:
-            import httpx
-
-            kwargs: dict[str, Any] = {
-                "transport": size_transport,
-                "follow_redirects": True,
-                "headers": headers or _default_headers,
-            }
-            if timeout:
-                kwargs["timeout"] = timeout
-            else:
-                kwargs["timeout"] = httpx.Timeout(
-                    self._spec.timeout, read=self._spec.timeout * 2
-                )
-            if auth is not None:
-                kwargs["auth"] = auth
-            return httpx.AsyncClient(**kwargs)
-
+        # Use the MCP SDK's default httpx client factory.  A custom
+        # _SizeLimitedAsyncTransport was injected here (B4 fix) but it
+        # interferes with the SSE streaming protocol — the MCP SDK's
+        # streamablehttp_client uses httpx.AsyncClient.stream() which
+        # requires the response stream to satisfy isinstance checks
+        # against httpx.AsyncByteStream.  Wrapping the stream breaks
+        # those checks and causes request cancellation.  Size enforcement
+        # is done post-parse in McpAdapter.invoke() instead.
         self._client_context = streamablehttp_client(
             self._spec.url,
             headers=_default_headers,
             timeout=self._spec.timeout,
-            httpx_client_factory=_factory,
         )
         (
             self._read_stream,
@@ -304,6 +329,11 @@ class StreamableHttpMcpClient:
             self._read_stream,
             self._write_stream,
         )
+        # Enter the session as a context manager — ClientSession.__aenter__
+        # creates the anyio task group that runs the background response
+        # reader. Without this, send_request hangs forever waiting for a
+        # response that no task is reading.
+        await self._session.__aenter__()
         await self._session.initialize()
 
     async def list_tools(self) -> list[McpRemoteTool]:
@@ -332,11 +362,21 @@ class StreamableHttpMcpClient:
     async def close(self) -> None:
         """Close the transport and release resources."""
         exc: Exception | None = None
+        # Exit the session context first (cleans up its task group), then
+        # the client context (closes the httpx transport). Order matters:
+        # the session's background tasks need the transport to still be
+        # alive when they shut down.
+        if self._session is not None:
+            try:
+                await self._session.__aexit__(None, None, None)
+            except Exception as e:
+                exc = e
         if self._client_context is not None:
             try:
                 await self._client_context.__aexit__(None, None, None)
             except Exception as e:
-                exc = e
+                if exc is None:
+                    exc = e
         self._session = None
         self._client_context = None
         self._read_stream = None

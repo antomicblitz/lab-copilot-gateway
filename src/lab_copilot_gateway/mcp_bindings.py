@@ -8,11 +8,12 @@ re-validates this hash on every invocation (fail-closed on mismatch).
 Schema: ``{local_name: McpToolBinding(server_id, local_name, remote_name,
 input_schema_hash)}``
 
-Schema hashes below were computed *authoritatively* from the
-pubmed-mcp-server v2.9.8 Zod v4 source definitions (commit ef0be2c0)
-using the same canonicalization as the gateway (``json.dumps(sort_keys=True,
-separators=(",", ":"))`` → SHA-256).  See ``mcp_pubmed.py`` runbook for
-re-validation instructions.
+Schema hashes below were captured **live** from the running
+pubmed-mcp-server v2.9.8 sidecar (image digest
+``sha256:098a1ef3...``) by querying ``tools/list`` via the MCP SDK and
+computing ``json.dumps(schema, sort_keys=True, separators=(",", ":"))``
+→ SHA-256.  If the server is upgraded, re-capture by running the
+probe script in ``mcp_pubmed.py``'s runbook.
 """
 
 from __future__ import annotations
@@ -39,12 +40,12 @@ BINDINGS: dict[str, McpToolBinding] = {
         server_id="pubmed",
         local_name="literature.search_pubmed",
         remote_name="pubmed_search_articles",
-        input_schema_hash="fd48238e7d0d48a96aa415d2b1208212ea179a5f5dd3b16d495f6f53935b0106",
+        input_schema_hash="3744ff15fe0a3fb1b1649f876c90a152deeb1ddd8f89a425e032ec7d84c02ac0",
     ),
     "literature.fetch_pubmed_articles": McpToolBinding(
         server_id="pubmed",
         local_name="literature.fetch_pubmed_articles",
         remote_name="pubmed_fetch_articles",
-        input_schema_hash="978e7bf7abf8f8884aea0c9df497b00ad8568d31736365f28a3dd8161ddee2ef",
+        input_schema_hash="1aff3f75bd9e3069a114297c791ff7b72dd644b516a0339a24e02d5cce17777b",
     ),
 }
