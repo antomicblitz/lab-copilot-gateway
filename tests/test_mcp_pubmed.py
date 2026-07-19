@@ -81,6 +81,13 @@ def test_normalize_article_url_synthesized_from_pmid() -> None:
     assert result["url"] == "https://pubmed.ncbi.nlm.nih.gov/99999999/"
 
 
+def test_normalize_article_both_pmid_and_url_none() -> None:
+    """When both pmid and url are None, url stays None (no crash)."""
+    result = normalize_article({})
+    assert result["pmid"] is None
+    assert result["url"] is None
+
+
 def test_normalize_article_url_from_raw_preferred() -> None:
     """When pubmedUrl is present, use it directly."""
     result = normalize_article(

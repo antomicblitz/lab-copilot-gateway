@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid as _uuid
 import hashlib
@@ -92,6 +93,8 @@ from lab_copilot_gateway.policy import (
 from lab_copilot_gateway.tools import get_tool_registry, list_tools
 from lab_copilot_gateway.plan import Plan, PlanValidationError
 from lab_copilot_gateway.plan_executor import get_plan_executor
+
+logger = logging.getLogger(__name__)
 
 
 class AuditBody(BaseModel):
@@ -1553,7 +1556,14 @@ def _invoke_mcp_tool(
             )
             audit_store.append(record)
         except Exception:
-            pass
+            # B2: audit persistence failures MUST be visible to operators.
+            logger.warning(
+                "MCP audit append failed for action %s (%s → %s)",
+                action_id,
+                tool.name,
+                kw.get("policy_decision", "?"),
+                exc_info=True,
+            )
 
     def _deny(
         reason: str, message: str | None = None, **kw: object
@@ -1618,9 +1628,26 @@ def _invoke_mcp_tool(
         client_factory=client_factory,
         overall_timeout=60.0,
     )
-    result: McpInvokeResult = _run_async_to_sync(
-        adapter.invoke(local_name=tool.name, arguments=body.args)
-    )
+    # C1: catch-all around the full adapter flow — any uncaught exception
+    # (adapter bug, OOM, event-loop failure) is normalized to a Gateway
+    # error rather than propagating as an HTTP 500.
+    try:
+        result: McpInvokeResult = _run_async_to_sync(
+            adapter.invoke(local_name=tool.name, arguments=body.args)
+        )
+    except Exception as exc:
+        result = McpInvokeResult(
+            ok=False,
+            reason="mcp_internal_error",
+            server_id=binding.server_id,
+            remote_tool=binding.remote_name,
+        )
+        logger.warning(
+            "Uncaught exception in MCP adapter invoke for %s: %s",
+            tool.name,
+            exc,
+            exc_info=True,
+        )
 
     # --- Build response + B2: audit ---
     response: dict[str, object] = {"ok": result.ok, "tool_name": tool.name}
@@ -1630,6 +1657,8 @@ def _invoke_mcp_tool(
         "duration_ms": result.duration_ms,
         "result_size_bytes": result.result_size_bytes,
         "schema_hash": result.schema_hash,
+        "ok": result.ok,
+        "reason": result.reason,
     }
     if result.ok:
         response["result"] = _apply_mcp_normalizer(tool.name, result.structured_content)
@@ -1640,9 +1669,10 @@ def _invoke_mcp_tool(
             result_summary={"ok": True},
         )
     else:
+        # B1: never forward raw structuredContent from errors — the Gateway
+        # owns the error shape.  Map to a bounded message keyed by reason.
         response["reason"] = result.reason
-        if result.structured_content:
-            response["detail"] = result.structured_content
+        response["message"] = f"MCP adapter error: {result.reason}"
         _audit(
             policy_decision="allow",
             reason=result.reason,

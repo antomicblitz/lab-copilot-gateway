@@ -217,6 +217,10 @@ class _SizeLimitedAsyncTransport:
 
         return response
 
+    async def aclose(self) -> None:
+        """Delegate close to the inner transport to prevent connection leaks."""
+        await self._inner.aclose()
+
 
 # ---------------------------------------------------------------------------
 # StreamableHttpMcpClient  (real, uses mcp SDK)
@@ -567,7 +571,16 @@ class McpAdapter:
             )
 
         # 5. Validate input schema hash.
-        actual_hash = remote_tool.input_schema_hash()
+        try:
+            actual_hash = remote_tool.input_schema_hash()
+        except Exception:
+            await _safe_close(client)
+            return McpInvokeResult(
+                ok=False,
+                reason="mcp_schema_error",
+                server_id=binding.server_id,
+                remote_tool=binding.remote_name,
+            )
         if actual_hash != binding.input_schema_hash:
             await _safe_close(client)
             return McpInvokeResult(
@@ -601,12 +614,13 @@ class McpAdapter:
         # 7. Check for remote error.
         if result.is_error:
             await _safe_close(client)
+            # B1: never forward raw structuredContent on error — the Gateway
+            # owns the error shape and must not leak untrusted remote content.
             return McpInvokeResult(
                 ok=False,
                 reason="mcp_remote_error",
                 server_id=binding.server_id,
                 remote_tool=binding.remote_name,
-                structured_content=result.structured_content,
             )
 
         # 8. Validate structured content.
@@ -621,9 +635,18 @@ class McpAdapter:
 
         # 9. Post-parse size-cap enforcement (defence-in-depth; the primary
         #    enforcement is at the transport layer in StreamableHttpMcpClient).
-        serialized = _json.dumps(
-            result.structured_content, sort_keys=True, separators=(",", ":")
-        )
+        try:
+            serialized = _json.dumps(
+                result.structured_content, sort_keys=True, separators=(",", ":")
+            )
+        except (TypeError, ValueError):
+            await _safe_close(client)
+            return McpInvokeResult(
+                ok=False,
+                reason="mcp_malformed_result",
+                server_id=binding.server_id,
+                remote_tool=binding.remote_name,
+            )
         result_bytes = len(serialized.encode("utf-8"))
         if result_bytes > spec.max_result_bytes:
             await _safe_close(client)

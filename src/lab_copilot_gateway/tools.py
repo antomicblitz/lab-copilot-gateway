@@ -13,8 +13,8 @@ identity mapper need to evaluate and record a call:
                          dotted lowercase, e.g. ``elabftw.read_current_experiment``.
     tier               : action tier from the policy engine's ``Tier`` enum.
     adapter            : which downstream service the tool eventually calls
-                         (``elabftw`` | ``opencloning`` | ``wallac`` |
-                         ``bentolab`` | ``help``).
+                          (``elabftw`` | ``opencloning`` | ``wallac`` |
+                          ``bentolab`` | ``mcp`` | ``help``).
     requires_approval  : whether the tool requires a single-use approval token
                          before execution.  Mutating tools always set this True
                          in V1; read-only tools set it False.

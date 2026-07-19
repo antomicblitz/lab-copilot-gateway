@@ -538,7 +538,8 @@ async def test_adapter_invoke_remote_error(
     result = await adapter.invoke(local_name="mcp.test", arguments={})
     assert result.ok is False
     assert result.reason == "mcp_remote_error"
-    assert result.structured_content == {"error": "invalid query"}
+    # B1: raw structuredContent is NEVER forwarded on error paths.
+    assert result.structured_content is None
 
 
 # ---------------------------------------------------------------------------
@@ -1146,3 +1147,74 @@ async def test_pubmed_normalizer_produces_contract_shape(
     assert article["pmid"] == "12345678"
     assert article["title"] == "CRISPR Paper"
     assert article["url"] == "https://pubmed.ncbi.nlm.nih.gov/12345678/"
+
+
+# ============================================================================
+# B4 — Transport-level pre-parse enforcement  (CONCERN 2)
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_byte_counting_stream_raises_before_full_materialization() -> None:
+    """Feed chunks through _ByteCountingStream directly and assert the
+    size-cap exception fires BEFORE the full body is consumed."""
+    from lab_copilot_gateway.mcp_adapter import (
+        McpResultTooLargeError,
+        _ByteCountingStream,
+    )
+
+    class _StubStream:
+        """Stub that yields 3 chunks and tracks total yielded."""
+
+        def __init__(self) -> None:
+            self.yielded_bytes = 0
+
+        async def __aiter__(self):
+            for i in range(3):
+                chunk = b"x" * 50  # 50 bytes per chunk
+                self.yielded_bytes += len(chunk)
+                yield chunk
+
+    stub = _StubStream()
+    counting = _ByteCountingStream(stub, max_bytes=80)  # 80-byte cap
+
+    chunks_read = 0
+    with pytest.raises(McpResultTooLargeError):
+        async for _chunk in counting:
+            chunks_read += 1
+
+    # Only 1 full chunk reached the consumer (50 ≤ 80), then the 2nd
+    # (cumulative 100 > 80) triggers the cap before the chunk is yielded.
+    assert chunks_read == 1, (
+        f"expected 1 chunk read before cap, got {chunks_read} "
+        f"(stub yielded {stub.yielded_bytes} bytes total)"
+    )
+    # The stub produced all 3 chunks internally but only 1 was consumed.
+    assert stub.yielded_bytes >= 50, "stub should have produced at least one chunk"
+
+
+# ============================================================================
+# Production schema hash format guard  (CONCERN 4)
+# ============================================================================
+
+
+def test_production_schema_hashes_are_64_char_lowercase_hex() -> None:
+    """Assert that production schema hashes in mcp_bindings are valid SHA-256
+    hex strings — not empty, not placeholder, not stale."""
+    import re
+    from lab_copilot_gateway.mcp_bindings import BINDINGS
+
+    search_hash = BINDINGS["literature.search_pubmed"].input_schema_hash
+    fetch_hash = BINDINGS["literature.fetch_pubmed_articles"].input_schema_hash
+
+    for label, value in [
+        ("literature.search_pubmed", search_hash),
+        ("literature.fetch_pubmed_articles", fetch_hash),
+    ]:
+        assert len(value) == 64, f"{label}: hash must be 64 chars, got {len(value)}"
+        assert re.fullmatch(r"[0-9a-f]{64}", value), (
+            f"{label}: hash must be lowercase hex, got {value!r}"
+        )
+        assert (
+            value != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ), f"{label}: hash is the empty-string SHA-256 — likely a placeholder"
