@@ -78,6 +78,10 @@ from lab_copilot_gateway.mcp_adapter import (
     McpServerSpec,
 )
 from lab_copilot_gateway.mcp_bindings import BINDINGS as _MCP_BINDINGS
+from lab_copilot_gateway.mcp_pubmed import (
+    normalize_search_result as _mcp_pubmed_normalize_search,
+    normalize_fetch_result as _mcp_pubmed_normalize_fetch,
+)
 from lab_copilot_gateway.policy import (
     PolicyEngine,
     PolicyRequest,
@@ -1488,6 +1492,20 @@ def _mcp_check_approval(
     return None
 
 
+def _apply_mcp_normalizer(
+    tool_name: str, structured_content: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Apply a binding-specific normalizer to raw MCP structuredContent.
+
+    Returns the normalized dict if a normalizer exists, otherwise the raw
+    content (or empty dict).
+    """
+    normalizer = _MCP_NORMALIZERS.get(tool_name)
+    if normalizer is not None and structured_content is not None:
+        return normalizer(structured_content)
+    return structured_content or {}
+
+
 def _invoke_mcp_tool(
     tool: Any,
     body: InvokeBody,
@@ -1614,7 +1632,7 @@ def _invoke_mcp_tool(
         "schema_hash": result.schema_hash,
     }
     if result.ok:
-        response["result"] = result.structured_content or {}
+        response["result"] = _apply_mcp_normalizer(tool.name, result.structured_content)
         _audit(
             policy_decision="allow",
             reason=result.reason,
@@ -1667,6 +1685,14 @@ _INVOKE_DISPATCHERS: dict[str, Any] = {
     "wallac": _invoke_wallac_tool,
     "bentolab": _invoke_bentolab_tool,
     "mcp": _invoke_mcp_tool,
+}
+
+#: MCP normalizer dispatch — maps local tool name to a function that
+#: normalizes raw MCP ``structuredContent`` into the Gateway contract shape.
+#: Slice 4: PubMed normalizers.  Add entries for future MCP integrations here.
+_MCP_NORMALIZERS: dict[str, Any] = {
+    "literature.search_pubmed": _mcp_pubmed_normalize_search,
+    "literature.fetch_pubmed_articles": _mcp_pubmed_normalize_fetch,
 }
 
 

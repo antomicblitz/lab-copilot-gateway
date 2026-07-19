@@ -515,7 +515,7 @@ _CATALOG: tuple[Tool, ...] = (
         description="Validate protocol entries for missing fields, duplicates, and "
         "deprecated entries. Admin diagnostic tool.",
     ),
-    # --- MCP (Model Context Protocol) gateway tool — placeholder (Slice 4) ---
+    # --- MCP (Model Context Protocol) gateway tool — placeholder (Slice 3) ---
     Tool(
         name="mcp.test_search",
         tier=Tier.OPERATIONAL_READ_ONLY,
@@ -523,6 +523,33 @@ _CATALOG: tuple[Tool, ...] = (
         requires_approval=False,
         mutability="read",
         description="Test MCP gateway search tool (placeholder for Slice 4 bindings).",
+    ),
+    # --- PubMed literature tools (Slice 4) ----------------------------------
+    Tool(
+        name="literature.search_pubmed",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Search PubMed for scientific literature by query. "
+            "Returns matching articles with PMID, title, authors, journal, "
+            "year, DOI, abstract, and PubMed URL.  Use for questions about "
+            "host range, function, regulation, or any claim a GenBank file "
+            "cannot establish."
+        ),
+    ),
+    Tool(
+        name="literature.fetch_pubmed_articles",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description=(
+            "Fetch full article details for a list of PubMed IDs (PMIDs). "
+            "Use after search_pubmed to get fuller abstracts before making "
+            "substantive claims."
+        ),
     ),
 )
 

@@ -857,3 +857,292 @@ async def test_adapter_result_too_large_has_old_test_regression(
     assert result.ok is False
     assert result.reason == "mcp_result_too_large"
     assert result.result_size_bytes > 10
+
+
+# ============================================================================
+# Slice 4 — PubMed integration tests
+# ============================================================================
+#
+# These tests prove the end-to-end path: stub MCP client → adapter →
+# normalizer → contract-shaped response.  They also prove that the
+# two PubMed tools are reachable and the other 8 remote tools are not.
+
+
+@pytest.fixture
+def pubmed_search_remote_tool() -> McpRemoteTool:
+    """Remote tool matching pubmed_search_articles (v2.9.8).
+
+    Schema is the EXACT z4mini.toJSONSchema() output loaded via JSON
+    to preserve backslash encoding in regex patterns identically.
+    """
+    import json as _json
+
+    return McpRemoteTool(
+        name="pubmed_search_articles",
+        description="Search PubMed with full query syntax",
+        input_schema=_json.loads(
+            r"""{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"author":{"type":"string"},"dateRange":{"properties":{"dateType":{"default":"pdat","enum":["pdat","mdat","edat"],"type":"string"},"maxDate":{"pattern":"^$|\\^\\d{4}([/\\-.]\\d{1,2}([/\\-.]\\d{1,2})?)?$","type":"string"},"minDate":{"pattern":"^$|\\^\\d{4}([/\\-.]\\d{1,2}([/\\-.]\\d{1,2})?)?$","type":"string"}},"required":["minDate","maxDate"],"type":"object"},"freeFullText":{"type":"boolean"},"hasAbstract":{"type":"boolean"},"journal":{"type":"string"},"language":{"type":"string"},"maxResults":{"default":20,"maximum":1000,"minimum":1,"type":"integer"},"meshTerms":{"items":{"type":"string"},"type":"array"},"offset":{"default":0,"maximum":9007199254740991,"minimum":0,"type":"integer"},"publicationTypes":{"items":{"type":"string"},"type":"array"},"query":{"minLength":1,"type":"string"},"sort":{"default":"relevance","enum":["relevance","pub_date","author","journal"],"type":"string"},"species":{"enum":["humans","animals"],"type":"string"},"summaryCount":{"default":0,"maximum":50,"minimum":0,"type":"integer"}},"required":["query"]}"""
+        ),
+    )
+
+
+@pytest.fixture
+def pubmed_fetch_remote_tool() -> McpRemoteTool:
+    """Remote tool matching pubmed_fetch_articles (v2.9.8)."""
+    import json as _json
+
+    return McpRemoteTool(
+        name="pubmed_fetch_articles",
+        description="Fetch full article metadata by PubMed IDs",
+        input_schema=_json.loads(
+            r"""{"$schema":"http://json-schema.org/draft-07/schema#","type":"object","properties":{"includeGrants":{"default":false,"type":"boolean"},"includeMesh":{"default":true,"type":"boolean"},"pmids":{"items":{"type":"string"},"maxItems":200,"minItems":1,"type":"array"}},"required":["pmids"]}"""
+        ),
+    )
+
+
+@pytest.fixture
+def pubmed_search_binding(
+    pubmed_search_remote_tool: McpRemoteTool,
+) -> McpToolBinding:
+    """Binding for literature.search_pubmed → pubmed_search_articles."""
+    return McpToolBinding(
+        server_id="pubmed",
+        local_name="literature.search_pubmed",
+        remote_name="pubmed_search_articles",
+        input_schema_hash=pubmed_search_remote_tool.input_schema_hash(),
+    )
+
+
+@pytest.fixture
+def pubmed_fetch_binding(
+    pubmed_fetch_remote_tool: McpRemoteTool,
+) -> McpToolBinding:
+    """Binding for literature.fetch_pubmed_articles → pubmed_fetch_articles."""
+    return McpToolBinding(
+        server_id="pubmed",
+        local_name="literature.fetch_pubmed_articles",
+        remote_name="pubmed_fetch_articles",
+        input_schema_hash=pubmed_fetch_remote_tool.input_schema_hash(),
+    )
+
+
+@pytest.fixture
+def pubmed_server_spec() -> McpServerSpec:
+    return McpServerSpec(
+        id="pubmed",
+        url="http://pubmed-mcp:3010/mcp",
+        timeout=30.0,
+        max_result_bytes=1_048_576,
+    )
+
+
+@pytest.fixture
+def pubmed_search_stub_client(
+    pubmed_search_remote_tool: McpRemoteTool,
+    pubmed_fetch_remote_tool: McpRemoteTool,
+) -> StubMcpClient:
+    """Stub client with both PubMed tools and canned search results."""
+    return StubMcpClient(
+        tools=[pubmed_search_remote_tool, pubmed_fetch_remote_tool],
+        call_results={
+            "pubmed_search_articles": McpCallResult(
+                structured_content={
+                    "query": "CRISPR",
+                    "offset": 0,
+                    "pmids": ["12345678", "87654321"],
+                    "summaries": [
+                        {
+                            "pmid": "12345678",
+                            "title": "CRISPR Paper One",
+                            "authors": "Smith J",
+                            "source": "Nature",
+                            "pubDate": "2024 Jan",
+                            "doi": "10.1038/crispr1",
+                            "pubmedUrl": "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+                        },
+                        {
+                            "pmid": "87654321",
+                            "title": "CRISPR Paper Two",
+                            "authors": "Doe J",
+                            "source": "Science",
+                            "pubDate": "2023",
+                        },
+                    ],
+                    "searchUrl": "https://pubmed.ncbi.nlm.nih.gov/?term=CRISPR",
+                },
+                is_error=False,
+            ),
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_adapter_invoke_pubmed_search_returns_normalized_shape(
+    pubmed_server_spec: McpServerSpec,
+    pubmed_search_binding: McpToolBinding,
+    pubmed_search_stub_client: StubMcpClient,
+) -> None:
+    """E2E: the adapter invokes pubmed_search_articles and the caller gets
+    raw structuredContent — normalization happens at the app layer."""
+    adapter = McpAdapter(
+        server_specs={pubmed_server_spec.id: pubmed_server_spec},
+        bindings={pubmed_search_binding.local_name: pubmed_search_binding},
+        client_factory=lambda spec, **kw: pubmed_search_stub_client,  # type: ignore[arg-type]
+    )
+    result = await adapter.invoke(
+        local_name="literature.search_pubmed",
+        arguments={"query": "CRISPR", "maxResults": 10},
+    )
+    assert result.ok is True
+    assert result.server_id == "pubmed"
+    assert result.remote_tool == "pubmed_search_articles"
+    assert result.structured_content is not None
+    sc = result.structured_content
+    assert sc["pmids"] == ["12345678", "87654321"]
+    assert len(sc["summaries"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_adapter_invoke_pubmed_unbound_tool_rejected(
+    pubmed_server_spec: McpServerSpec,
+    pubmed_search_remote_tool: McpRemoteTool,
+) -> None:
+    """Unbound remote tools (e.g. pubmed_spell_check) are rejected with
+    mcp_unregistered_tool."""
+    # Only bind the two allowlisted tools — pubmed_spell_check is not bound.
+    bindings = {
+        "literature.search_pubmed": McpToolBinding(
+            server_id="pubmed",
+            local_name="literature.search_pubmed",
+            remote_name="pubmed_search_articles",
+            input_schema_hash=pubmed_search_remote_tool.input_schema_hash(),
+        ),
+    }
+    adapter = McpAdapter(
+        server_specs={pubmed_server_spec.id: pubmed_server_spec},
+        bindings=bindings,
+    )
+    # Ask for a tool that isn't in the bindings — no route.
+    result = await adapter.invoke(
+        local_name="literature.create_annotation",
+        arguments={},
+    )
+    assert result.ok is False
+    assert result.reason == "mcp_unregistered_tool"
+
+
+@pytest.mark.asyncio
+async def test_adapter_invoke_pubmed_all_10_tools_only_2_reachable(
+    pubmed_server_spec: McpServerSpec,
+    pubmed_search_binding: McpToolBinding,
+    pubmed_fetch_binding: McpToolBinding,
+    pubmed_search_remote_tool: McpRemoteTool,
+    pubmed_fetch_remote_tool: McpRemoteTool,
+) -> None:
+    """The PubMed server has 10 tools.  Only search_pubmed and fetch_pubmed_articles
+    are bound.  All other tool names (local or remote) are rejected.
+
+    The 10 remote tools: pubmed_search_articles, pubmed_fetch_articles,
+    pubmed_fetch_fulltext, pubmed_find_related, pubmed_format_citations,
+    pubmed_lookup_citation, pubmed_lookup_mesh, pubmed_europepmc_search,
+    pubmed_convert_ids, pubmed_spell_check.
+    """
+    unbound_remote_names = [
+        "pubmed_fetch_fulltext",
+        "pubmed_find_related",
+        "pubmed_format_citations",
+        "pubmed_lookup_citation",
+        "pubmed_lookup_mesh",
+        "pubmed_europepmc_search",
+        "pubmed_convert_ids",
+        "pubmed_spell_check",
+    ]
+
+    stub = StubMcpClient(
+        tools=[pubmed_search_remote_tool, pubmed_fetch_remote_tool],
+        call_results={
+            "pubmed_search_articles": McpCallResult(
+                structured_content={"pmids": [], "summaries": []},
+                is_error=False,
+            ),
+            "pubmed_fetch_articles": McpCallResult(
+                structured_content={"articles": [], "totalReturned": 0},
+                is_error=False,
+            ),
+        },
+    )
+
+    adapter = McpAdapter(
+        server_specs={pubmed_server_spec.id: pubmed_server_spec},
+        bindings={
+            pubmed_search_binding.local_name: pubmed_search_binding,
+            pubmed_fetch_binding.local_name: pubmed_fetch_binding,
+        },
+        client_factory=lambda spec, **kw: stub,  # type: ignore[arg-type]
+    )
+
+    # The two allowlisted tools work.
+    result = await adapter.invoke(
+        local_name="literature.search_pubmed", arguments={"query": "test"}
+    )
+    assert result.ok is True
+
+    result = await adapter.invoke(
+        local_name="literature.fetch_pubmed_articles", arguments={"pmids": ["1"]}
+    )
+    assert result.ok is True
+
+    # None of the unbound remote tool names are reachable through any local name.
+    for remote_name in unbound_remote_names:
+        result = await adapter.invoke(local_name=remote_name, arguments={})
+        assert result.ok is False, f"{remote_name} should be unregistered"
+        assert result.reason == "mcp_unregistered_tool"
+
+
+# ---------------------------------------------------------------------------
+# PubMed normalizer integration with McpAdapter
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pubmed_normalizer_produces_contract_shape(
+    pubmed_server_spec: McpServerSpec,
+    pubmed_search_binding: McpToolBinding,
+    pubmed_search_remote_tool: McpRemoteTool,
+) -> None:
+    """Prove that the normalizer converts raw MCP structuredContent to the
+    contracted article-record shape."""
+    from lab_copilot_gateway.mcp_pubmed import normalize_search_result
+
+    canned = {
+        "query": "CRISPR",
+        "offset": 0,
+        "pmids": ["12345678"],
+        "summaries": [
+            {
+                "pmid": "12345678",
+                "title": "CRISPR Paper",
+                "authors": "Smith J",
+                "source": "Nature",
+                "pubDate": "2024",
+                "doi": "10.1038/test",
+                "pubmedUrl": "https://pubmed.ncbi.nlm.nih.gov/12345678/",
+            },
+        ],
+        "searchUrl": "https://pubmed.ncbi.nlm.nih.gov/?term=CRISPR",
+    }
+
+    normalized = normalize_search_result(canned)
+    assert normalized["total"] == 1
+    article = normalized["articles"][0]
+    assert "pmid" in article
+    assert "title" in article
+    assert "authors" in article
+    assert "journal" in article
+    assert "year" in article
+    assert "doi" in article
+    assert "abstract" in article
+    assert "url" in article
+    assert article["pmid"] == "12345678"
+    assert article["title"] == "CRISPR Paper"
+    assert article["url"] == "https://pubmed.ncbi.nlm.nih.gov/12345678/"
