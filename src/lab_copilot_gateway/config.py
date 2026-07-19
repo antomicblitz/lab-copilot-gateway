@@ -74,6 +74,67 @@ def get_autonomy_max_steps() -> int:
         return 10
 
 
+# --- MCP (Model Context Protocol) outbound adapter settings -------------------
+#
+# MCP servers connect behind the gateway as downstream adapters.  These
+# settings govern how the gateway connects to them, enforces size/timeout
+# limits, and surfaces health diagnostics.
+
+
+def get_mcp_server_specs() -> list[dict[str, object]]:
+    """Return the configured MCP server specs from env.
+
+    Reads ``LAB_COPILOT_MCP_SERVERS`` — a JSON list of server objects, each
+    with ``id`` (str), ``url`` (str), ``timeout`` (float, seconds, optional),
+    and ``max_result_bytes`` (int, optional).  Missing is empty list.
+
+    Example env value::
+
+        [{"id": "pubmed", "url": "https://pubmed-mcp.example.org/mcp",
+          "timeout": 30, "max_result_bytes": 1048576}]
+    """
+    import json as _json
+
+    raw = os.getenv("LAB_COPILOT_MCP_SERVERS", "")
+    if not raw.strip():
+        return []
+    try:
+        specs = _json.loads(raw)
+    except _json.JSONDecodeError:
+        return []
+    if not isinstance(specs, list):
+        return []
+    result: list[dict[str, object]] = []
+    for spec in specs:
+        if not isinstance(spec, dict) or not isinstance(spec.get("id"), str):
+            continue
+        result.append(
+            {
+                "id": spec["id"],
+                "url": spec.get("url", ""),
+                "timeout": float(spec.get("timeout", 30.0)),
+                "max_result_bytes": int(spec.get("max_result_bytes", 1048576)),
+            }
+        )
+    return result
+
+
+def get_mcp_default_timeout() -> float:
+    """Default timeout in seconds for MCP server connections."""
+    try:
+        return float(os.getenv("LAB_COPILOT_MCP_TIMEOUT", "30"))
+    except ValueError:
+        return 30.0
+
+
+def get_mcp_default_max_result_bytes() -> int:
+    """Default maximum result size in bytes for MCP tool calls."""
+    try:
+        return int(os.getenv("LAB_COPILOT_MCP_MAX_RESULT_BYTES", "1048576"))
+    except ValueError:
+        return 1048576
+
+
 def get_public_config(*, service_name: str, version: str) -> dict[str, object]:
     """Return config safe to expose to authenticated clients."""
     return {

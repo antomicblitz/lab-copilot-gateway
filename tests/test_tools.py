@@ -501,3 +501,80 @@ def test_default_registry_is_the_v1_catalog() -> None:
     reg = get_tool_registry()
     assert len(reg.list()) == 31  # noqa: PLR2004 — V1 catalog size is a contract
     reset_tool_registry()
+
+
+# --- Slice 3: MCP adapter entry ----------------------------------------------
+
+
+def test_mcp_adapter_is_in_allowed_set() -> None:
+    """The ``mcp`` adapter is in the allowed set so MCP tools can be declared."""
+    from lab_copilot_gateway.tools import _ALLOWED_ADAPTERS
+
+    assert "mcp" in _ALLOWED_ADAPTERS
+
+
+def test_tool_with_mcp_adapter_validates() -> None:
+    """A Tool with adapter='mcp' is valid (passes constructor checks)."""
+    tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="MCP test tool",
+        mcp_server_id="pubmed",
+        mcp_remote_tool="search_pubmed",
+        mcp_schema_hash="abc123",
+    )
+    assert tool.adapter == "mcp"
+    assert tool.mcp_server_id == "pubmed"
+    assert tool.mcp_remote_tool == "search_pubmed"
+    assert tool.mcp_schema_hash == "abc123"
+
+
+def test_tool_mcp_fields_are_optional() -> None:
+    """MCP fields default to None and are not required for registration."""
+    tool = Tool(
+        name="mcp.minimal",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+    )
+    assert tool.mcp_server_id is None
+    assert tool.mcp_remote_tool is None
+    assert tool.mcp_schema_hash is None
+
+
+def test_tool_to_dict_omits_mcp_fields() -> None:
+    """MCP fields are internal dispatch detail — never leaked to LibreChat."""
+    tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="MCP test",
+        mcp_server_id="pubmed",
+        mcp_remote_tool="search_pubmed",
+        mcp_schema_hash="abc123",
+    )
+    d = tool.to_dict()
+    assert "mcp_server_id" not in d
+    assert "mcp_remote_tool" not in d
+    assert "mcp_schema_hash" not in d
+    # Standard fields are still present.
+    assert d["name"] == "mcp.test_search"
+    assert d["adapter"] == "mcp"
+
+
+def test_mcp_tool_requires_approval_enforcement() -> None:
+    """Mutating MCP tool without approval → ValueError (same as all adapters)."""
+    with pytest.raises(ValueError, match="requires approval"):
+        Tool(
+            name="mcp.mutate",
+            tier=Tier.BOUNDED_WRITES,
+            adapter="mcp",
+            requires_approval=False,
+            mutability="append",
+        )

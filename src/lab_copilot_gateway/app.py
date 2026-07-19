@@ -72,6 +72,12 @@ from lab_copilot_gateway.identity import (
     MappedIdentity,
     get_identity_mapper,
 )
+from lab_copilot_gateway.mcp_adapter import (
+    McpAdapter,
+    McpInvokeResult,
+    McpServerSpec,
+)
+from lab_copilot_gateway.mcp_bindings import BINDINGS as _MCP_BINDINGS
 from lab_copilot_gateway.policy import (
     PolicyEngine,
     PolicyRequest,
@@ -1419,12 +1425,116 @@ def _invoke_bentolab_tool(
         return {"ok": False, "tool_name": tool.name, **exc.to_dict()}
 
 
+def _build_mcp_server_specs() -> dict[str, McpServerSpec]:
+    """Build MCP server specs from environment config."""
+    from lab_copilot_gateway.config import get_mcp_server_specs
+
+    specs: dict[str, McpServerSpec] = {}
+    for raw in get_mcp_server_specs():
+        sid = str(raw["id"])
+        specs[sid] = McpServerSpec(
+            id=sid,
+            url=str(raw["url"]),
+            timeout=float(raw["timeout"]),  # type: ignore[arg-type] — config.py already casts to float
+            max_result_bytes=int(raw["max_result_bytes"]),  # type: ignore[arg-type] — config.py already casts to int
+        )
+    return specs
+
+
+def _invoke_mcp_tool(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,  # noqa: ARG001 — required by dispatcher signature
+    bindings: dict | None = None,
+    client_factory: Any = None,
+) -> dict[str, object]:
+    """Dispatch an MCP adapter tool invocation.
+
+    Resolves the binding by ``tool.name``, validates the remote still
+    advertises the tool with a matching input-schema hash, invokes the
+    tool, enforces size caps, and returns a normalized Gateway-shaped
+    result.  Fails closed on absence, mismatch, timeout, oversize, or
+    malformed shape.
+
+    ``structuredContent`` is surfaced; arbitrary text, resources, images,
+    and prompts are dropped.
+    """
+    if bindings is None:
+        bindings = _MCP_BINDINGS
+
+    binding = bindings.get(tool.name)
+    if binding is None:
+        return {
+            "ok": False,
+            "tool_name": tool.name,
+            "reason": "mcp_unregistered_tool",
+            "message": (
+                f"tool {tool.name!r} is registered as mcp adapter but "
+                "has no MCP binding — add it to mcp_bindings.py"
+            ),
+        }
+
+    server_specs = _build_mcp_server_specs()
+    adapter = McpAdapter(
+        server_specs=server_specs,
+        bindings=bindings,
+        client_factory=client_factory,
+    )
+    result: McpInvokeResult = _run_async_to_sync(
+        adapter.invoke(local_name=tool.name, arguments=body.args)
+    )
+
+    response: dict[str, object] = {
+        "ok": result.ok,
+        "tool_name": tool.name,
+    }
+    if result.ok:
+        response["result"] = result.structured_content or {}
+    else:
+        response["reason"] = result.reason
+        if result.structured_content:
+            response["detail"] = result.structured_content
+
+    # Record MCP-specific audit metadata.
+    response["_mcp_audit"] = {
+        "server_id": result.server_id,
+        "remote_tool": result.remote_tool,
+        "duration_ms": result.duration_ms,
+        "result_size_bytes": result.result_size_bytes,
+    }
+    return response
+
+
+def _run_async_to_sync(coro: Any) -> Any:
+    """Bridge an async coroutine to synchronous code.
+
+    Uses ``asyncio.run()`` in a fresh event loop per invocation.  This is
+    the approved pattern for adapting async MCP SDK calls into FastAPI's
+    synchronous dispatch boundary.  Each invocation gets its own event
+    loop — no ``ClientSession`` is cached across calls.
+    """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop — create a fresh one.
+        return asyncio.run(coro)
+    # We're inside a running event loop; create a new loop in a thread.
+    import concurrent.futures
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(asyncio.run, coro)
+        return future.result()
+
+
 # Maps adapter name to its dispatch function for POST /invoke.
 _INVOKE_DISPATCHERS: dict[str, Any] = {
     "elabftw": _invoke_elabftw_tool,
     "opencloning": _invoke_opencloning_tool,
     "wallac": _invoke_wallac_tool,
     "bentolab": _invoke_bentolab_tool,
+    "mcp": _invoke_mcp_tool,
 }
 
 
@@ -2144,6 +2254,21 @@ def _build_health_deps(
             else "not_configured"
         ),
     }
+    # MCP server health — Slice 3 reports configured servers as
+    # reachable=false until Slice 4 wires a real server.
+    from lab_copilot_gateway.config import get_mcp_server_specs
+
+    mcp_specs = get_mcp_server_specs()
+    mcp_status: dict[str, object] = {}
+    for spec in mcp_specs:
+        sid = str(spec["id"])
+        mcp_status[sid] = {
+            "configured": True,
+            "url": spec.get("url", ""),
+            "reachable": False,  # Slice 4: probe via initialize
+            "schema_valid": False,  # Slice 4: validate after probe
+        }
+    deps["mcp_servers"] = mcp_status
     deps.update(_identity_backend_status(identity_mapper))
     deps.update(_approval_backend_status(approval_store))
     deps["tool_count"] = len(get_tool_registry().list())

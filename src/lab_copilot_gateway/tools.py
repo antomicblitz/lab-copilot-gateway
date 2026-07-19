@@ -43,7 +43,7 @@ from lab_copilot_gateway.policy import Tier
 # Adapters that a declared tool may target.  Keeping the set explicit makes a
 # typo in a tool entry fail closed.
 _ALLOWED_ADAPTERS: frozenset[str] = frozenset(
-    {"elabftw", "opencloning", "wallac", "bentolab", "help"}
+    {"elabftw", "opencloning", "wallac", "bentolab", "help", "mcp"}
 )
 
 # Mutability classes.  ``mutate`` rewrites existing content and is reserved for
@@ -79,6 +79,12 @@ class Tool:
         * ``mutability`` is ``read`` | ``append`` | ``mutate``.
         * Mutating tools always ``requires_approval`` in V1.
         * No forbidden raw-endpoint attribute is set on the instance.
+
+    MCP-specific fields (Slice 3):
+        ``mcp_server_id``, ``mcp_remote_tool``, and ``mcp_schema_hash``
+        are optional and only meaningful for tools whose ``adapter == "mcp"``.
+        They are internal to the gateway dispatch and NOT exposed in
+        ``to_dict()`` so LibreChat never sees downstream MCP details.
     """
 
     name: str
@@ -87,6 +93,9 @@ class Tool:
     requires_approval: bool
     mutability: str
     description: str = ""
+    mcp_server_id: str | None = None
+    mcp_remote_tool: str | None = None
+    mcp_schema_hash: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name or self.name != self.name.strip():

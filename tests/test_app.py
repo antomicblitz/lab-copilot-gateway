@@ -2407,3 +2407,214 @@ def test_opencloning_invoke_rejects_invalid_file_content_b64() -> None:
     assert response.status_code == 200
     assert response.json()["reason"] == "invalid_file_content"
     assert stub.calls == []
+
+
+# ============================================================================
+# Slice 3 — MCP adapter /invoke dispatch tests
+# ============================================================================
+
+
+def test_invoke_mcp_dispatches_with_stub_client(
+    monkeypatch,
+) -> None:
+    """POST /invoke to an MCP tool dispatches through the MCP adapter.
+
+    Uses a stub client returning canned structuredContent.  The response
+    includes ok:true, the canned result, and _mcp_audit metadata.
+    """
+    from lab_copilot_gateway.policy import Tier
+
+    import lab_copilot_gateway.mcp_bindings as mcpbindmod
+    from lab_copilot_gateway.mcp_adapter import (
+        McpCallResult,
+        McpRemoteTool,
+        McpToolBinding,
+        StubMcpClient,
+    )
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    # Set up an MCP tool in the registry.
+    mcp_tool = Tool(
+        name="mcp.test_search",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="Test MCP search tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    # Set up a binding.
+    remote = McpRemoteTool(
+        name="remote_search",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    original_bindings = dict(mcpbindmod.BINDINGS)
+    mcpbindmod.BINDINGS = {
+        "mcp.test_search": McpToolBinding(
+            server_id="test-mcp",
+            local_name="mcp.test_search",
+            remote_name="remote_search",
+            input_schema_hash=remote.input_schema_hash(),
+        ),
+    }
+
+    # Create a stub client with pre-seeded results.
+    stub = StubMcpClient(
+        tools=[remote],
+        call_results={
+            "remote_search": McpCallResult(
+                structured_content={"results": [{"id": 1, "title": "Found"}]},
+                is_error=False,
+            ),
+        },
+    )
+
+    # Patch _invoke_mcp_tool to use our stub client.
+    import lab_copilot_gateway.app as appmod
+
+    original_invoke_mcp = appmod._invoke_mcp_tool
+    original_build_specs = appmod._build_mcp_server_specs
+
+    # Provide server specs so the adapter finds its server.
+    appmod._build_mcp_server_specs = lambda: {
+        "test-mcp": appmod.McpServerSpec(
+            id="test-mcp",
+            url="http://stub",
+            timeout=5.0,
+            max_result_bytes=10_000_000,
+        )
+    }
+
+    def _patched_invoke(
+        tool, body, mapped_identity, bindings=None, client_factory=None
+    ):
+        if bindings is None:
+            bindings = mcpbindmod.BINDINGS
+        return original_invoke_mcp(
+            tool,
+            body,
+            mapped_identity,
+            bindings=bindings,
+            client_factory=lambda spec, **kw: stub,
+        )
+
+    monkeypatch.setattr(appmod, "_invoke_mcp_tool", _patched_invoke)
+    # Also patch the dispatch dict — it holds the function reference from
+    # module load time, so the dispatcher would otherwise use the original.
+    original_dispatcher = appmod._INVOKE_DISPATCHERS.get("mcp")
+    appmod._INVOKE_DISPATCHERS["mcp"] = _patched_invoke
+
+    try:
+        client = make_client()
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.test_search",
+                "context_token": "mcp-does-not-need-token",
+                "args": {"query": "test"},
+                "keycloak_subject": "kc-http-1",
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is True
+        assert out["tool_name"] == "mcp.test_search"
+        assert out["result"] == {"results": [{"id": 1, "title": "Found"}]}
+        assert "_mcp_audit" in out
+        assert out["_mcp_audit"]["server_id"] == "test-mcp"
+        assert out["_mcp_audit"]["remote_tool"] == "remote_search"
+        assert out["_mcp_audit"]["duration_ms"] >= 0
+        assert out["_mcp_audit"]["result_size_bytes"] > 0
+    finally:
+        mcpbindmod.BINDINGS = original_bindings
+        reset_tool_registry(None)
+        appmod._build_mcp_server_specs = original_build_specs
+        if original_dispatcher is not None:
+            appmod._INVOKE_DISPATCHERS["mcp"] = original_dispatcher
+        monkeypatch.undo()
+
+
+def test_invoke_mcp_no_binding_returns_unregistered() -> None:
+    """An MCP tool without a binding returns mcp_unregistered_tool."""
+    from lab_copilot_gateway.policy import Tier
+    from lab_copilot_gateway.tools import Tool, ToolRegistry, reset_tool_registry
+
+    mcp_tool = Tool(
+        name="mcp.no_binding",
+        tier=Tier.OPERATIONAL_READ_ONLY,
+        adapter="mcp",
+        requires_approval=False,
+        mutability="read",
+        description="No binding tool",
+    )
+    registry = ToolRegistry.from_iterable([mcp_tool])
+    reset_tool_registry(registry)
+
+    try:
+        client = make_client()
+        r = client.post(
+            "/invoke",
+            json={
+                "tool_name": "mcp.no_binding",
+                "context_token": "x",
+                "args": {},
+            },
+        )
+        assert r.status_code == 200
+        out = r.json()
+        assert out["ok"] is False
+        assert out["reason"] == "mcp_unregistered_tool"
+    finally:
+        reset_tool_registry(None)
+
+
+def test_invoke_mcp_health_includes_mcp_servers() -> None:
+    """/health includes ``mcp_servers`` key (empty when no servers configured)."""
+    client = make_client()
+    r = client.get("/health")
+    assert r.status_code == 200
+    deps = r.json()["dependencies"]
+    assert "mcp_servers" in deps
+    # No servers configured by default → empty dict.
+    assert deps["mcp_servers"] == {}
+
+
+def test_invoke_mcp_health_with_configured_server(monkeypatch) -> None:
+    """/health reports configured MCP servers with reachable=false."""
+    monkeypatch.setenv(
+        "LAB_COPILOT_MCP_SERVERS",
+        '[{"id": "pubmed", "url": "https://pubmed-mcp.example.org/mcp"}]',
+    )
+    # Force re-creation of the app to pick up the new env var.
+    import lab_copilot_gateway.app as appmod
+
+    client = _DevAuthClient(appmod.create_app())
+    r = client.get("/health")
+    assert r.status_code == 200
+    deps = r.json()["dependencies"]
+    assert "pubmed" in deps["mcp_servers"]
+    pubmed = deps["mcp_servers"]["pubmed"]
+    assert pubmed["configured"] is True
+    assert pubmed["url"] == "https://pubmed-mcp.example.org/mcp"
+    assert pubmed["reachable"] is False
+    assert pubmed["schema_valid"] is False
+
+
+def test_invoke_mcp_policy_applies_to_mcp_tool() -> None:
+    """/policy/evaluate works for an MCP adapter tool (policy is
+    adapter-agnostic)."""
+    client = make_client()
+    body = {
+        "tool_name": "mcp.test_search",
+        "tier": 3,
+        "adapter": "mcp",
+        "user_id": "elab-user-1",
+    }
+    r = client.post("/policy/evaluate", json=body)
+    assert r.status_code == 200
+    out = r.json()
+    # Tier 3 (VALIDATION_DRY_RUN) for a mapped user → allow.
+    assert out["decision"] == "allow"
+    assert out["tier"] == 3
