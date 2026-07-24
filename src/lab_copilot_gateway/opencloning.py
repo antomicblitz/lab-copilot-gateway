@@ -984,7 +984,13 @@ class OpenCloningAdapter:
         """
         # Decode file content to bytes for size check and downstream call.
         if file_content_b64 is not None:
+            if not isinstance(file_content_b64, str):
+                encoded_length = 0
+            else:
+                encoded_length = len(file_content_b64)
             try:
+                if not isinstance(file_content_b64, str):
+                    raise TypeError("file_content_b64 must be a string")
                 raw_bytes = base64.b64decode(file_content_b64, validate=True)
             except (binascii.Error, ValueError, TypeError) as exc:
                 self._audit(
@@ -1002,12 +1008,12 @@ class OpenCloningAdapter:
                     tool_args_hash=compute_args_hash(
                         {
                             "file_format": file_format,
-                            "encoded_length": len(file_content_b64),
+                            "encoded_length": encoded_length,
                         }
                     ),
                     error={
                         "code": "INVALID_FILE_CONTENT",
-                        "encoded_length": len(file_content_b64),
+                        "encoded_length": encoded_length,
                     },
                 )
                 raise InvalidFileContent() from exc

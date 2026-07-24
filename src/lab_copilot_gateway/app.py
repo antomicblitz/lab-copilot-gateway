@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import os
 import uuid as _uuid
@@ -293,7 +295,11 @@ class ElabftwAmendBody(BaseModel):
     model_id: str | None = None
     amendment_html: str = ""
     attachment_filename: str | None = None
-    attachment_b64: str | None = None  # base64-encoded bytes
+    # Pydantic-level validation enforces string typing; the field
+    # explicitly accepts any value so non-string bodies are still routed
+    # to the adapter, which performs strict base64 validation and audits
+    # the deny (tests/test_app.py::test_parse_sequence_file_rejects_non_string_b64_with_audit).
+    attachment_b64: object = None  # type: ignore[assignment]
     attachment_comment: str = ""
 
 
@@ -876,7 +882,7 @@ def _invoke_elabftw_download_upload(
 
 def _audit_invalid_base64(
     tool: Any,
-    body: InvokeBody,
+    body: Any,
     mapped_identity: MappedIdentity | None,
     encoded_length: int,
 ) -> None:
@@ -885,18 +891,30 @@ def _audit_invalid_base64(
     tool_name = tool.name if hasattr(tool, "name") else str(tool)
     record = AuditRecord(
         action_id=action_id,
-        conversation_id=body.conversation_id,
-        request_id=body.request_id,
-        keycloak_subject=body.keycloak_subject,
-        librechat_user_id=body.librechat_user_id,
+        conversation_id=getattr(body, "conversation_id", None)
+        if hasattr(body, "conversation_id")
+        else body.get("conversation_id"),
+        request_id=getattr(body, "request_id", None)
+        if hasattr(body, "request_id")
+        else body.get("request_id"),
+        keycloak_subject=getattr(body, "keycloak_subject", None)
+        if hasattr(body, "keycloak_subject")
+        else body.get("keycloak_subject"),
+        librechat_user_id=getattr(body, "librechat_user_id", None)
+        if hasattr(body, "librechat_user_id")
+        else body.get("librechat_user_id"),
         mapped_elabftw_user_id=mapped_identity.elabftw_user_id
         if mapped_identity
         else None,
         mapped_elabftw_team_id=mapped_identity.elabftw_team_id
         if mapped_identity
         else None,
-        provider=body.provider,
-        model_id=body.model_id,
+        provider=getattr(body, "provider", None)
+        if hasattr(body, "provider")
+        else body.get("provider"),
+        model_id=getattr(body, "model_id", None)
+        if hasattr(body, "model_id")
+        else body.get("model_id"),
         tool_name=tool_name,
         tool_args_hash=compute_args_hash({"encoded_length": encoded_length}),
         policy_decision="deny",
@@ -911,28 +929,60 @@ def _audit_invalid_base64(
         )
 
 
+def _decode_attachment_b64(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+    field_name: str,
+) -> tuple[bytes | None, dict[str, object] | None]:
+    """Strictly decode an ``attachment_b64`` value or return a deny response.
+
+    The result is a tuple ``(data, error_response)``. Exactly one of the
+    two entries is non-None. Decoding is strict (drops invalid characters
+    silently, so only ``validate=True`` is safe here), refuses non-string
+    input, and computes the encoded length defensively before raising.
+    Every failure is audited.
+    """
+    raw = body.args.get(field_name)
+    if raw is None or raw == "":
+        return None, None
+    if not isinstance(raw, str):
+        _audit_invalid_base64(tool, body, mapped_identity, 0)
+        return None, {
+            "ok": False,
+            "tool_name": tool.name if hasattr(tool, "name") else str(tool),
+            "reason": "client_error",
+            "message": f"{field_name} must be a base64 string",
+        }
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError, TypeError) as exc:
+        _audit_invalid_base64(tool, body, mapped_identity, len(raw))
+        return None, {
+            "ok": False,
+            "tool_name": tool.name if hasattr(tool, "name") else str(tool),
+            "reason": "client_error",
+            "message": f"{field_name} is not valid base64: {exc}",
+        }
+    return decoded, None
+
+
 def _invoke_elabftw_amend(
     tool: Any,
     body: InvokeBody,
     mapped_identity: MappedIdentity | None,
 ) -> dict[str, object]:
     """Handle elabftw.amend_my_experiment_after_approval tool invocation."""
-    import base64
-
     attachment_data: bytes | None = None
     attachment_filename = body.args.get("attachment_filename")
-    attachment_b64 = body.args.get("attachment_b64")
-    if attachment_b64 and attachment_filename:
-        try:
-            attachment_data = base64.b64decode(attachment_b64)
-        except Exception as exc:
-            _audit_invalid_base64(tool, body, mapped_identity, len(str(attachment_b64)))
-            return {
-                "ok": False,
-                "tool_name": tool.name,
-                "reason": "client_error",
-                "message": f"attachment_b64 is not valid base64: {exc}",
-            }
+    if attachment_filename:
+        decoded, error = _decode_attachment_b64(
+            tool, body, mapped_identity, "attachment_b64"
+        )
+        if error is not None:
+            return error
+        attachment_data = decoded
+
     adapter = get_elabftw_write_adapter()
     result = adapter.amend_my_experiment_after_approval(
         context_token=body.context_token,
@@ -2333,14 +2383,27 @@ def _register_elabftw_amend_route(
         )
         attachment_data: bytes | None = None
         if body.attachment_b64 is not None and body.attachment_filename:
-            try:
-                attachment_data = base64.b64decode(body.attachment_b64)
-            except Exception as exc:
+            raw = body.attachment_b64
+            if not isinstance(raw, str):
                 _audit_invalid_base64(
                     "elabftw.amend_my_experiment_after_approval",
-                    body,
+                    body.model_dump(),
                     mapped_identity,
-                    len(str(body.attachment_b64)),
+                    0,
+                )
+                return {
+                    "ok": False,
+                    "reason": "client_error",
+                    "message": "attachment_b64 must be a string",
+                }
+            try:
+                attachment_data = base64.b64decode(raw, validate=True)
+            except (binascii.Error, ValueError, TypeError) as exc:
+                _audit_invalid_base64(
+                    "elabftw.amend_my_experiment_after_approval",
+                    body.model_dump(),
+                    mapped_identity,
+                    len(raw),
                 )
                 return {
                     "ok": False,
@@ -2575,15 +2638,19 @@ def _register_bentolab_route(api: FastAPI, identity_mapper: IdentityMapper) -> N
             librechat_user_id=body.librechat_user_id,
         )
         if body.args.get("attachment_b64") and body.args.get("attachment_filename"):
+            raw = body.args["attachment_b64"]
+            if not isinstance(raw, str):
+                _audit_invalid_base64(tool, body, mapped_identity, 0)
+                return {
+                    "ok": False,
+                    "tool_name": tool.name,
+                    "reason": "client_error",
+                    "message": "attachment_b64 must be a string",
+                }
             try:
-                base64.b64decode(body.args["attachment_b64"])
-            except Exception as exc:
-                _audit_invalid_base64(
-                    tool,
-                    body,
-                    mapped_identity,
-                    len(str(body.args["attachment_b64"])),
-                )
+                base64.b64decode(raw, validate=True)
+            except (binascii.Error, ValueError, TypeError) as exc:
+                _audit_invalid_base64(tool, body, mapped_identity, len(raw))
                 return {
                     "ok": False,
                     "tool_name": tool.name,
