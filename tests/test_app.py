@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -973,8 +974,9 @@ def test_elabftw_amend_invalid_base64_chars_audits_and_does_not_call_adapter() -
     Without ``validate=True`` the standard library drops invalid
     characters; an input of only invalid characters would otherwise
     decode to empty bytes and proceed. The gateway must instead
-    audit the deny and refuse.
+    audit the deny and refuse, without invoking the eLabFTW adapter.
     """
+    import lab_copilot_gateway.app as appmod
     import lab_copilot_gateway.identity as identitymod
 
     mapper = identitymod._default_mapper
@@ -986,43 +988,75 @@ def test_elabftw_amend_invalid_base64_chars_audits_and_does_not_call_adapter() -
         elabftw_team_ids=["team-amend-invalid"],
     )
 
-    client = make_client()
-    approval_resp = client.post(
-        "/approval/request",
-        json={
-            "tool_name": "elabftw.amend_my_experiment_after_approval",
-            "tier": 6,
-            "args": {
+    # Spy on the write adapter so the test proves the gateway refused
+    # to call it. Use a no-op patch that records invocations.
+    adapter_calls: list[str] = []
+    original_adapter = appmod.get_elabftw_write_adapter
+
+    class _SpyAdapter:
+        def __getattr__(self, name: str) -> Any:
+            def _record(*_args: Any, **_kwargs: Any) -> Any:
+                adapter_calls.append(name)
+                return _stub_result()
+
+            return _record
+
+    def _stub_result() -> Any:
+        return type("R", (), {"to_dict": lambda self: {}})()
+
+    appmod.get_elabftw_write_adapter = lambda: _SpyAdapter()
+    captured_audits: list[Any] = []
+    original_audit = appmod.get_audit_store().append
+    appmod.get_audit_store().append = lambda record: captured_audits.append(record)  # type: ignore[method-assign]
+    try:
+        client = make_client()
+        approval_resp = client.post(
+            "/approval/request",
+            json={
+                "tool_name": "elabftw.amend_my_experiment_after_approval",
+                "tier": 6,
+                "args": {
+                    "amendment_html": "<p>no-op</p>",
+                    "attachment_filename": "pUC19.dna",
+                    "attachment_b64": "@@@",
+                },
+            },
+        )
+        assert approval_resp.status_code == 200, approval_resp.text
+        approval_id = approval_resp.json()["approval_id"]
+        r = client.post(
+            "/elabftw/amend_my_experiment_after_approval",
+            json={
+                "context_token": "valid-context-token",
+                "approval_id": approval_id,
                 "amendment_html": "<p>no-op</p>",
                 "attachment_filename": "pUC19.dna",
                 "attachment_b64": "@@@",
+                "librechat_user_id": "lc-amend-invalid",
             },
-        },
-    )
-    assert approval_resp.status_code == 200, approval_resp.text
-    approval_id = approval_resp.json()["approval_id"]
-    r = client.post(
-        "/elabftw/amend_my_experiment_after_approval",
-        json={
-            "context_token": "valid-context-token",
-            "approval_id": approval_id,
-            "amendment_html": "<p>no-op</p>",
-            "attachment_filename": "pUC19.dna",
-            "attachment_b64": "@@@",
-            "librechat_user_id": "lc-amend-invalid",
-        },
-    )
-    body = r.json()
-    assert body["ok"] is False, body
-    assert body["reason"] == "client_error", body
-    assert "@@@" not in body["message"]
+        )
+        body = r.json()
+        assert body["ok"] is False, body
+        assert body["reason"] == "client_error", body
+        assert "@@@" not in body["message"]
 
-    # Audit confirmation: confirm the deny code is the structured
-    # invalid_file_content reason. We verify via the response body and
-    # absence of a write-tool success code; deeper audit-store introspection
-    # is covered by the opencloning test.
-    assert body.get("ok") is False
-    assert body.get("reason") == "client_error"
+        # Security contract: no adapter call, but a deny audit was written.
+        assert adapter_calls == [], (
+            "amendment adapter must not be invoked for invalid base64; "
+            f"got calls={adapter_calls!r}"
+        )
+        invalid_audits = [
+            record
+            for record in captured_audits
+            if record.error and record.error.get("code") == "INVALID_FILE_CONTENT"
+        ]
+        assert invalid_audits, (
+            "expected at least one INVALID_FILE_CONTENT deny audit row"
+        )
+        assert "@@@" not in str(invalid_audits), "deny audit must not echo the payload"
+    finally:
+        appmod.get_elabftw_write_adapter = original_adapter
+        appmod.get_audit_store().append = original_audit  # type: ignore[method-assign]
 
 
 def test_parse_sequence_file_rejects_non_string_b64_with_audit() -> None:
@@ -1042,42 +1076,41 @@ def test_parse_sequence_file_rejects_non_string_b64_with_audit() -> None:
     from lab_copilot_gateway.policy import Tier
 
     audit_store = AuditStore(":memory:")
+    opencloning_calls: list[str] = []
+
+    class _SpyClient(HttpOpenCloningClient):
+        def __init__(self) -> None:
+            super().__init__(base_url="http://opencloning:8000")
+
+        def parse_sequence_file(
+            self, file_content: bytes, file_format: str
+        ) -> dict[str, Any]:
+            opencloning_calls.append("parse_sequence_file")
+            return {"sequences": []}
+
+    spy = _SpyClient()
     adapter = OpenCloningAdapter(
         policy_engine=PolicyEngine(
             max_tier=Tier.CLOSED_LOOP_AUTONOMY, kill_switches=(), kill_categories=()
         ),
         audit_store=audit_store,
-        client=HttpOpenCloningClient(base_url="http://opencloning:8000"),
+        client=spy,
     )
 
-    with pytest.raises(InvalidFileContent):
-        adapter.parse_sequence_file(
-            context_token="tok",
-            file_content="ATCG",
-            file_content_b64=42,
-            file_format="fasta",
-            mapped_identity=MappedIdentity(
-                keycloak_subject="kc-b64-non-string",
-                librechat_user_id="lc-b64-non-string",
-                elabftw_user_id=1,
-                elabftw_team_ids=[1],
-            ),
-        )
-
-    # The adapter must have recorded an audit deny. We can't enumerate
-    # rows through a public read API, so we monkeypatch the store to
-    # capture the appended record and assert on it.
+    # Spy on the audit store to capture append() calls and assert that
+    # an INVALID_FILE_CONTENT deny was recorded without any downstream
+    # OpenCloning call.
     captured: list[object] = []
     original_append = audit_store.append
-    audit_store.append = lambda record: (
+    audit_store.append = lambda record: (  # type: ignore[method-assign]
         captured.append(record) or original_append(record)
-    )  # type: ignore[method-assign]
+    )
     try:
         with pytest.raises(InvalidFileContent):
             adapter.parse_sequence_file(
                 context_token="tok",
                 file_content="ATCG",
-                file_content_b64=99,
+                file_content_b64=42,
                 file_format="fasta",
                 mapped_identity=MappedIdentity(
                     keycloak_subject="kc-b64-non-string",
@@ -1086,14 +1119,18 @@ def test_parse_sequence_file_rejects_non_string_b64_with_audit() -> None:
                     elabftw_team_ids=[1],
                 ),
             )
+        assert opencloning_calls == [], (
+            "OpenCloning must not be invoked for invalid base64; "
+            f"got calls={opencloning_calls!r}"
+        )
+        invalid = [
+            record
+            for record in captured
+            if record.error and record.error.get("code") == "INVALID_FILE_CONTENT"
+        ]
+        assert invalid, "expected INVALID_FILE_CONTENT audit row for non-string b64"
     finally:
         audit_store.append = original_append  # type: ignore[method-assign]
-    invalid = [
-        record
-        for record in captured
-        if record.error and record.error.get("code") == "INVALID_FILE_CONTENT"
-    ]
-    assert invalid, "expected INVALID_FILE_CONTENT audit row for non-string b64"
 
 
 def test_elabftw_draft_experiment_update_succeeds() -> None:
