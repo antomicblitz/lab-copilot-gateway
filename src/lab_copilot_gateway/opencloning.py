@@ -142,6 +142,16 @@ class DisallowedFileType(OpenCloningAdapterError):
         self.extension = extension
 
 
+class UnknownFileFormat(OpenCloningAdapterError):
+    """File format metadata is missing or not explicitly recognized."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            reason="unknown_file_format",
+            message="file_format must be explicitly identified before parsing",
+        )
+
+
 class InvalidFileContent(OpenCloningAdapterError):
     """Base64-encoded file content could not be decoded safely."""
 
@@ -951,7 +961,7 @@ class OpenCloningAdapter:
         self,
         *,
         context_token: str,
-        file_format: str,
+        file_format: str | None,
         mapped_identity: MappedIdentity | None,
         file_content: str = "",
         file_content_b64: str | None = None,
@@ -974,9 +984,38 @@ class OpenCloningAdapter:
         """
         # Decode file content to bytes for size check and downstream call.
         if file_content_b64 is not None:
+            if not isinstance(file_content_b64, str):
+                encoded_length = 0
+            else:
+                encoded_length = len(file_content_b64)
             try:
+                if not isinstance(file_content_b64, str):
+                    raise TypeError("file_content_b64 must be a string")
                 raw_bytes = base64.b64decode(file_content_b64, validate=True)
             except (binascii.Error, ValueError, TypeError) as exc:
+                self._audit(
+                    tool_name=TOOL_PARSE,
+                    policy_decision="deny",
+                    reason="invalid_file_content",
+                    mapped_identity=mapped_identity,
+                    experiment_id=None,
+                    conversation_id=conversation_id,
+                    request_id=request_id,
+                    keycloak_subject=keycloak_subject,
+                    librechat_user_id=librechat_user_id,
+                    provider=provider,
+                    model_id=model_id,
+                    tool_args_hash=compute_args_hash(
+                        {
+                            "file_format": file_format,
+                            "encoded_length": encoded_length,
+                        }
+                    ),
+                    error={
+                        "code": "INVALID_FILE_CONTENT",
+                        "encoded_length": encoded_length,
+                    },
+                )
                 raise InvalidFileContent() from exc
         else:
             raw_bytes = (
@@ -984,6 +1023,31 @@ class OpenCloningAdapter:
                 if isinstance(file_content, str)
                 else file_content
             )
+
+        # File-type metadata is authoritative; never guess a parser.
+        if not file_format:
+            self._audit(
+                tool_name=TOOL_PARSE,
+                policy_decision="deny",
+                reason="unknown_file_format",
+                mapped_identity=mapped_identity,
+                experiment_id=None,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=compute_args_hash(
+                    {
+                        "encoded_length": len(file_content_b64)
+                        if file_content_b64 is not None
+                        else len(raw_bytes)
+                    }
+                ),
+                error={"code": "UNKNOWN_FILE_FORMAT"},
+            )
+            raise UnknownFileFormat()
 
         # File-size limit (enforced before any downstream call).
         if len(raw_bytes) > MAX_FILE_SIZE_BYTES:

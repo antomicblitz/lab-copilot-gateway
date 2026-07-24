@@ -46,11 +46,13 @@ from lab_copilot_gateway.opencloning import (
     DisallowedFileType,
     FileTooLarge,
     HttpOpenCloningClient,
+    InvalidFileContent,
     OpenCloningAdapter,
     OpenCloningAdapterError,
     OpenCloningResult,
     PolicyDenied,
     StubOpenCloningClient,
+    UnknownFileFormat,
     WritebackResult,
     WritebackStepResult,
     _build_rollback_instructions,
@@ -310,7 +312,39 @@ def test_parse_sequence_file_rejects_disallowed_type(
     assert rows[0]["error"]["code"] == "DISALLOWED_FILE_TYPE"
 
 
-# --- manual_sequence: happy path --------------------------------------------
+def test_parse_sequence_file_rejects_invalid_base64_with_audit(
+    adapter: OpenCloningAdapter,
+    audit: AuditStore,
+    stub_client: StubOpenCloningClient,
+) -> None:
+    with pytest.raises(InvalidFileContent):
+        adapter.parse_sequence_file(
+            context_token=_token(),
+            file_content_b64="not-valid-base64!!!",
+            file_format="fasta",
+            mapped_identity=_identity(),
+        )
+    assert len(stub_client.calls) == 0
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "deny"
+    assert rows[0]["error"]["code"] == "INVALID_FILE_CONTENT"
+    assert "not-valid" not in str(rows[0])
+
+
+def test_parse_sequence_file_rejects_unknown_format_with_audit(
+    adapter: OpenCloningAdapter,
+    audit: AuditStore,
+) -> None:
+    with pytest.raises(UnknownFileFormat):
+        adapter.parse_sequence_file(
+            context_token=_token(),
+            file_content="ATCG",
+            file_format=None,
+            mapped_identity=_identity(),
+        )
+    rows = _audit_rows(audit)
+    assert rows[0]["error"]["code"] == "UNKNOWN_FILE_FORMAT"
 
 
 def test_manual_sequence_succeeds(
