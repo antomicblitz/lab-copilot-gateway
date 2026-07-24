@@ -798,7 +798,7 @@ def _serialize_downloaded_upload(
         ".fasta": "fasta",
         ".fa": "fasta",
         ".embl": "embl",
-    }.get(extension, extension.lstrip(".") or "genbank")
+    }.get(extension)
     result: dict[str, object] = {
         "upload_id": upload_id,
         "content_b64": base64.b64encode(content).decode("ascii"),
@@ -874,6 +874,43 @@ def _invoke_elabftw_download_upload(
     }
 
 
+def _audit_invalid_base64(
+    tool: Any,
+    body: InvokeBody,
+    mapped_identity: MappedIdentity | None,
+    encoded_length: int,
+) -> None:
+    """Record a safe deny event without retaining malformed payload bytes."""
+    action_id = str(_uuid.uuid4())
+    tool_name = tool.name if hasattr(tool, "name") else str(tool)
+    record = AuditRecord(
+        action_id=action_id,
+        conversation_id=body.conversation_id,
+        request_id=body.request_id,
+        keycloak_subject=body.keycloak_subject,
+        librechat_user_id=body.librechat_user_id,
+        mapped_elabftw_user_id=mapped_identity.elabftw_user_id
+        if mapped_identity
+        else None,
+        mapped_elabftw_team_id=mapped_identity.elabftw_team_id
+        if mapped_identity
+        else None,
+        provider=body.provider,
+        model_id=body.model_id,
+        tool_name=tool_name,
+        tool_args_hash=compute_args_hash({"encoded_length": encoded_length}),
+        policy_decision="deny",
+        api_call_summary={},
+        error={"code": "INVALID_FILE_CONTENT", "encoded_length": encoded_length},
+    )
+    try:
+        get_audit_store().append(record)
+    except Exception:
+        logger.warning(
+            "Invalid-base64 audit append failed for action %s", action_id, exc_info=True
+        )
+
+
 def _invoke_elabftw_amend(
     tool: Any,
     body: InvokeBody,
@@ -889,6 +926,7 @@ def _invoke_elabftw_amend(
         try:
             attachment_data = base64.b64decode(attachment_b64)
         except Exception as exc:
+            _audit_invalid_base64(tool, body, mapped_identity, len(str(attachment_b64)))
             return {
                 "ok": False,
                 "tool_name": tool.name,
@@ -932,7 +970,7 @@ def _dispatch_opencloning_tool(
             context_token=body.context_token,
             file_content=body.args.get("file_content", ""),
             file_content_b64=body.args.get("file_content_b64"),
-            file_format=body.args.get("file_format", "genbank"),
+            file_format=body.args.get("file_format"),
             mapped_identity=mapped_identity,
             conversation_id=body.conversation_id,
             request_id=body.request_id,
@@ -2289,21 +2327,27 @@ def _register_elabftw_amend_route(
     ) -> dict[str, object]:
         import base64
 
+        mapped_identity = identity_mapper.map(
+            keycloak_subject=principal.keycloak_subject,
+            librechat_user_id=body.librechat_user_id,
+        )
         attachment_data: bytes | None = None
         if body.attachment_b64 is not None and body.attachment_filename:
             try:
                 attachment_data = base64.b64decode(body.attachment_b64)
             except Exception as exc:
+                _audit_invalid_base64(
+                    "elabftw.amend_my_experiment_after_approval",
+                    body,
+                    mapped_identity,
+                    len(str(body.attachment_b64)),
+                )
                 return {
                     "ok": False,
                     "reason": "client_error",
                     "message": f"attachment_b64 is not valid base64: {exc}",
                 }
         adapter = get_elabftw_write_adapter()
-        mapped_identity = identity_mapper.map(
-            keycloak_subject=principal.keycloak_subject,
-            librechat_user_id=body.librechat_user_id,
-        )
         try:
             result = adapter.amend_my_experiment_after_approval(
                 context_token=body.context_token,
@@ -2534,6 +2578,12 @@ def _register_bentolab_route(api: FastAPI, identity_mapper: IdentityMapper) -> N
             try:
                 base64.b64decode(body.args["attachment_b64"])
             except Exception as exc:
+                _audit_invalid_base64(
+                    tool,
+                    body,
+                    mapped_identity,
+                    len(str(body.args["attachment_b64"])),
+                )
                 return {
                     "ok": False,
                     "tool_name": tool.name,
