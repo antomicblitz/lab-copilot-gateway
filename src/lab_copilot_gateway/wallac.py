@@ -1438,6 +1438,11 @@ class WallacAdapter:
     ) -> str:
         """Consume the ``wallac.run`` approval and return the effective id.
 
+        Review round 4 (CONCERN 1): the target-record binding is
+        verified BEFORE the approval is consumed so a target
+        mismatch does not burn the token. Verification failures
+        are audited identically to consume failures.
+
         Round 3 (review-blocker 1): the production orchestrator
         mints approval target_records as ``elabftw:experiment:<id>``
         (consistent with the eLabFTW resource address scheme). The
@@ -1462,14 +1467,9 @@ class WallacAdapter:
             return plan_approval_id
         if self.approval_store is None or not approval_id:
             return approval_id
-        try:
-            self.approval_store.consume(
-                approval_id=approval_id,
-                tool_name=TOOL_RUN,
-                args_hash=compute_args_hash(raw_args),
-                target_record=None,
-            )
-        except Exception as exc:
+
+        def _audit_consume_failure(reason_detail: str) -> None:
+            """Helper to record an approval_consume_failed audit row."""
             self._audit(
                 tool_name=TOOL_RUN,
                 policy_decision="allow",
@@ -1485,23 +1485,37 @@ class WallacAdapter:
                 tool_args_hash=tool_args_hash,
                 error={
                     "code": "APPROVAL_CONSUME_FAILED",
-                    "exception": type(exc).__name__,
-                    "message": str(exc),
+                    "detail": reason_detail,
                 },
             )
+
+        # Review round 4 CONCERN 1: verify the target_record binding
+        # BEFORE consuming so a target mismatch does not burn the
+        # approval token. The check is mandatory for any nonzero
+        # experiment_id (see _verify_target_experiment fail-closed
+        # semantics).
+        if experiment_id:
+            try:
+                self._verify_target_experiment(
+                    approval_id=approval_id, experiment_id=experiment_id
+                )
+            except WallacAdapterError as exc:
+                _audit_consume_failure(str(exc))
+                raise
+
+        try:
+            self.approval_store.consume(
+                approval_id=approval_id,
+                tool_name=TOOL_RUN,
+                args_hash=compute_args_hash(raw_args),
+                target_record=None,
+            )
+        except Exception as exc:
+            _audit_consume_failure(str(exc))
             raise WallacAdapterError(
                 reason="approval_consume_failed",
                 message=f"approval consume failed: {exc}",
             ) from exc
-        # Bind the approval to the effective experiment id via
-        # the target_record axis. This works regardless of the
-        # orchestrator's prefix convention (``elabftw:experiment:
-        # <id>``, ``wallac:exp:<id>``, future schemes) — we parse
-        # the trailing integer and compare.
-        if experiment_id:
-            self._verify_target_experiment(
-                approval_id=approval_id, experiment_id=experiment_id
-            )
         return approval_id
 
     def _verify_target_experiment(
@@ -1512,28 +1526,49 @@ class WallacAdapter:
     ) -> None:
         """Verify the approval's target_record encodes ``experiment_id``.
 
-        The production orchestrator mints target_records in the form
-        ``elabftw:experiment:<id>`` (and may use other conventions
-        in the future). This helper parses the trailing numeric id
-        from any ``<prefix>:<id>`` target and rejects mismatches
-        with a WallacAdapterError so the dispatcher sees a
-        structured failure. Combined with the args-hash consume
-        above, this gives two-axis binding: the protocol binding
-        (args hash) and the experiment binding (target id).
+        Review round 4 (BLOCKER): for every nonzero effective
+        experiment id, the target_record MUST bind to that id.
+        Missing target, missing record, or unparseable suffix all
+        fail closed — an approval without a verifiable target
+        binding would let the run execute against any experiment.
+        The prefix is parsed flexibly (``elabftw:experiment:<id>``
+        today, future conventions) but the numeric experiment id
+        check is mandatory.
+
+        Review round 3 (NIT — prefix flexibility): this is why
+        the suffix is parsed with ``rsplit(':', 1)`` rather than
+        a hard-coded ``elabftw:experiment:`` prefix match.
         """
         record = self.approval_store.get(approval_id) if self.approval_store else None
-        if record is None or record.target_record is None:
-            # No target binding was supplied at approval-request
-            # time — accept the run (the caller chose not to bind
-            # the experiment). This is the legacy behavior.
-            return
+        if record is None:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval '{approval_id}' has no stored record; "
+                    "cannot verify experiment binding"
+                ),
+            )
+        if record.target_record is None:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record is missing; "
+                    f"a wallac.run targeting experiment {experiment_id} "
+                    "requires the approval to bind to that experiment"
+                ),
+            )
         target = record.target_record.strip()
         try:
             encoded = int(target.rsplit(":", 1)[-1])
         except (ValueError, IndexError):
-            # Unparseable target — do not second-guess the
-            # orchestrator's convention; just accept.
-            return
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record '{record.target_record}' "
+                    "is not parseable as '<prefix>:<experiment_id>'; "
+                    f"cannot verify binding to experiment {experiment_id}"
+                ),
+            ) from None
         if encoded != experiment_id:
             raise WallacAdapterError(
                 reason="approval_consume_failed",

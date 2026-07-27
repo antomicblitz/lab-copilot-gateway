@@ -1316,14 +1316,12 @@ def test_run_rejects_approval_for_different_experiment() -> None:
 
 
 def test_run_rejects_approval_when_explicit_experiment_id_differs() -> None:
-    """Review round 3 (explicit-override binding): when the LLM
-    supplied ``experiment_id`` explicitly at approval-request time
-    AND at invoke time, BOTH axes must agree. The args hash check
-    fires first (experiment 43 != 42 in the hash), and the
-    WallacAdapterError surfaces 'does not match request field
-    args_hash'. This proves the explicit-override path is also
-    bound — an approval for experiment 43 cannot run against
-    experiment 42 even when both are explicit.
+    """Review round 4 (refined): when the LLM supplied
+    ``experiment_id`` explicitly at approval-request time AND at
+    invoke time with a different value, BOTH axes bind. The
+    target-record verification now runs BEFORE the consume
+    (round-4 concern 1) so the target_record axis fires first
+    and the approval is not burned on a mismatch.
     """
     from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
 
@@ -1361,9 +1359,73 @@ def test_run_rejects_approval_when_explicit_experiment_id_differs() -> None:
                 experiment_id_explicit=True,
             )
         assert exc_info.value.reason == "approval_consume_failed"
-        # The args hash axis fires first when explicit, surfacing
-        # 'args_hash' in the message.
-        assert "args_hash" in exc_info.value.message
+        # The target-record axis fires first (round-4 reordering
+        # so a target mismatch does not burn the approval). The
+        # message references the target experiment id mismatch.
+        assert "experiment 43" in exc_info.value.message
+        assert "experiment 42" in exc_info.value.message
+        # And critically, the approval is NOT consumed (target
+        # verification runs before consume).
+        record = approval.get(approval_id)
+        assert record is not None
+        assert not record.is_consumed()
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_rejects_approval_when_target_record_encodes_other_experiment() -> None:
+    """Review round 4 CONCERN 3: when the args hash matches but
+    the target_record encodes a different experiment, the
+    target-verification axis must reject the run. This proves
+    BOTH axes bind independently.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        # Mint an approval bound to experiment 42 (with target
+        # record encoding 42). Invoke with experiment_id=43 —
+        # the args hash would match if explicit, but the target
+        # axis catches the mismatch.
+        approval_id_42 = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=42,
+            explicit_experiment_id=True,
+            target_record="elabftw:experiment:42",
+        )
+
+        with pytest.raises(WallacAdapterError) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id_42,
+                protocol_id=1001,
+                experiment_id=43,
+                experiment_id_explicit=True,
+            )
+        assert exc_info.value.reason == "approval_consume_failed"
+        # The target-verification axis fires — args hash matched,
+        # target axis rejected.
+        assert "experiment 42" in exc_info.value.message
+        assert "experiment 43" in exc_info.value.message
     finally:
         monkeypatch.undo()
         audit.close()
