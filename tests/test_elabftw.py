@@ -1341,3 +1341,86 @@ def test_get_upload_content_must_return_raw_bytes_not_text():
 
     assert isinstance(result, bytes)
     assert result == original
+
+
+# --- CA bundle (slice 3 of wallac-bridge-tls-trust.md) -------------------
+
+
+def test_default_client_from_env_loads_ca_bundle(monkeypatch, tmp_path):
+    """Slice 3 acceptance: setting LAB_COPILOT_ELABFTW_CA_BUNDLE
+    attaches the bundle path to the HttpElabftwClient. System
+    trust plus the private CA is the slice-3 model.
+    """
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text(
+        "-----BEGIN CERTIFICATE-----\nMIIBfake\n-----END CERTIFICATE-----\n"
+    )
+    monkeypatch.setenv("LAB_COPILOT_ELABFTW_BASE_URL", "https://elab.example.org")
+    monkeypatch.setenv("LAB_COPILOT_ELABFTW_API_KEY", "2-abcdef")
+    monkeypatch.setenv("LAB_COPILOT_ELABFTW_VERIFY_TLS", "1")
+    monkeypatch.setenv("LAB_COPILOT_ELABFTW_CA_BUNDLE", str(bundle))
+    client = _default_client_from_env()
+    assert client is not None
+    assert client.verify_tls is True
+    assert client.ca_bundle == str(bundle)
+
+
+def test_ca_bundle_requires_verify_tls_true(monkeypatch, tmp_path):
+    """Slice 3 fail-closed: a CA bundle combined with verify=False
+    is meaningless — the bundle would never be loaded. Reject at
+    construction time so misconfigurations fail loudly."""
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    with pytest.raises(ValueError, match="verify_tls is False"):
+        HttpElabftwClient(
+            base_url="https://elab.example.org",
+            api_key="k",
+            verify_tls=False,
+            ca_bundle=str(bundle),
+        )
+
+
+def test_ca_bundle_must_be_a_file(monkeypatch, tmp_path):
+    """Slice 3 fail-closed: a missing/unreadable bundle path is
+    rejected at construction so the bad config fails at startup,
+    not on the first outbound request."""
+    missing = tmp_path / "does-not-exist.pem"
+    with pytest.raises(ValueError, match="not a file"):
+        HttpElabftwClient(
+            base_url="https://elab.example.org",
+            api_key="k",
+            verify_tls=True,
+            ca_bundle=str(missing),
+        )
+
+
+def test_session_verify_uses_bundle_path_when_set(monkeypatch, tmp_path):
+    """When a CA bundle is set, requests.Session.verify is the
+    bundle path (str), not a bool. ``requests`` treats a string
+    ``verify`` as the CA bundle path and preserves system trust
+    plus the private CA — exactly the slice-3 model.
+    """
+    bundle = tmp_path / "ca.pem"
+    bundle.write_text("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----\n")
+    client = HttpElabftwClient(
+        base_url="https://elab.example.org",
+        api_key="k",
+        verify_tls=True,
+        ca_bundle=str(bundle),
+    )
+    sess = client._connect()
+    assert sess.verify == str(bundle)
+
+
+def test_session_verify_falls_back_to_bool_when_no_bundle():
+    """When no bundle is configured, ``s.verify`` is the bool
+    ``verify_tls`` flag — the legacy path for dev/test diagnostics
+    that have no private CA yet.
+    """
+    client = HttpElabftwClient(
+        base_url="https://elab.example.org",
+        api_key="k",
+        verify_tls=False,
+    )
+    sess = client._connect()
+    assert sess.verify is False
