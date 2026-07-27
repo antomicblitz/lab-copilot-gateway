@@ -1539,6 +1539,12 @@ def test_run_rejects_approval_with_unparseable_target_record() -> None:
             )
         assert exc_info.value.reason == "approval_consume_failed"
         assert "not parseable" in exc_info.value.message
+        # The token must remain unconsumed so the operator can
+        # retry with a properly-bound approval (same contract as
+        # the missing-target branch).
+        record = approval.get(approval_id)
+        assert record is not None
+        assert not record.is_consumed()
     finally:
         monkeypatch.undo()
         audit.close()
