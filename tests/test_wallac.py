@@ -146,6 +146,7 @@ def _claims(
     keycloak_subject: str | None = "kc-human-1",
     librechat_user_id: str | None = "lc-human-1",
     ttl_seconds: int = 600,
+    record_type: str = "experiment",
 ) -> ContextTokenClaims:
     issued_at = _dt.datetime.now(_dt.timezone.utc)
     expires_at = issued_at + _dt.timedelta(seconds=ttl_seconds)
@@ -156,6 +157,7 @@ def _claims(
         librechat_user_id=librechat_user_id,
         issued_at=issued_at.isoformat(),
         expires_at=expires_at.isoformat(),
+        record_type=record_type,
     )
 
 
@@ -1108,12 +1110,10 @@ def test_run_sends_current_experiment_id_to_bridge(
         bridge_client=stub_bridge_client,
         approval_store=approval,
     )
-    approval_id = _approval_token(
+    approval_id = _wallac_run_approval(
         approval,
-        tool_name=TOOL_RUN,
-        args={"protocol_id": 1001},
-        target_record="wallac:exp:42",
-        tier=4,
+        protocol_id=1001,
+        experiment_id=42,
     )
 
     result = adapter.run(
@@ -1193,12 +1193,10 @@ def test_run_creates_new_experiment_without_context(
         bridge_client=stub_bridge_client,
         approval_store=approval,
     )
-    approval_id = _approval_token(
+    approval_id = _wallac_run_approval(
         approval,
-        tool_name=TOOL_RUN,
-        args={"protocol_id": 1001},
-        target_record="wallac:exp:0",
-        tier=4,
+        protocol_id=1001,
+        experiment_id=0,
     )
 
     # Mint a token with no experiment context.
@@ -1209,6 +1207,7 @@ def test_run_creates_new_experiment_without_context(
         mapped_identity=_identity(),
         approval_id=approval_id,
         protocol_id=1001,
+        experiment_id=0,
     )
 
     assert result.result["job_id"] == "bridge-job-002"
@@ -1242,6 +1241,70 @@ def test_experiment_id_from_token_returns_zero_for_garbage() -> None:
     assert _experiment_id_from_token("not-a-real-token") == 0
 
 
+def test_experiment_id_from_token_returns_zero_for_resource_context() -> None:
+    """Review concern round 1: a context token whose record is a
+    database item (``record_type='resource'``) carries an item id
+    in the same numeric field. Using it as an experiment id would
+    target an unrelated experiment. The helper must return 0 so
+    the adapter's own validation surfaces the error."""
+    from lab_copilot_gateway.app import _experiment_id_from_token
+
+    resource_claims = _claims(experiment_id=42, record_type="resource")
+    assert _experiment_id_from_token(_token(resource_claims)) == 0
+
+
+def test_run_rejects_approval_for_different_experiment() -> None:
+    """Review-blocker 1 (round 1): an approval minted for
+    experiment 42 cannot be replayed against experiment 43. The
+    target_record binding on the approval store rejects the
+    consume call when the supplied experiment_id does not match.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        # Approval minted for experiment 42.
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=42,
+        )
+
+        # Replay attempt against experiment 43 — must be rejected.
+        with pytest.raises(Exception) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id,
+                protocol_id=1001,
+                experiment_id=43,
+            )
+        # The approval binding fails with a mismatch error.
+        assert (
+            "mismatch" in str(exc_info.value).lower()
+            or "args_hash" in str(exc_info.value).lower()
+        )
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
 # ============================================================================
 
 
@@ -1259,6 +1322,31 @@ def _approval_token(
         args_hash=compute_args_hash(args or {"job_item_id": 99}),
         target_record=target_record or "wallac:job:99",
         tier=tier,
+    )
+    approval_id, _ = approval_store.request(req)
+    return approval_id
+
+
+def _wallac_run_approval(
+    approval_store: ApprovalStore,
+    *,
+    protocol_id: int,
+    experiment_id: int,
+    target_record: str | None = None,
+) -> str:
+    """Mint an approval token for ``wallac.run``.
+
+    Review-blocker 1 (round 1): the args hash must include the
+    effective experiment id (and the target_record must equal
+    ``wallac:exp:<id>``) so an approval for experiment A cannot be
+    replayed against experiment B.
+    """
+    args = {"protocol_id": protocol_id, "experiment_id": experiment_id}
+    req = ApprovalRequest(
+        tool_name=TOOL_RUN,
+        args_hash=compute_args_hash(args),
+        target_record=target_record or f"wallac:exp:{experiment_id}",
+        tier=4,
     )
     approval_id, _ = approval_store.request(req)
     return approval_id
