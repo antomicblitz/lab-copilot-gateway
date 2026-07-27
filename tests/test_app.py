@@ -1705,8 +1705,7 @@ def test_invoke_dispatches_wallac_run_with_context_experiment_id() -> None:
     (``protocol_id`` only — the dispatcher derives
     ``experiment_id`` from the context token). target_record pins
     ``elabftw:experiment:<id>`` so the run is bound to that
-    experiment on the approval-store axis.
-    the approval-store axis.
+    experiment via the adapter's target-record parser.
     """
     import lab_copilot_gateway.identity as identitymod
 

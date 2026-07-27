@@ -1376,10 +1376,13 @@ def test_run_rejects_approval_when_explicit_experiment_id_differs() -> None:
 
 
 def test_run_rejects_approval_when_target_record_encodes_other_experiment() -> None:
-    """Review round 4 CONCERN 3: when the args hash matches but
-    the target_record encodes a different experiment, the
-    target-verification axis must reject the run. This proves
-    BOTH axes bind independently.
+    """Review round 4 CONCERN 3 (refined in round 5): the
+    target-verification axis must reject independently of the
+    args-hash axis. We mint the approval with explicit
+    experiment_id=43 in the args hash AND a tampered target
+    encoding 42, then invoke with experiment_id=43. The args
+    hash matches (so the hash axis passes), but the target
+    axis catches the mismatch.
     """
     from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
 
@@ -1400,32 +1403,195 @@ def test_run_rejects_approval_when_target_record_encodes_other_experiment() -> N
             approval_store=approval,
         )
 
-        # Mint an approval bound to experiment 42 (with target
-        # record encoding 42). Invoke with experiment_id=43 —
-        # the args hash would match if explicit, but the target
-        # axis catches the mismatch.
-        approval_id_42 = _wallac_run_approval(
+        # Approval with explicit experiment_id=43 in args hash
+        # but a tampered target encoding 42 — simulates the
+        # orchestrator ever producing a wrong-prefix target.
+        approval_id = _wallac_run_approval(
             approval,
             protocol_id=1001,
-            experiment_id=42,
+            experiment_id=43,
             explicit_experiment_id=True,
             target_record="elabftw:experiment:42",
+        )
+
+        # Invoke with experiment_id=43 — args hash matches, target
+        # axis rejects.
+        with pytest.raises(WallacAdapterError) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id,
+                protocol_id=1001,
+                experiment_id=43,
+                experiment_id_explicit=True,
+            )
+        assert exc_info.value.reason == "approval_consume_failed"
+        # The target-verification axis fires — message references
+        # both encoded (42) and target (43) experiment ids.
+        assert "experiment 42" in exc_info.value.message
+        assert "experiment 43" in exc_info.value.message
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_rejects_approval_with_missing_target_record() -> None:
+    """Review round 5 CONCERN 2: a nonzero experiment_id with a
+    missing target_record must fail closed. This is the original
+    fail-open variant from round 4 — an approval without any
+    target binding could otherwise run against any experiment.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        # Approval minted with explicit experiment_id=43 but NO
+        # target_record — the fail-open variant.
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=43,
+            explicit_experiment_id=True,
+            target_record=None,
         )
 
         with pytest.raises(WallacAdapterError) as exc_info:
             adapter.run(
                 context_token=_token(),
                 mapped_identity=_identity(),
-                approval_id=approval_id_42,
+                approval_id=approval_id,
                 protocol_id=1001,
                 experiment_id=43,
                 experiment_id_explicit=True,
             )
         assert exc_info.value.reason == "approval_consume_failed"
-        # The target-verification axis fires — args hash matched,
-        # target axis rejected.
-        assert "experiment 42" in exc_info.value.message
-        assert "experiment 43" in exc_info.value.message
+        assert "target_record is missing" in exc_info.value.message
+        # Token must remain unconsumed so the operator can retry
+        # with a properly-bound approval.
+        record = approval.get(approval_id)
+        assert record is not None
+        assert not record.is_consumed()
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_rejects_approval_with_unparseable_target_record() -> None:
+    """Review round 5 CONCERN 2: a target_record whose suffix
+    cannot be parsed as an integer must fail closed. The parser
+    uses ``rsplit(':', 1)`` so anything after the last colon is
+    the candidate suffix; non-numeric suffixes reject.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        # Approval with an unparseable target suffix — the
+        # parser will fail to extract an integer.
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=43,
+            explicit_experiment_id=True,
+            target_record="elabftw:experiment:not-an-int",
+        )
+
+        with pytest.raises(WallacAdapterError) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id,
+                protocol_id=1001,
+                experiment_id=43,
+                experiment_id_explicit=True,
+            )
+        assert exc_info.value.reason == "approval_consume_failed"
+        assert "not parseable" in exc_info.value.message
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_rejects_approval_when_explicit_args_hash_differs() -> None:
+    """Review round 5 CONCERN 1: converse of the target-only test.
+    Mint an approval with explicit experiment_id=42 in args hash
+    and target encoding 43, then invoke with experiment_id=43.
+    Target verification passes, then consumption rejects on
+    args_hash.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=42,
+            explicit_experiment_id=True,
+            target_record="elabftw:experiment:43",
+        )
+
+        with pytest.raises(WallacAdapterError) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id,
+                protocol_id=1001,
+                experiment_id=43,
+                experiment_id_explicit=True,
+            )
+        assert exc_info.value.reason == "approval_consume_failed"
+        # Target verification passed (43 == 43); the args-hash
+        # axis fires.
+        assert "args_hash" in exc_info.value.message
     finally:
         monkeypatch.undo()
         audit.close()
@@ -1532,12 +1698,15 @@ def _approval_token(
     return approval_id
 
 
+_UNSET = object()
+
+
 def _wallac_run_approval(
     approval_store: ApprovalStore,
     *,
     protocol_id: int,
     experiment_id: int,
-    target_record: str | None = None,
+    target_record: Any = _UNSET,
     explicit_experiment_id: bool = False,
 ) -> str:
     """Mint an approval token for ``wallac.run``.
@@ -1550,17 +1719,25 @@ def _wallac_run_approval(
     axis on ``approval_store.consume()`` (matched via the trailing
     integer in ``<prefix>:<id>`` so the orchestrator's convention
     does not have to match).
+
+    Pass ``target_record`` explicitly (including the literal
+    ``None``) to suppress the default — tests that exercise the
+    missing-target or unparseable-target fail-closed paths rely on
+    this. The default when ``target_record`` is not passed is the
+    orchestrator's production convention.
     """
     args = {"protocol_id": protocol_id}
     if explicit_experiment_id:
         args["experiment_id"] = experiment_id
+    effective_target = (
+        target_record
+        if target_record is not _UNSET
+        else f"elabftw:experiment:{experiment_id}"
+    )
     req = ApprovalRequest(
         tool_name=TOOL_RUN,
         args_hash=compute_args_hash(args),
-        # Default to the orchestrator's actual production convention
-        # (``elabftw:experiment:<id>``). Tests that need the legacy
-        # ``wallac:exp:<id>`` form override this via target_record.
-        target_record=target_record or f"elabftw:experiment:{experiment_id}",
+        target_record=effective_target,
         tier=4,
     )
     approval_id, _ = approval_store.request(req)
