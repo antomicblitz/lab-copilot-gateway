@@ -899,10 +899,15 @@ class WallacAdapter:
             "title": f"Lab Copilot — Protocol {protocol_id}",
             "execution_mode": "existing_protocol",
             "protocol_id": protocol_id,
-            # Don't pass the current experiment_id — the bridge creates
-            # a NEW experiment for the results. Writing to the current
-            # experiment would overwrite its body with the heatmap HTML.
-            "elabftw_experiment_id": 0,
+            # Pass the current experiment id when we have one so the
+            # bridge can append/upsert the Wallac results into the
+            # existing experiment body instead of creating a new one.
+            # Slice 6 of
+            # ``docs/plans/wallac-existing-protocol-writeback-repair.md``
+            # (cross-repo plan). When no experiment context exists
+            # (``experiment_id == 0``) the bridge still creates a new
+            # experiment for standalone runs.
+            "elabftw_experiment_id": experiment_id,
         }
 
         # Pass wells_spec if the LLM specified which wells to measure.

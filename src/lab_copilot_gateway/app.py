@@ -410,6 +410,29 @@ def _approval_backend_status(store: ApprovalStore) -> dict[str, str]:
     }
 
 
+def _experiment_id_from_token(context_token: str | None) -> int:
+    """Return the experiment id carried in a context token, or 0.
+
+    Used by ``wallac.run`` (slice 6 of the Wallac writeback-repair
+    plan) to decide which experiment the bridge should append/upsert
+    its Wallac results into. Returns 0 when the token is missing,
+    malformed, or carries no experiment claim — the bridge interprets
+    0 as "create a new results experiment".
+    """
+    if not context_token:
+        return 0
+    try:
+        claims = verify_context_token(context_token)
+    except Exception:
+        # Reason: dispatchers must remain fail-soft here — the
+        # adapter's own ``run()`` method is the authoritative
+        # validator for the context token. Returning 0 lets a
+        # downstream validation failure surface a clean error
+        # instead of swallowing context here.
+        return 0
+    return int(getattr(claims, "experiment_id", 0) or 0)
+
+
 def _download_filename(filename: str) -> str:
     """Return a conservative Content-Disposition filename."""
     safe = filename.replace("/", "_").replace("\\", "_").replace('"', "_")
@@ -1356,6 +1379,16 @@ def _invoke_wallac_tool(
                 "result": result.to_dict(),
             }
         elif tool.name == "wallac.run":
+            # Slice 6 of
+            # ``docs/plans/wallac-existing-protocol-writeback-repair.md``
+            # (cross-repo plan): when an eLabFTW experiment context is
+            # present, pass its id so the bridge can append/upsert the
+            # Wallac results section into the existing experiment body
+            # instead of always creating a brand-new results experiment.
+            # LLM-supplied ``experiment_id`` in args still wins so the
+            # caller can target a non-context experiment explicitly.
+            context_experiment_id = _experiment_id_from_token(body.context_token)
+            caller_experiment_id = body.args.get("experiment_id")
             result = adapter.run(
                 context_token=body.context_token,
                 mapped_identity=mapped_identity,
@@ -1363,6 +1396,11 @@ def _invoke_wallac_tool(
                 protocol_id=body.args.get("protocol_id") or 0,
                 plate_id=body.args.get("plate_id"),
                 plate_layout=body.args.get("plate_layout"),
+                experiment_id=(
+                    int(caller_experiment_id)
+                    if caller_experiment_id
+                    else context_experiment_id
+                ),
                 conversation_id=body.conversation_id,
                 request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,

@@ -27,6 +27,8 @@ Additional coverage (mirrors the OpenCloning adapter test patterns):
 from __future__ import annotations
 
 import datetime as _dt
+import json
+from typing import Any
 
 import pytest
 
@@ -54,6 +56,7 @@ from lab_copilot_gateway.wallac import (
     WallacAdapter,
     WallacAdapterError,
     WallacResult,
+    TOOL_RUN,
     TOOL_SUBMIT,
     _default_bridge_client_from_env,
     _default_client_from_env,
@@ -1045,6 +1048,200 @@ def test_singleton_bridge_client_none_when_unset(monkeypatch) -> None:
 
 # ============================================================================
 # C21: submit_generated_protocol
+# ============================================================================
+
+
+# --- wallac.run sends current experiment id (slice 6) -------------------------
+
+
+def test_run_sends_current_experiment_id_to_bridge(
+    monkeypatch,
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """Slice 6 of ``docs/plans/wallac-existing-protocol-writeback-repair.md``:
+
+    when an eLabFTW experiment context is open, ``wallac.run`` MUST
+    forward that experiment id to the Wallac bridge so the bridge
+    can append/upsert its results into the existing experiment body.
+    """
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode()
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def _fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+        body = json.loads(req.data.decode())
+        captured["url"] = req.full_url
+        captured["body"] = body
+        return _FakeResponse({"job_id": "bridge-job-001", "status": "accepted"})
+
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423")
+    # Patch urllib.request.urlopen globally — wallac.py imports the
+    # module then calls ``urllib.request.urlopen`` directly, so the
+    # correct patch site is the underlying ``urllib.request``.
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        _fake_urlopen,
+    )
+
+    # Allow tier 4 BOUNDED_WRITES hardware execution.
+    policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(
+        approval,
+        tool_name=TOOL_RUN,
+        args={"protocol_id": 1001},
+        target_record="wallac:exp:42",
+        tier=4,
+    )
+
+    result = adapter.run(
+        context_token=_token(),  # claims.experiment_id defaults to 42
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        protocol_id=1001,
+        experiment_id=42,  # simulates dispatcher extracting context id
+    )
+
+    assert isinstance(result, WallacResult)
+    assert result.tool_name == TOOL_RUN
+    assert result.result["job_id"] == "bridge-job-001"
+
+    # Bridge received the call with elabftw_experiment_id == 42 (from
+    # the context token), so the bridge can append/upsert into that
+    # experiment instead of creating a brand-new one.
+    assert captured["url"].endswith("/jobs")
+    assert captured["body"]["elabftw_experiment_id"] == 42
+    assert captured["body"]["protocol_id"] == 1001
+    assert captured["body"]["execution_mode"] == "existing_protocol"
+
+    # Approval was consumed.
+    record = approval.get(approval_id)
+    assert record is not None
+    assert record.is_consumed()
+
+    # Audit row records the result with the context experiment id.
+    rows = _audit_rows(audit)
+    assert len(rows) == 1
+    assert rows[0]["policy_decision"] == "allow"
+    assert rows[0]["tool_name"] == TOOL_RUN
+
+
+def test_run_creates_new_experiment_without_context(
+    monkeypatch,
+    policy: PolicyEngine,
+    audit: AuditStore,
+    stub_client: StubWallacClient,
+    stub_bridge_client: StubWallacBridgeClient,
+    approval: ApprovalStore,
+) -> None:
+    """When no experiment context is open, ``wallac.run`` MUST send
+    ``elabftw_experiment_id == 0`` so the bridge creates a new
+    results experiment (legacy behavior, unchanged by slice 6)."""
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode()
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def _fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+        captured["body"] = json.loads(req.data.decode())
+        return _FakeResponse({"job_id": "bridge-job-002", "status": "accepted"})
+
+    monkeypatch.setenv("LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423")
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        _fake_urlopen,
+    )
+
+    policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+
+    adapter = WallacAdapter(
+        policy_engine=policy,
+        audit_store=audit,
+        client=stub_client,
+        bridge_client=stub_bridge_client,
+        approval_store=approval,
+    )
+    approval_id = _approval_token(
+        approval,
+        tool_name=TOOL_RUN,
+        args={"protocol_id": 1001},
+        target_record="wallac:exp:0",
+        tier=4,
+    )
+
+    # Mint a token with no experiment context.
+    no_ctx_claims = _claims(experiment_id=0)
+
+    result = adapter.run(
+        context_token=_token(no_ctx_claims),
+        mapped_identity=_identity(),
+        approval_id=approval_id,
+        protocol_id=1001,
+    )
+
+    assert result.result["job_id"] == "bridge-job-002"
+    assert captured["body"]["elabftw_experiment_id"] == 0
+
+
+def test_experiment_id_from_token_returns_zero_when_no_token() -> None:
+    """Direct unit test for the dispatcher helper used by
+    ``wallac.run`` (slice 6). Returns 0 when no token is supplied —
+    the bridge interprets 0 as "create a new experiment"."""
+    from lab_copilot_gateway.app import _experiment_id_from_token
+
+    assert _experiment_id_from_token(None) == 0
+    assert _experiment_id_from_token("") == 0
+
+
+def test_experiment_id_from_token_returns_claim_id() -> None:
+    """Direct unit test for ``_experiment_id_from_token``: extracts
+    the experiment id from a valid context token."""
+    from lab_copilot_gateway.app import _experiment_id_from_token
+
+    token = _token(_claims(experiment_id=42))
+    assert _experiment_id_from_token(token) == 42
+
+
+def test_experiment_id_from_token_returns_zero_for_garbage() -> None:
+    """A malformed token must not crash the dispatcher — it returns 0
+    so the adapter's own validation surfaces the real error."""
+    from lab_copilot_gateway.app import _experiment_id_from_token
+
+    assert _experiment_id_from_token("not-a-real-token") == 0
+
+
 # ============================================================================
 
 
