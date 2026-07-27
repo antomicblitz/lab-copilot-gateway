@@ -383,7 +383,14 @@ _CATALOG: tuple[Tool, ...] = (
             "Calling this tool automatically triggers an approval card "
             "in the UI — do NOT ask the user for confirmation first, "
             "just call it and the approval card appears. "
-            "Args: protocol_id (int, from GET /protocols), plate_id (int, optional)."
+            "Args: protocol_id (int, from GET /protocols), plate_id "
+            "(int, optional), experiment_id (int, optional — supply "
+            "the current eLabFTW experiment id when the operator has "
+            "one open so the bridge writes results into that experiment; "
+            "omit to create a fresh results experiment). The approval "
+            "is bound to the exact args hash — supply experiment_id "
+            "at approval-request time if you intend to supply it at "
+            "invoke time."
         ),
     ),
     Tool(

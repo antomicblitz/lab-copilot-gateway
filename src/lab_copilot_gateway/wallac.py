@@ -634,15 +634,14 @@ class WallacAdapter:
         """
         # The raw args dict is what the approval request hashed — must match
         # for the approval consume to succeed.
-        # Review-blocker 1 (round 1): include the effective experiment id
-        # in raw_args so the approval hash binds the run to its
-        # writeback target. Without this, an approval for protocol X
-        # could be replayed against a different experiment by
-        # supplying a different experiment_id override.
-        raw_args: dict[str, Any] = {
-            "protocol_id": protocol_id,
-            "experiment_id": experiment_id,
-        }
+        # Review round 2: the args hash intentionally does NOT
+        # include experiment_id — the LLM cannot reliably know the
+        # dispatcher's effective experiment_id at approval-request
+        # time (it may be derived from a context token the LLM
+        # cannot see). experiment_id is bound via the separate
+        # target_record axis on approval_store.consume() so a
+        # mismatched experiment_id still fails the consume.
+        raw_args: dict[str, Any] = {"protocol_id": protocol_id}
         if plate_id is not None:
             raw_args["plate_id"] = plate_id
         if plate_layout:
@@ -736,8 +735,11 @@ class WallacAdapter:
         # Review-blocker 1 (round 1): the audit's tool_args_hash must
         # reflect the EFFECTIVE experiment id (the one the bridge
         # will write results into), not the context-claim id. Without
-        # this, an override would not show up in the audit trail.
-        tool_args_hash = compute_args_hash({**raw_args, "experiment_id": experiment_id})
+        # tool_args_hash reflects what the caller (LLM) actually sees
+        # in the tool args — that is what gets approved and audited.
+        # experiment_id binding is on the target_record axis, not the
+        # args hash, so it does not pollute this hash.
+        tool_args_hash = compute_args_hash(raw_args)
 
         # 2. Identity resolution.
         if mapped_identity is None:

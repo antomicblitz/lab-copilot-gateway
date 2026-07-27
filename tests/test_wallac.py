@@ -1254,10 +1254,13 @@ def test_experiment_id_from_token_returns_zero_for_resource_context() -> None:
 
 
 def test_run_rejects_approval_for_different_experiment() -> None:
-    """Review-blocker 1 (round 1): an approval minted for
-    experiment 42 cannot be replayed against experiment 43. The
-    target_record binding on the approval store rejects the
-    consume call when the supplied experiment_id does not match.
+    """Review round 2: an approval minted with
+    ``target_record='wallac:exp:43'`` cannot be consumed for a
+    run targeting experiment 42. The args hash (round-2 design)
+    deliberately does NOT include experiment_id so the LLM does
+    not need to know the dispatcher's effective experiment_id at
+    approval-request time — but the target_record axis catches the
+    mismatch.
     """
     from lab_copilot_gateway.wallac import WallacAdapter
 
@@ -1278,27 +1281,30 @@ def test_run_rejects_approval_for_different_experiment() -> None:
             approval_store=approval,
         )
 
-        # Approval minted for experiment 42.
+        # Approval minted with target_record pinned to experiment 43.
         approval_id = _wallac_run_approval(
             approval,
             protocol_id=1001,
-            experiment_id=42,
+            experiment_id=43,
         )
 
-        # Replay attempt against experiment 43 — must be rejected.
-        with pytest.raises(Exception) as exc_info:
+        # Replay attempt against experiment 42 — the target_record
+        # binding must reject this on the target_record axis
+        # (not the args_hash axis). The adapter wraps the
+        # ApprovalMismatch in a WallacAdapterError so the dispatcher
+        # sees a structured failure.
+        from lab_copilot_gateway.wallac import WallacAdapterError
+
+        with pytest.raises(WallacAdapterError) as exc_info:
             adapter.run(
                 context_token=_token(),
                 mapped_identity=_identity(),
                 approval_id=approval_id,
                 protocol_id=1001,
-                experiment_id=43,
+                experiment_id=42,
             )
-        # The approval binding fails with a mismatch error.
-        assert (
-            "mismatch" in str(exc_info.value).lower()
-            or "args_hash" in str(exc_info.value).lower()
-        )
+        assert exc_info.value.reason == "approval_consume_failed"
+        assert "target_record" in exc_info.value.message
     finally:
         monkeypatch.undo()
         audit.close()
@@ -1336,12 +1342,14 @@ def _wallac_run_approval(
 ) -> str:
     """Mint an approval token for ``wallac.run``.
 
-    Review-blocker 1 (round 1): the args hash must include the
-    effective experiment id (and the target_record must equal
-    ``wallac:exp:<id>``) so an approval for experiment A cannot be
-    replayed against experiment B.
+    Mirrors the production approval-request path: the LLM knows
+    ``protocol_id`` at approval-request time but does not always
+    know ``experiment_id`` (the dispatcher may derive it from a
+    context token). The args hash binds the protocol; the
+    experiment_id binding lives on the separate ``target_record``
+    axis on ``approval_store.consume()``.
     """
-    args = {"protocol_id": protocol_id, "experiment_id": experiment_id}
+    args = {"protocol_id": protocol_id}
     req = ApprovalRequest(
         tool_name=TOOL_RUN,
         args_hash=compute_args_hash(args),

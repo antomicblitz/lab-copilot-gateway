@@ -460,6 +460,8 @@ def _resolve_run_experiment_id(
       from a non-context call).
     * Type validation — a non-int or bool is rejected with a
       structured client error, never an HTTP 500.
+    * Negative values are rejected (review NIT round 2): eLabFTW
+      experiment ids are non-negative integers.
     * Non-experiment context tokens resolve to 0 (see
       ``_experiment_id_from_token``); a malformed override on a
       resource-context token still produces the structured error.
@@ -468,12 +470,12 @@ def _resolve_run_experiment_id(
     if "experiment_id" not in args:
         return context_experiment_id, None
     raw = args["experiment_id"]
-    if not isinstance(raw, int) or isinstance(raw, bool):
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
         return 0, {
             "reason": "invalid_args",
             "message": (
-                "experiment_id must be an integer when supplied "
-                f"(got {type(raw).__name__})"
+                "experiment_id must be a non-negative integer when "
+                f"supplied (got {raw!r})"
             ),
         }
     return raw, None
