@@ -1773,13 +1773,15 @@ def test_invoke_dispatches_wallac_run_with_context_experiment_id() -> None:
 
         # Issue an approval for protocol_id=1001. The dispatcher
         # will derive experiment_id=42 from the context token and
-        # pass target_record='wallac:exp:42' to consume.
+        # the adapter's target_record parser will match it to
+        # 'elabftw:experiment:42' (the production orchestrator
+        # convention).
         approval_resp = client.post(
             "/approval/request",
             json={
                 "tool_name": "wallac.run",
                 "args": {"protocol_id": 1001},
-                "target_record": "wallac:exp:42",
+                "target_record": "elabftw:experiment:42",
                 "tier": 4,
                 "keycloak_subject": "kc-http-1",
                 "librechat_user_id": "lc-http-1",

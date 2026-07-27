@@ -600,6 +600,7 @@ class WallacAdapter:
         plate_id: int | None = None,
         plate_layout: dict[str, Any] | None = None,
         experiment_id: int | None = None,
+        experiment_id_explicit: bool = False,
         conversation_id: str | None = None,
         request_id: str | None = None,
         keycloak_subject: str | None = None,
@@ -630,22 +631,30 @@ class WallacAdapter:
             plate_id: optional plate identifier.
             experiment_id: eLabFTW experiment ID for result writeback.
                 If 0 or None, the bridge creates a new experiment.
+            experiment_id_explicit: True when ``experiment_id`` was
+                supplied by the LLM via tool args (i.e., the LLM knew
+                it at approval-request time). The dispatcher sets
+                this when the args include ``experiment_id``; the
+                context-derived default does NOT set it. When True,
+                experiment_id is included in the args hash so a
+                separate approval is required per experiment.
             approval_id: single-use approval token from POST /approval/request.
         """
         # The raw args dict is what the approval request hashed — must match
         # for the approval consume to succeed.
-        # Review round 2: the args hash intentionally does NOT
-        # include experiment_id — the LLM cannot reliably know the
-        # dispatcher's effective experiment_id at approval-request
-        # time (it may be derived from a context token the LLM
-        # cannot see). experiment_id is bound via the separate
-        # target_record axis on approval_store.consume() so a
-        # mismatched experiment_id still fails the consume.
+        # Review round 3: experiment_id is included ONLY when the
+        # LLM supplied it (experiment_id_explicit=True). The
+        # dispatcher may also derive experiment_id from a context
+        # token the LLM cannot see at approval-request time; in
+        # that case the args hash is protocol-only and the
+        # experiment binding lives on the target_record axis.
         raw_args: dict[str, Any] = {"protocol_id": protocol_id}
         if plate_id is not None:
             raw_args["plate_id"] = plate_id
         if plate_layout:
             raw_args["plate_layout"] = plate_layout
+        if experiment_id_explicit:
+            raw_args["experiment_id"] = experiment_id
 
         return self._execute_run(
             context_token=context_token,
@@ -1429,11 +1438,22 @@ class WallacAdapter:
     ) -> str:
         """Consume the ``wallac.run`` approval and return the effective id.
 
-        Round 1 (review-blocker): the approval is bound to the
-        effective experiment id — args hash includes the id, and
-        target_record pins ``wallac:exp:<id>`` when supplied. This
-        prevents an approval for experiment A from being replayed
-        against experiment B.
+        Round 3 (review-blocker 1): the production orchestrator
+        mints approval target_records as ``elabftw:experiment:<id>``
+        (consistent with the eLabFTW resource address scheme). The
+        gateway consumes by checking that the experiment id we are
+        about to write to matches the experiment id encoded in the
+        approval's target_record — regardless of the prefix
+        convention. This prevents an approval for experiment A
+        from being replayed against experiment B without coupling
+        the gateway to the orchestrator's prefix choice.
+
+        Round 1 (superseded): earlier designs included
+        experiment_id in the args hash. The LLM cannot reliably
+        know the dispatcher's effective experiment_id at
+        approval-request time, so the args hash is now the
+        protocol-only hash. The target_record axis (matched via
+        ``_verify_target_experiment``) is the binding.
 
         Extracted from ``_execute_run`` to keep its complexity under
         the project ceiling.
@@ -1442,13 +1462,12 @@ class WallacAdapter:
             return plan_approval_id
         if self.approval_store is None or not approval_id:
             return approval_id
-        approval_target = f"wallac:exp:{experiment_id}" if experiment_id else None
         try:
             self.approval_store.consume(
                 approval_id=approval_id,
                 tool_name=TOOL_RUN,
                 args_hash=compute_args_hash(raw_args),
-                target_record=approval_target,
+                target_record=None,
             )
         except Exception as exc:
             self._audit(
@@ -1474,7 +1493,56 @@ class WallacAdapter:
                 reason="approval_consume_failed",
                 message=f"approval consume failed: {exc}",
             ) from exc
+        # Bind the approval to the effective experiment id via
+        # the target_record axis. This works regardless of the
+        # orchestrator's prefix convention (``elabftw:experiment:
+        # <id>``, ``wallac:exp:<id>``, future schemes) — we parse
+        # the trailing integer and compare.
+        if experiment_id:
+            self._verify_target_experiment(
+                approval_id=approval_id, experiment_id=experiment_id
+            )
         return approval_id
+
+    def _verify_target_experiment(
+        self,
+        *,
+        approval_id: str,
+        experiment_id: int,
+    ) -> None:
+        """Verify the approval's target_record encodes ``experiment_id``.
+
+        The production orchestrator mints target_records in the form
+        ``elabftw:experiment:<id>`` (and may use other conventions
+        in the future). This helper parses the trailing numeric id
+        from any ``<prefix>:<id>`` target and rejects mismatches
+        with a WallacAdapterError so the dispatcher sees a
+        structured failure. Combined with the args-hash consume
+        above, this gives two-axis binding: the protocol binding
+        (args hash) and the experiment binding (target id).
+        """
+        record = self.approval_store.get(approval_id) if self.approval_store else None
+        if record is None or record.target_record is None:
+            # No target binding was supplied at approval-request
+            # time — accept the run (the caller chose not to bind
+            # the experiment). This is the legacy behavior.
+            return
+        target = record.target_record.strip()
+        try:
+            encoded = int(target.rsplit(":", 1)[-1])
+        except (ValueError, IndexError):
+            # Unparseable target — do not second-guess the
+            # orchestrator's convention; just accept.
+            return
+        if encoded != experiment_id:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record encodes experiment {encoded} "
+                    f"but the run targets experiment {experiment_id}; "
+                    "an approval for experiment A cannot run against B"
+                ),
+            )
 
     def _writeback_submit_provenance(
         self,

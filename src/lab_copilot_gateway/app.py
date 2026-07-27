@@ -1441,6 +1441,13 @@ def _invoke_wallac_tool(
             # is honored (a request to create a new experiment from a
             # non-context call). Validate the type so a malformed
             # LLM argument does not crash the dispatcher with a 500.
+            #
+            # experiment_id_explicit is True only when the LLM
+            # supplied the override via args. The context-derived
+            # default is NOT explicit — the LLM could not have known
+            # the value at approval-request time. This asymmetric flag
+            # controls whether experiment_id is included in the
+            # approval args hash (review round 3).
             effective_experiment_id, invalid_arg = _resolve_run_experiment_id(
                 body.args, body.context_token
             )
@@ -1450,6 +1457,7 @@ def _invoke_wallac_tool(
                     "tool_name": tool.name,
                     **invalid_arg,
                 }
+            experiment_id_explicit = "experiment_id" in body.args
             result = adapter.run(
                 context_token=body.context_token,
                 mapped_identity=mapped_identity,
@@ -1458,6 +1466,7 @@ def _invoke_wallac_tool(
                 plate_id=body.args.get("plate_id"),
                 plate_layout=body.args.get("plate_layout"),
                 experiment_id=effective_experiment_id,
+                experiment_id_explicit=experiment_id_explicit,
                 conversation_id=body.conversation_id,
                 request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,

@@ -1121,7 +1121,8 @@ def test_run_sends_current_experiment_id_to_bridge(
         mapped_identity=_identity(),
         approval_id=approval_id,
         protocol_id=1001,
-        experiment_id=42,  # simulates dispatcher extracting context id
+        experiment_id=42,  # dispatcher-derived, NOT explicit
+        experiment_id_explicit=False,
     )
 
     assert isinstance(result, WallacResult)
@@ -1208,6 +1209,7 @@ def test_run_creates_new_experiment_without_context(
         approval_id=approval_id,
         protocol_id=1001,
         experiment_id=0,
+        experiment_id_explicit=False,
     )
 
     assert result.result["job_id"] == "bridge-job-002"
@@ -1254,15 +1256,16 @@ def test_experiment_id_from_token_returns_zero_for_resource_context() -> None:
 
 
 def test_run_rejects_approval_for_different_experiment() -> None:
-    """Review round 2: an approval minted with
-    ``target_record='wallac:exp:43'`` cannot be consumed for a
-    run targeting experiment 42. The args hash (round-2 design)
-    deliberately does NOT include experiment_id so the LLM does
-    not need to know the dispatcher's effective experiment_id at
-    approval-request time — but the target_record axis catches the
-    mismatch.
+    """Review round 3 (two-axis binding): an approval minted with
+    ``target_record='elabftw:experiment:43'`` cannot run against
+    experiment 42 when the dispatcher derives the experiment id
+    from the context (NOT explicit). The args hash is
+    protocol-only, so the binding must be on the target_record
+    axis — the round-3 parser checks the trailing integer in any
+    ``<prefix>:<id>`` target. This is the legacy
+    context-derived path.
     """
-    from lab_copilot_gateway.wallac import WallacAdapter
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
 
     monkeypatch = pytest.MonkeyPatch()
     try:
@@ -1281,19 +1284,72 @@ def test_run_rejects_approval_for_different_experiment() -> None:
             approval_store=approval,
         )
 
-        # Approval minted with target_record pinned to experiment 43.
+        # Approval minted with the production target_record
+        # convention (elabftw:experiment:43). experiment_id is NOT
+        # in the args hash (dispatcher-derived case).
         approval_id = _wallac_run_approval(
             approval,
             protocol_id=1001,
             experiment_id=43,
+            explicit_experiment_id=False,
         )
 
-        # Replay attempt against experiment 42 — the target_record
-        # binding must reject this on the target_record axis
-        # (not the args_hash axis). The adapter wraps the
-        # ApprovalMismatch in a WallacAdapterError so the dispatcher
-        # sees a structured failure.
-        from lab_copilot_gateway.wallac import WallacAdapterError
+        # Replay attempt against experiment 42 with a derived
+        # (non-explicit) experiment id. Args hash matches; the
+        # target_record axis must reject the run.
+        with pytest.raises(WallacAdapterError) as exc_info:
+            adapter.run(
+                context_token=_token(),
+                mapped_identity=_identity(),
+                approval_id=approval_id,
+                protocol_id=1001,
+                experiment_id=42,
+                experiment_id_explicit=False,
+            )
+        assert exc_info.value.reason == "approval_consume_failed"
+        assert "experiment 43" in exc_info.value.message
+        assert "experiment 42" in exc_info.value.message
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_rejects_approval_when_explicit_experiment_id_differs() -> None:
+    """Review round 3 (explicit-override binding): when the LLM
+    supplied ``experiment_id`` explicitly at approval-request time
+    AND at invoke time, BOTH axes must agree. The args hash check
+    fires first (experiment 43 != 42 in the hash), and the
+    WallacAdapterError surfaces 'does not match request field
+    args_hash'. This proves the explicit-override path is also
+    bound — an approval for experiment 43 cannot run against
+    experiment 42 even when both are explicit.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter, WallacAdapterError
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=43,
+            explicit_experiment_id=True,
+        )
 
         with pytest.raises(WallacAdapterError) as exc_info:
             adapter.run(
@@ -1302,9 +1358,90 @@ def test_run_rejects_approval_for_different_experiment() -> None:
                 approval_id=approval_id,
                 protocol_id=1001,
                 experiment_id=42,
+                experiment_id_explicit=True,
             )
         assert exc_info.value.reason == "approval_consume_failed"
-        assert "target_record" in exc_info.value.message
+        # The args hash axis fires first when explicit, surfacing
+        # 'args_hash' in the message.
+        assert "args_hash" in exc_info.value.message
+    finally:
+        monkeypatch.undo()
+        audit.close()
+        approval.close()
+
+
+def test_run_explicit_experiment_id_override_succeeds() -> None:
+    """Review blocker 2 (round 3): a valid explicit
+    ``experiment_id`` override MUST succeed end-to-end. The
+    approval is minted with the experiment id in the args hash
+    (because the LLM supplied it explicitly), so the consume
+    matches. The target_record axis additionally confirms the
+    binding.
+    """
+    from lab_copilot_gateway.wallac import WallacAdapter
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+
+        # Stub the urllib call to the bridge so the test does not
+        # try to hit the network.
+        class _FakeResponse:
+            def __init__(self, payload: dict[str, Any]) -> None:
+                self._payload = payload
+
+            def read(self) -> bytes:
+                return json.dumps(self._payload).encode()
+
+            def __enter__(self) -> "_FakeResponse":
+                return self
+
+            def __exit__(self, *_args: Any) -> None:
+                return None
+
+        def _fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+            return _FakeResponse({"job_id": "bridge-job-1", "status": "accepted"})
+
+        monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+
+        policy = PolicyEngine(max_tier=Tier.BOUNDED_WRITES)
+        audit = AuditStore(db_path=":memory:")
+        approval = ApprovalStore(db_path=":memory:")
+
+        adapter = WallacAdapter(
+            policy_engine=policy,
+            audit_store=audit,
+            client=StubWallacClient(),
+            bridge_client=StubWallacBridgeClient(),
+            approval_store=approval,
+        )
+
+        approval_id = _wallac_run_approval(
+            approval,
+            protocol_id=1001,
+            experiment_id=43,
+            explicit_experiment_id=True,
+        )
+
+        # The LLM supplied experiment_id=43 explicitly; the
+        # dispatcher forwards it as experiment_id_explicit=True.
+        # The consume must succeed because args hash matches and
+        # the target_record encodes 43.
+        result = adapter.run(
+            context_token=_token(),
+            mapped_identity=_identity(),
+            approval_id=approval_id,
+            protocol_id=1001,
+            experiment_id=43,
+            experiment_id_explicit=True,
+        )
+        assert result.tool_name == TOOL_RUN
+        # Approval was consumed.
+        record = approval.get(approval_id)
+        assert record is not None
+        assert record.is_consumed()
     finally:
         monkeypatch.undo()
         audit.close()
@@ -1339,21 +1476,29 @@ def _wallac_run_approval(
     protocol_id: int,
     experiment_id: int,
     target_record: str | None = None,
+    explicit_experiment_id: bool = False,
 ) -> str:
     """Mint an approval token for ``wallac.run``.
 
     Mirrors the production approval-request path: the LLM knows
-    ``protocol_id`` at approval-request time but does not always
-    know ``experiment_id`` (the dispatcher may derive it from a
-    context token). The args hash binds the protocol; the
+    ``protocol_id`` at approval-request time and may also know
+    ``experiment_id`` (if it was an explicit override). The args
+    hash binds the protocol (and the explicit experiment id); the
     experiment_id binding lives on the separate ``target_record``
-    axis on ``approval_store.consume()``.
+    axis on ``approval_store.consume()`` (matched via the trailing
+    integer in ``<prefix>:<id>`` so the orchestrator's convention
+    does not have to match).
     """
     args = {"protocol_id": protocol_id}
+    if explicit_experiment_id:
+        args["experiment_id"] = experiment_id
     req = ApprovalRequest(
         tool_name=TOOL_RUN,
         args_hash=compute_args_hash(args),
-        target_record=target_record or f"wallac:exp:{experiment_id}",
+        # Default to the orchestrator's actual production convention
+        # (``elabftw:experiment:<id>``). Tests that need the legacy
+        # ``wallac:exp:<id>`` form override this via target_record.
+        target_record=target_record or f"elabftw:experiment:{experiment_id}",
         tier=4,
     )
     approval_id, _ = approval_store.request(req)
