@@ -600,6 +600,7 @@ class WallacAdapter:
         plate_id: int | None = None,
         plate_layout: dict[str, Any] | None = None,
         experiment_id: int | None = None,
+        experiment_id_explicit: bool = False,
         conversation_id: str | None = None,
         request_id: str | None = None,
         keycloak_subject: str | None = None,
@@ -630,15 +631,30 @@ class WallacAdapter:
             plate_id: optional plate identifier.
             experiment_id: eLabFTW experiment ID for result writeback.
                 If 0 or None, the bridge creates a new experiment.
+            experiment_id_explicit: True when ``experiment_id`` was
+                supplied by the LLM via tool args (i.e., the LLM knew
+                it at approval-request time). The dispatcher sets
+                this when the args include ``experiment_id``; the
+                context-derived default does NOT set it. When True,
+                experiment_id is included in the args hash so a
+                separate approval is required per experiment.
             approval_id: single-use approval token from POST /approval/request.
         """
         # The raw args dict is what the approval request hashed — must match
         # for the approval consume to succeed.
+        # Review round 3: experiment_id is included ONLY when the
+        # LLM supplied it (experiment_id_explicit=True). The
+        # dispatcher may also derive experiment_id from a context
+        # token the LLM cannot see at approval-request time; in
+        # that case the args hash is protocol-only and the
+        # experiment binding lives on the target_record axis.
         raw_args: dict[str, Any] = {"protocol_id": protocol_id}
         if plate_id is not None:
             raw_args["plate_id"] = plate_id
         if plate_layout:
             raw_args["plate_layout"] = plate_layout
+        if experiment_id_explicit:
+            raw_args["experiment_id"] = experiment_id
 
         return self._execute_run(
             context_token=context_token,
@@ -725,9 +741,14 @@ class WallacAdapter:
             )
             raise
 
-        tool_args_hash = compute_args_hash(
-            {**raw_args, "experiment_id": claims.experiment_id}
-        )
+        # Review-blocker 1 (round 1): the audit's tool_args_hash must
+        # reflect the EFFECTIVE experiment id (the one the bridge
+        # will write results into), not the context-claim id. Without
+        # tool_args_hash reflects what the caller (LLM) actually sees
+        # in the tool args — that is what gets approved and audited.
+        # experiment_id binding is on the target_record axis, not the
+        # args hash, so it does not pollute this hash.
+        tool_args_hash = compute_args_hash(raw_args)
 
         # 2. Identity resolution.
         if mapped_identity is None:
@@ -736,7 +757,7 @@ class WallacAdapter:
                 policy_decision="deny",
                 reason="unmapped_caller",
                 mapped_identity=None,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -755,7 +776,7 @@ class WallacAdapter:
                 policy_decision="deny",
                 reason="context_token_user_mismatch",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -785,7 +806,7 @@ class WallacAdapter:
                 policy_decision="deny",
                 reason=decision.reason,
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -808,7 +829,7 @@ class WallacAdapter:
                 policy_decision="deny",
                 reason="wallac_not_configured",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -827,40 +848,26 @@ class WallacAdapter:
         # The args_hash must match what POST /approval/request computed —
         # compute_args_hash(raw_args) — not the audit tool_args_hash
         # (which includes experiment_id for audit correlation).
-        effective_approval_id = approval_id
-        if plan_approval_id:
-            effective_approval_id = plan_approval_id
-        elif self.approval_store is not None and approval_id:
-            try:
-                self.approval_store.consume(
-                    approval_id=approval_id,
-                    tool_name=TOOL_RUN,
-                    args_hash=compute_args_hash(raw_args),
-                )
-            except Exception as exc:
-                self._audit(
-                    tool_name=TOOL_RUN,
-                    policy_decision="allow",
-                    reason="approval_consume_failed",
-                    mapped_identity=mapped_identity,
-                    experiment_id=claims.experiment_id,
-                    conversation_id=conversation_id,
-                    request_id=request_id,
-                    keycloak_subject=keycloak_subject,
-                    librechat_user_id=librechat_user_id,
-                    provider=provider,
-                    model_id=model_id,
-                    tool_args_hash=tool_args_hash,
-                    error={
-                        "code": "APPROVAL_CONSUME_FAILED",
-                        "exception": type(exc).__name__,
-                        "message": str(exc),
-                    },
-                )
-                raise WallacAdapterError(
-                    reason="approval_consume_failed",
-                    message=f"approval consume failed: {exc}",
-                ) from exc
+        # Review-blocker 1 (round 1): bind the approval to the
+        # effective experiment id so an approval for experiment A
+        # cannot be replayed against experiment B. raw_args already
+        # carries experiment_id (set in adapter.run) so the args hash
+        # differs across experiments; the explicit target_record
+        # provides a second layer of defense.
+        effective_approval_id = self._consume_run_approval(
+            approval_id=approval_id,
+            plan_approval_id=plan_approval_id,
+            experiment_id=experiment_id,
+            raw_args=raw_args,
+            mapped_identity=mapped_identity,
+            conversation_id=conversation_id,
+            request_id=request_id,
+            keycloak_subject=keycloak_subject,
+            librechat_user_id=librechat_user_id,
+            provider=provider,
+            model_id=model_id,
+            tool_args_hash=tool_args_hash,
+        )
 
         # 7. Submit job to the Wallac bridge (POST /jobs).
         #    The bridge handles: protocol resolution, run execution,
@@ -873,7 +880,7 @@ class WallacAdapter:
                 policy_decision="allow",
                 reason="bridge_not_configured",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -899,10 +906,15 @@ class WallacAdapter:
             "title": f"Lab Copilot — Protocol {protocol_id}",
             "execution_mode": "existing_protocol",
             "protocol_id": protocol_id,
-            # Don't pass the current experiment_id — the bridge creates
-            # a NEW experiment for the results. Writing to the current
-            # experiment would overwrite its body with the heatmap HTML.
-            "elabftw_experiment_id": 0,
+            # Pass the current experiment id when we have one so the
+            # bridge can append/upsert the Wallac results into the
+            # existing experiment body instead of creating a new one.
+            # Slice 6 of
+            # ``docs/plans/wallac-existing-protocol-writeback-repair.md``
+            # (cross-repo plan). When no experiment context exists
+            # (``experiment_id == 0``) the bridge still creates a new
+            # experiment for standalone runs.
+            "elabftw_experiment_id": experiment_id,
         }
 
         # Pass wells_spec if the LLM specified which wells to measure.
@@ -932,7 +944,7 @@ class WallacAdapter:
                 policy_decision="allow",
                 reason="bridge_submit_failed",
                 mapped_identity=mapped_identity,
-                experiment_id=claims.experiment_id,
+                experiment_id=experiment_id,
                 conversation_id=conversation_id,
                 request_id=request_id,
                 keycloak_subject=keycloak_subject,
@@ -968,7 +980,7 @@ class WallacAdapter:
             policy_decision="allow",
             reason="call_succeeded",
             mapped_identity=mapped_identity,
-            experiment_id=claims.experiment_id,
+            experiment_id=experiment_id,
             conversation_id=conversation_id,
             request_id=request_id,
             keycloak_subject=keycloak_subject,
@@ -1407,6 +1419,165 @@ class WallacAdapter:
                     message=f"approval token consume failed: {exc}",
                 ) from exc
         return approval_id
+
+    def _consume_run_approval(
+        self,
+        *,
+        approval_id: str,
+        plan_approval_id: str | None,
+        experiment_id: int,
+        raw_args: dict[str, Any],
+        mapped_identity: MappedIdentity | None,
+        conversation_id: str | None,
+        request_id: str | None,
+        keycloak_subject: str | None,
+        librechat_user_id: str | None,
+        provider: str | None,
+        model_id: str | None,
+        tool_args_hash: str,
+    ) -> str:
+        """Consume the ``wallac.run`` approval and return the effective id.
+
+        Review round 4 (CONCERN 1): the target-record binding is
+        verified BEFORE the approval is consumed so a target
+        mismatch does not burn the token. Verification failures
+        are audited identically to consume failures.
+
+        Round 3 (review-blocker 1): the production orchestrator
+        mints approval target_records as ``elabftw:experiment:<id>``
+        (consistent with the eLabFTW resource address scheme). The
+        gateway consumes by checking that the experiment id we are
+        about to write to matches the experiment id encoded in the
+        approval's target_record — regardless of the prefix
+        convention. This prevents an approval for experiment A
+        from being replayed against experiment B without coupling
+        the gateway to the orchestrator's prefix choice.
+
+        Round 1 (superseded): earlier designs included
+        experiment_id in the args hash. The LLM cannot reliably
+        know the dispatcher's effective experiment_id at
+        approval-request time, so the args hash is now the
+        protocol-only hash. The target_record axis (matched via
+        ``_verify_target_experiment``) is the binding.
+
+        Extracted from ``_execute_run`` to keep its complexity under
+        the project ceiling.
+        """
+        if plan_approval_id:
+            return plan_approval_id
+        if self.approval_store is None or not approval_id:
+            return approval_id
+
+        def _audit_consume_failure(reason_detail: str) -> None:
+            """Helper to record an approval_consume_failed audit row."""
+            self._audit(
+                tool_name=TOOL_RUN,
+                policy_decision="allow",
+                reason="approval_consume_failed",
+                mapped_identity=mapped_identity,
+                experiment_id=experiment_id,
+                conversation_id=conversation_id,
+                request_id=request_id,
+                keycloak_subject=keycloak_subject,
+                librechat_user_id=librechat_user_id,
+                provider=provider,
+                model_id=model_id,
+                tool_args_hash=tool_args_hash,
+                error={
+                    "code": "APPROVAL_CONSUME_FAILED",
+                    "detail": reason_detail,
+                },
+            )
+
+        # Review round 4 CONCERN 1: verify the target_record binding
+        # BEFORE consuming so a target mismatch does not burn the
+        # approval token. The check is mandatory for any nonzero
+        # experiment_id (see _verify_target_experiment fail-closed
+        # semantics).
+        if experiment_id:
+            try:
+                self._verify_target_experiment(
+                    approval_id=approval_id, experiment_id=experiment_id
+                )
+            except WallacAdapterError as exc:
+                _audit_consume_failure(str(exc))
+                raise
+
+        try:
+            self.approval_store.consume(
+                approval_id=approval_id,
+                tool_name=TOOL_RUN,
+                args_hash=compute_args_hash(raw_args),
+                target_record=None,
+            )
+        except Exception as exc:
+            _audit_consume_failure(str(exc))
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=f"approval consume failed: {exc}",
+            ) from exc
+        return approval_id
+
+    def _verify_target_experiment(
+        self,
+        *,
+        approval_id: str,
+        experiment_id: int,
+    ) -> None:
+        """Verify the approval's target_record encodes ``experiment_id``.
+
+        Review round 4 (BLOCKER): for every nonzero effective
+        experiment id, the target_record MUST bind to that id.
+        Missing target, missing record, or unparseable suffix all
+        fail closed — an approval without a verifiable target
+        binding would let the run execute against any experiment.
+        The prefix is parsed flexibly (``elabftw:experiment:<id>``
+        today, future conventions) but the numeric experiment id
+        check is mandatory.
+
+        Review round 3 (NIT — prefix flexibility): this is why
+        the suffix is parsed with ``rsplit(':', 1)`` rather than
+        a hard-coded ``elabftw:experiment:`` prefix match.
+        """
+        record = self.approval_store.get(approval_id) if self.approval_store else None
+        if record is None:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval '{approval_id}' has no stored record; "
+                    "cannot verify experiment binding"
+                ),
+            )
+        if record.target_record is None:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record is missing; "
+                    f"a wallac.run targeting experiment {experiment_id} "
+                    "requires the approval to bind to that experiment"
+                ),
+            )
+        target = record.target_record.strip()
+        try:
+            encoded = int(target.rsplit(":", 1)[-1])
+        except (ValueError, IndexError):
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record '{record.target_record}' "
+                    "is not parseable as '<prefix>:<experiment_id>'; "
+                    f"cannot verify binding to experiment {experiment_id}"
+                ),
+            ) from None
+        if encoded != experiment_id:
+            raise WallacAdapterError(
+                reason="approval_consume_failed",
+                message=(
+                    f"approval target_record encodes experiment {encoded} "
+                    f"but the run targets experiment {experiment_id}; "
+                    "an approval for experiment A cannot run against B"
+                ),
+            )
 
     def _writeback_submit_provenance(
         self,

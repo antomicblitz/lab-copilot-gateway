@@ -410,6 +410,77 @@ def _approval_backend_status(store: ApprovalStore) -> dict[str, str]:
     }
 
 
+def _experiment_id_from_token(context_token: str | None) -> int:
+    """Return the experiment id carried in a context token, or 0.
+
+    Used by ``wallac.run`` (slice 6 of the Wallac writeback-repair
+    plan) to decide which experiment the bridge should append/upsert
+    its Wallac results into. Returns 0 when the token is missing,
+    malformed, carries no experiment claim, or carries a non-
+    experiment claim (a database item id must NOT be confused with
+    an experiment id — review concern round 1).
+
+    The bridge interprets 0 as "create a new results experiment".
+    """
+    if not context_token:
+        return 0
+    try:
+        claims = verify_context_token(context_token)
+    except Exception:
+        # Reason: dispatchers must remain fail-soft here — the
+        # adapter's own ``run()`` method is the authoritative
+        # validator for the context token. Returning 0 lets a
+        # downstream validation failure surface a clean error
+        # instead of swallowing context here.
+        return 0
+    # Reject non-experiment contexts. A context token whose record
+    # is a database item (record_type == "resource") carries an item
+    # id in the same numeric field — using it as an experiment id
+    # would target an unrelated experiment. Returning 0 lets the
+    # adapter's own validation surface the error.
+    if getattr(claims, "record_type", "experiment") != "experiment":
+        return 0
+    return int(getattr(claims, "experiment_id", 0) or 0)
+
+
+def _resolve_run_experiment_id(
+    args: dict, context_token: str | None
+) -> tuple[int, dict[str, Any] | None]:
+    """Pick the effective experiment id for ``wallac.run``.
+
+    Returns ``(effective_id, None)`` on success, or
+    ``(0, invalid_arg_envelope)`` when the LLM-supplied override is
+    malformed (in which case the dispatcher should return the
+    envelope as a structured error response).
+
+    Review concern round 1:
+
+    * Key presence, not truthiness — an explicit ``experiment_id: 0``
+      override is honored (a request to create a new experiment
+      from a non-context call).
+    * Type validation — a non-int or bool is rejected with a
+      structured client error, never an HTTP 500.
+    * Negative values are rejected (review NIT round 2): eLabFTW
+      experiment ids are non-negative integers.
+    * Non-experiment context tokens resolve to 0 (see
+      ``_experiment_id_from_token``); a malformed override on a
+      resource-context token still produces the structured error.
+    """
+    context_experiment_id = _experiment_id_from_token(context_token)
+    if "experiment_id" not in args:
+        return context_experiment_id, None
+    raw = args["experiment_id"]
+    if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+        return 0, {
+            "reason": "invalid_args",
+            "message": (
+                "experiment_id must be a non-negative integer when "
+                f"supplied (got {raw!r})"
+            ),
+        }
+    return raw, None
+
+
 def _download_filename(filename: str) -> str:
     """Return a conservative Content-Disposition filename."""
     safe = filename.replace("/", "_").replace("\\", "_").replace('"', "_")
@@ -1356,6 +1427,37 @@ def _invoke_wallac_tool(
                 "result": result.to_dict(),
             }
         elif tool.name == "wallac.run":
+            # Slice 6 of
+            # ``docs/plans/wallac-existing-protocol-writeback-repair.md``
+            # (cross-repo plan): when an eLabFTW experiment context is
+            # present, pass its id so the bridge can append/upsert the
+            # Wallac results section into the existing experiment body
+            # instead of always creating a brand-new results experiment.
+            # LLM-supplied ``experiment_id`` in args still wins so the
+            # caller can target a non-context experiment explicitly.
+            #
+            # Review concern 1 (round 1): use key PRESENCE, not
+            # truthiness, so an explicit ``experiment_id: 0`` override
+            # is honored (a request to create a new experiment from a
+            # non-context call). Validate the type so a malformed
+            # LLM argument does not crash the dispatcher with a 500.
+            #
+            # experiment_id_explicit is True only when the LLM
+            # supplied the override via args. The context-derived
+            # default is NOT explicit — the LLM could not have known
+            # the value at approval-request time. This asymmetric flag
+            # controls whether experiment_id is included in the
+            # approval args hash (review round 3).
+            effective_experiment_id, invalid_arg = _resolve_run_experiment_id(
+                body.args, body.context_token
+            )
+            if invalid_arg is not None:
+                return {
+                    "ok": False,
+                    "tool_name": tool.name,
+                    **invalid_arg,
+                }
+            experiment_id_explicit = "experiment_id" in body.args
             result = adapter.run(
                 context_token=body.context_token,
                 mapped_identity=mapped_identity,
@@ -1363,6 +1465,8 @@ def _invoke_wallac_tool(
                 protocol_id=body.args.get("protocol_id") or 0,
                 plate_id=body.args.get("plate_id"),
                 plate_layout=body.args.get("plate_layout"),
+                experiment_id=effective_experiment_id,
+                experiment_id_explicit=experiment_id_explicit,
                 conversation_id=body.conversation_id,
                 request_id=body.request_id,
                 keycloak_subject=body.keycloak_subject,

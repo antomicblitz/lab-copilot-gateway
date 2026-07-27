@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import json
 from typing import Any
 
 import pytest
@@ -1692,6 +1693,319 @@ def test_invoke_dispatches_elabftw_amend_with_approval() -> None:
     assert write["operation"] == "append_amendment"
     assert write["experiment_id"] == 42
     assert write["audit_action_id"]
+
+
+def test_invoke_dispatches_wallac_run_with_context_experiment_id() -> None:
+    """Slice 6 / review round 2: end-to-end through ``/invoke`` —
+    a ``wallac.run`` request with a context experiment id must
+    forward that id to the bridge so the bridge can write results
+    into the existing experiment.
+
+    Mints the approval with the exact args the LLM would supply
+    (``protocol_id`` only — the dispatcher derives
+    ``experiment_id`` from the context token). target_record pins
+    ``elabftw:experiment:<id>`` so the run is bound to that
+    experiment via the adapter's target-record parser.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    # Wire a real identity, wallac adapter, and a fastapi test client.
+    # Match the http-write claims (kc-http-1/lc-http-1/elab-http-1) so
+    # the context token's user matches the resolved identity.
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    # Build a fastapi app with a wallac adapter whose bridge is
+    # stubbed via monkeypatched urllib.request.urlopen (see test
+    # helpers below).
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode()
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def _fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+        body = json.loads(req.data.decode())
+        captured["url"] = req.full_url
+        captured["body"] = body
+        return _FakeResponse({"job_id": "bridge-job-ctx", "status": "accepted"})
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        # The adapter requires BOTH base URLs to be set: the BASE
+        # URL drives status/audit endpoints, the BRIDGE URL drives
+        # the wallac.run POST. The adapter's run path also requires
+        # self.client (the BASE client) at runtime for the
+        # not-configured check.
+        monkeypatch.setenv("LAB_COPILOT_WALLAC_BASE_URL", "http://wallac.invalid:8421")
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            _fake_urlopen,
+        )
+        # Force the wallac adapter singleton to rebuild with the
+        # current env. The singleton is created lazily at first use,
+        # so once reset it picks up the new BRIDGE_URL on its next
+        # creation.
+        import lab_copilot_gateway.wallac as wallacmod_for_reset
+
+        wallacmod_for_reset.reset_wallac_adapter()
+
+        app = create_app()
+        client = _DevAuthClient(app)
+
+        # Issue an approval for protocol_id=1001. The dispatcher
+        # will derive experiment_id=42 from the context token and
+        # the adapter's target_record parser will match it to
+        # 'elabftw:experiment:42' (the production orchestrator
+        # convention).
+        approval_resp = client.post(
+            "/approval/request",
+            json={
+                "tool_name": "wallac.run",
+                "args": {"protocol_id": 1001},
+                "target_record": "elabftw:experiment:42",
+                "tier": 4,
+                "keycloak_subject": "kc-http-1",
+                "librechat_user_id": "lc-http-1",
+                "mapped_elabftw_user_id": "elab-http-1",
+                "provider": "openai",
+                "model_id": "gpt-4o-mini",
+                "ttl_seconds": 300,
+            },
+        )
+        assert approval_resp.status_code == 200
+        approval_id = approval_resp.json()["approval_id"]
+
+        # Invoke with a context token whose experiment_id is 42
+        # and NO explicit experiment_id override.
+        invoke_resp = client.post(
+            "/invoke",
+            json={
+                "tool_name": "wallac.run",
+                "context_token": mint_context_token(_http_write_claims()),
+                "approval_id": approval_id,
+                "args": {"protocol_id": 1001},
+                "keycloak_subject": "kc-http-1",
+                "librechat_user_id": "lc-http-1",
+                "conversation_id": "conv-wallac-1",
+                "request_id": "req-wallac-1",
+                "provider": "openai",
+                "model_id": "gpt-4o-mini",
+            },
+        )
+        assert invoke_resp.status_code == 200, invoke_resp.text
+        out = invoke_resp.json()
+        if not out["ok"]:
+            raise AssertionError(f"invoke failed: {out}")
+        assert out["ok"] is True
+        assert out["tool_name"] == "wallac.run"
+        # The bridge received the effective experiment_id from the
+        # dispatcher-derived context token.
+        assert captured["body"]["elabftw_experiment_id"] == 42
+        assert captured["body"]["protocol_id"] == 1001
+    finally:
+        monkeypatch.undo()
+
+
+def test_invoke_wallac_run_rejects_malformed_experiment_id_override() -> None:
+    """Review concern 1 (round 1): an explicit ``experiment_id`` arg
+    must be an int — a malformed value returns a structured
+    client error, not an HTTP 500.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-wallac-2",
+        librechat_user_id="lc-wallac-2",
+        elabftw_user_id="elab-wallac-2",
+        elabftw_team_ids=["team-wallac-2"],
+    )
+
+    app = create_app()
+    client = _DevAuthClient(app)
+
+    # No approval needed — validation should reject before any
+    # downstream call. No bridge URL set either, so even if the
+    # adapter ran there is no bridge to talk to.
+    invoke_resp = client.post(
+        "/invoke",
+        json={
+            "tool_name": "wallac.run",
+            "context_token": mint_context_token(_http_write_claims()),
+            "args": {"protocol_id": 1001, "experiment_id": "abc"},
+            "keycloak_subject": "kc-wallac-2",
+            "librechat_user_id": "lc-wallac-2",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert invoke_resp.status_code == 200
+    out = invoke_resp.json()
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_args"
+    assert "experiment_id" in out["message"]
+
+
+def test_invoke_wallac_run_rejects_negative_experiment_id_override() -> None:
+    """Review NIT round 2: eLabFTW experiment ids are non-negative
+    integers. A negative override returns the same structured
+    client error as a malformed type.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-wallac-3",
+        librechat_user_id="lc-wallac-3",
+        elabftw_user_id="elab-wallac-3",
+        elabftw_team_ids=["team-wallac-3"],
+    )
+
+    app = create_app()
+    client = _DevAuthClient(app)
+
+    invoke_resp = client.post(
+        "/invoke",
+        json={
+            "tool_name": "wallac.run",
+            "context_token": mint_context_token(_http_write_claims()),
+            "args": {"protocol_id": 1001, "experiment_id": -7},
+            "keycloak_subject": "kc-wallac-3",
+            "librechat_user_id": "lc-wallac-3",
+            "provider": "openai",
+            "model_id": "gpt-4o-mini",
+        },
+    )
+    assert invoke_resp.status_code == 200
+    out = invoke_resp.json()
+    assert out["ok"] is False
+    assert out["reason"] == "invalid_args"
+    assert "-7" in out["message"]
+
+
+def test_invoke_dispatches_wallac_run_with_explicit_experiment_id_override() -> None:
+    """Review concern 2 (round 4): the explicit-override happy
+    path through /invoke. The LLM supplies experiment_id=43 in
+    args; the dispatcher forwards experiment_id_explicit=True;
+    the adapter includes it in the approval hash; the bridge
+    receives 43.
+
+    Mirrors test_invoke_dispatches_wallac_run_with_context_experiment_id
+    but with the explicit-override path.
+    """
+    import lab_copilot_gateway.identity as identitymod
+
+    mapper = identitymod._default_mapper
+    assert isinstance(mapper, identitymod.DbIdentityMapper)
+    mapper.upsert(
+        keycloak_subject="kc-http-1",
+        librechat_user_id="lc-http-1",
+        elabftw_user_id="elab-http-1",
+        elabftw_team_ids=["team-http-1"],
+    )
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResponse:
+        def __init__(self, payload: dict[str, Any]) -> None:
+            self._payload = payload
+
+        def read(self) -> bytes:
+            return json.dumps(self._payload).encode()
+
+        def __enter__(self) -> "_FakeResponse":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+    def _fake_urlopen(req, timeout=None):  # type: ignore[no-untyped-def]
+        body = json.loads(req.data.decode())
+        captured["url"] = req.full_url
+        captured["body"] = body
+        return _FakeResponse({"job_id": "bridge-job-explicit", "status": "accepted"})
+
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setenv("LAB_COPILOT_WALLAC_BASE_URL", "http://wallac.invalid:8421")
+        monkeypatch.setenv(
+            "LAB_COPILOT_WALLAC_BRIDGE_URL", "http://bridge.invalid:8423"
+        )
+        monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
+        import lab_copilot_gateway.wallac as wallacmod_for_reset
+
+        wallacmod_for_reset.reset_wallac_adapter()
+
+        app = create_app()
+        client = _DevAuthClient(app)
+
+        # Approval minted WITH experiment_id in args hash
+        # (explicit). target_record pins elabftw:experiment:43.
+        approval_resp = client.post(
+            "/approval/request",
+            json={
+                "tool_name": "wallac.run",
+                "args": {"protocol_id": 1001, "experiment_id": 43},
+                "target_record": "elabftw:experiment:43",
+                "tier": 4,
+                "keycloak_subject": "kc-http-1",
+                "librechat_user_id": "lc-http-1",
+                "mapped_elabftw_user_id": "elab-http-1",
+                "provider": "openai",
+                "model_id": "gpt-4o-mini",
+                "ttl_seconds": 300,
+            },
+        )
+        assert approval_resp.status_code == 200
+        approval_id = approval_resp.json()["approval_id"]
+
+        # Invoke with the same explicit experiment_id=43.
+        # The dispatcher forwards experiment_id_explicit=True.
+        invoke_resp = client.post(
+            "/invoke",
+            json={
+                "tool_name": "wallac.run",
+                "context_token": mint_context_token(_http_write_claims()),
+                "approval_id": approval_id,
+                "args": {"protocol_id": 1001, "experiment_id": 43},
+                "keycloak_subject": "kc-http-1",
+                "librechat_user_id": "lc-http-1",
+                "conversation_id": "conv-wallac-explicit",
+                "request_id": "req-wallac-explicit",
+                "provider": "openai",
+                "model_id": "gpt-4o-mini",
+            },
+        )
+        assert invoke_resp.status_code == 200, invoke_resp.text
+        out = invoke_resp.json()
+        if not out["ok"]:
+            raise AssertionError(f"invoke failed: {out}")
+        assert out["ok"] is True
+        # The bridge received the explicit experiment_id override.
+        assert captured["body"]["elabftw_experiment_id"] == 43
+    finally:
+        monkeypatch.undo()
 
 
 def test_invoke_propagates_invalid_context_token() -> None:
