@@ -681,12 +681,18 @@ class HttpElabftwClient:
     See AGENTS.md → "eLabFTW API — HTTP client patterns":
         * ``requests.Session`` with ``Authorization`` header set to the API
           key (no Bearer prefix).
-        * ``verify=False`` for dev instances with self-signed certs.
+        * Application-scoped TLS trust via ``LAB_COPILOT_ELABFTW_CA_BUNDLE``
+          (set to a PEM file containing the eLabFTW self-signed CA); the
+          bundle is loaded IN ADDITION to system trust. ``verify=False``
+          is rejected when a bundle is set; ``verify=False`` is allowed
+          only in dev/test diagnostics without a bundle (slice 3 of
+          docs/plans/wallac-bridge-tls-trust.md).
     """
 
     base_url: str
     api_key: str
     verify_tls: bool = False
+    ca_bundle: str | None = None
     timeout_seconds: float = 10.0
     _session: Any = None  # lazy-built requests.Session
 
@@ -695,6 +701,23 @@ class HttpElabftwClient:
             raise ValueError("HttpElabftwClient requires non-empty base_url")
         if not self.api_key:
             raise ValueError("HttpElabftwClient requires non-empty api_key")
+        if self.ca_bundle and not self.verify_tls:
+            # Review slice 3 of wallac-bridge-tls-trust.md: a CA bundle
+            # + verify=False is meaningless — the bundle is never used.
+            # Reject up front so misconfigurations fail loudly at
+            # adapter construction rather than silently at the first
+            # outbound request.
+            raise ValueError(
+                "HttpElabftwClient: CA bundle is set but verify_tls is False; "
+                "a CA bundle requires verification on"
+            )
+        if self.ca_bundle:
+            import os
+
+            if not os.path.isfile(self.ca_bundle):
+                raise ValueError(
+                    f"HttpElabftwClient: CA bundle path is not a file: {self.ca_bundle}"
+                )
 
     def _connect(self) -> Any:
         if self._session is None:
@@ -702,7 +725,11 @@ class HttpElabftwClient:
 
             s = requests.Session()
             s.headers.update({"Authorization": self.api_key})
-            s.verify = self.verify_tls
+            # s.verify accepts a bool OR a path to a CA bundle (PEM).
+            # Setting it to the bundle path preserves system trust
+            # AND adds the private CA — exactly what the slice-3
+            # plan requires for the lab's self-signed eLabFTW.
+            s.verify = self.ca_bundle if self.ca_bundle else self.verify_tls
             self._session = s
         return self._session
 
@@ -903,10 +930,18 @@ def _default_client_from_env() -> ElabftwClient | None:
         "true",
         "yes",
     }
+    # Slice 3 of docs/plans/wallac-bridge-tls-trust.md: optional PEM
+    # CA bundle. Loaded IN ADDITION to system trust. Must NEVER be
+    # set when verification is disabled — __post_init__ rejects that
+    # combination. The bundle file is bind-mounted into the gateway
+    # container at a known path; the env var carries the in-container
+    # path, not the host path.
+    ca_bundle = os.getenv("LAB_COPILOT_ELABFTW_CA_BUNDLE", "") or None
     return HttpElabftwClient(
         base_url=base_url,
         api_key=api_key,
         verify_tls=verify_tls,
+        ca_bundle=ca_bundle,
         timeout_seconds=float(os.getenv("LAB_COPILOT_ELABFTW_TIMEOUT", "10.0")),
     )
 
