@@ -1,4 +1,19 @@
-.PHONY: help check lint typecheck format format-check test complexity mdlint run test-opencloning-contract
+.PHONY: help check lint typecheck format format-check test complexity mdlint run test-opencloning-contract ci-local update update-bump
+
+# Pinned dev/test tools. Match pyproject.toml dev/test groups exactly so
+# `uv sync --frozen` fetches a deterministic version. Local and CI must
+# match; version drift between local and CI has caused real CI failures
+# (e.g. ruff format output differs between 0.15.x patch versions). If you
+# see a CI failure that can't be reproduced locally, check that the
+# pins in pyproject.toml haven't drifted.
+#
+# Renewal cadence: bump monthly. Use `make update` to see what's
+# available, then `make update-bump TOOL=X.Y.Z` to bump the pin and
+# update uv.lock. After bumping, run `make ci-local` to verify.
+RUFF_VERSION := 0.15.10
+PYTEST_VERSION := 8.3.4
+PYTEST_COV_VERSION := 5.0.0
+
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "%-30s %s\n", $$1, $$2}'
